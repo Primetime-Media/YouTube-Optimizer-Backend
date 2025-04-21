@@ -1,0 +1,47 @@
+# Version control
+.git
+.gitignore
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+venv
+.env
+*.egg
+*.egg-info
+
+# Development/IDE
+.idea
+.vscode
+*.log
+.pytest_cache
+__pycache__
+*.pyc
+
+# Local development
+docker-compose*.yml
+Dockerfile
+README.md
+.dockerignore
+
+# Secrets
+client_secret_*.json
+*.pem
+*.key
+*.env*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Database
+*.sqlite3
+*.db
+
+# Build and distribution files
+build/
+dist/
+*.whl
