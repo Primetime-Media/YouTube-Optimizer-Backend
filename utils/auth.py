@@ -1,11 +1,13 @@
 import logging
 from google.oauth2.credentials import Credentials
+from google.oauth2 import service_account
 from google.auth.transport.requests import Request
 from utils.db import get_connection
 from typing import Dict, Optional, Union
 import datetime
 from fastapi import Depends, Cookie, Request
 from pydantic import BaseModel
+from config import get_settings
 
 # Models for user data
 class User(BaseModel):
@@ -18,6 +20,23 @@ class User(BaseModel):
 
 logger = logging.getLogger(__name__)
 
+def get_app_credentials() -> Optional[Credentials]:
+    """
+    Retrieve app-level credentials from environment variables.
+    
+    Returns:
+        Credentials object or None if not found
+    """
+    try:
+        settings = get_settings()
+
+        service_account_file = settings.client_secret_file
+        return service_account.Credentials.from_service_account_file(service_account_file)
+            
+    except Exception as e:
+        logger.error(f"Error retrieving app credentials: {e}")
+        return None
+    
 def get_user_credentials(user_id: int, auto_refresh: bool = True) -> Optional[Credentials]:
     """
     Retrieve user credentials from the database and convert to a Google OAuth2 Credentials object.
@@ -191,6 +210,7 @@ def get_credentials_dict(user_id: int) -> Optional[Dict]:
         dict: Credentials as a dictionary or None if not found
     """
     try:
+        logger.info(f"Getting credentials data for user {user_id}")
         conn = get_connection()
         
         with conn.cursor() as cursor:

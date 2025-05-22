@@ -53,36 +53,14 @@ def create_timeseries_table(conn):
         
         conn.commit()
 
-def run_migrations(conn):
-    """Run database migrations for schema updates."""
-    try:
-        with conn.cursor() as cursor:
-            # Migration: Add last_optimization_id to youtube_videos if it doesn't exist
-            cursor.execute("""
-                DO $$
-                BEGIN
-                    IF NOT EXISTS (
-                        SELECT 1 
-                        FROM information_schema.columns 
-                        WHERE table_name='youtube_videos' AND column_name='last_optimization_id'
-                    ) THEN
-                        ALTER TABLE youtube_videos ADD COLUMN last_optimization_id INTEGER;
-                    END IF;
-                END $$;
-            """)
-            
-            conn.commit()
-            logger.info("Database migrations completed successfully")
-    except Exception as e:
-        conn.rollback()
-        logger.error(f"Error running database migrations: {e}")
-        raise
 
 def init_db():
     """Initialize the database with required tables."""
     conn = get_connection()
     conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
     
+    #delete_all_tables_except_users()
+
     try:
         with conn.cursor() as cursor:
 
@@ -203,6 +181,8 @@ def init_db():
                     is_optimized BOOLEAN DEFAULT FALSE,
                     last_optimized_at TIMESTAMP,
                     last_optimization_id INTEGER,
+                    queued_for_optimization BOOLEAN DEFAULT FALSE,
+                    optimizations_completed INTEGER DEFAULT 0,
                     
                     -- Video status and visibility
                     privacy_status VARCHAR(50),  -- public, private, unlisted
@@ -219,6 +199,7 @@ def init_db():
                     
                     -- Video category
                     category_id VARCHAR(50),
+                    category_name VARCHAR(255),
                     
                     -- Topic details for content categorization (similar to channel)
                     topic_ids TEXT[],            -- YouTube topic IDs
@@ -234,6 +215,7 @@ def init_db():
                     retention_graph_data JSONB,  -- Audience retention data
                     viewer_demographics JSONB,   -- Audience demographics 
                     traffic_sources JSONB,       -- Where views come from
+                    last_analytics_refresh TIMESTAMP WITH TIME ZONE,
                     
                     -- Raw data for future use
                     content_details JSONB,       -- All content details as JSON
@@ -299,9 +281,13 @@ def init_db():
                     status VARCHAR(50) DEFAULT 'pending',  -- pending, in_progress, completed, failed
                     progress INTEGER DEFAULT 0,            -- 0-100 percentage of completion
                     optimization_score FLOAT,              -- Optional score to rate quality of optimization
+                    
+                    optimization_step INTEGER NOT NULL,
                     created_by VARCHAR(255),               -- User or system that created the optimization
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    
+                    UNIQUE(video_id, optimization_step)
                 );
 
                 -- Create indexes for better query performance
@@ -359,6 +345,60 @@ def init_scheduler_tables(cursor):
         )
     """)
 
+def delete_all_tables_except_users():
+    """
+    Deletes all database tables except the 'users' table.
+    Useful for resetting the database during development.
+    """
+    conn = None
+    try:
+        conn = get_connection()
+        # Set isolation level to AUTOCOMMIT for DROP TABLE statements
+        conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
+        
+        with conn.cursor() as cursor:
+            # Get a list of all tables in the current database
+            # This query works for PostgreSQL
+            cursor.execute("""
+                SELECT tablename 
+                FROM pg_tables 
+                WHERE schemaname = 'public'
+            """)
+            
+            tables = [row[0] for row in cursor.fetchall()]
+            
+            # Filter out the 'users' table
+            tables_to_delete = [table for table in tables if table != 'users']
+            
+            if not tables_to_delete:
+                logger.info("No tables found to delete (excluding 'users').")
+                return
+
+            logger.info(f"Deleting tables: {', '.join(tables_to_delete)}")
+
+            # Drop each table with CASCADE to remove dependent objects (like foreign keys)
+            for table in tables_to_delete:
+                try:
+                    cursor.execute(f"DROP TABLE IF EXISTS {table} CASCADE;")
+                    logger.info(f"Dropped table: {table}")
+                except Exception as e:
+                    logger.error(f"Error dropping table {table}: {e}")
+                    # Continue with other tables even if one fails
+                    pass 
+            
+            logger.info("Finished attempting to delete tables.")
+
+    except Exception as e:
+        logger.error(f"Error deleting tables: {e}")
+        # No rollback needed with AUTOCOMMIT, but log the error
+        raise # Re-raise the exception
+    finally:
+        if conn:
+            conn.close()
+            logger.info("Database connection closed.")
+
 if __name__ == "__main__":
+    pass
     # Run this file directly to initialize the database
-    init_db()
+    #init_db()
+    #delete_all_tables_except_users()

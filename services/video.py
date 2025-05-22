@@ -1,7 +1,11 @@
 import logging
 from typing import Dict, Optional, List
+from unicodedata import category
+
 from utils.db import get_connection
 from services.llm_optimization import get_comprehensive_optimization
+from services.optimizer import apply_optimization_to_youtube_video
+from services.thumbnail_optimizer import do_thumbnail_optimization
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +23,7 @@ def get_video_data(video_id: str) -> Optional[Dict]:
         conn = get_connection()
         with conn.cursor() as cursor:
             cursor.execute("""
-                SELECT id, title, description, tags, transcript, has_captions
+                SELECT id, title, description, tags, transcript, has_captions, like_count, comment_count, category_name, category_id
                 FROM youtube_videos
                 WHERE video_id = %s
             """, (video_id,))
@@ -28,8 +32,8 @@ def get_video_data(video_id: str) -> Optional[Dict]:
             if not result:
                 return None
                 
-            db_id, title, description, tags, transcript, has_captions = result
-            
+            db_id, title, description, tags, transcript, has_captions, like_count, comment_count, category_name, category_id = result
+
             return {
                 "id": db_id,  # Database ID
                 "video_id": video_id,  # YouTube video ID
@@ -37,7 +41,11 @@ def get_video_data(video_id: str) -> Optional[Dict]:
                 "description": description,
                 "tags": tags,
                 "transcript": transcript,
-                "has_captions": has_captions
+                "has_captions": has_captions,
+                "like_count": like_count,
+                "comment_count": comment_count,
+                "category_name": category_name,
+                "category_id": category_id
             }
     except Exception as e:
         logger.error(f"Error fetching video data: {str(e)}")
@@ -46,7 +54,7 @@ def get_video_data(video_id: str) -> Optional[Dict]:
         if conn:
             conn.close()
 
-def create_optimization(db_video_id: int) -> int:
+def create_optimization(db_video_id: int, optimization_step: int = 1) -> int:
     """
     Create a new optimization record for a video
     
@@ -60,19 +68,28 @@ def create_optimization(db_video_id: int) -> int:
         conn = get_connection()
         try:
             with conn.cursor() as cursor:
+                # Delete any existing optimization for this video and step, regardless of status
+                cursor.execute("""
+                    DELETE FROM video_optimizations
+                    WHERE video_id = %s AND optimization_step = %s
+                """, (db_video_id, optimization_step))
+                logger.info(f"Deleted existing optimizations (any status) for video_id {db_video_id}, step {optimization_step}")
+
                 # Always create a new optimization record
                 cursor.execute("""
                     INSERT INTO video_optimizations (
                         video_id,
                         status,
                         progress,
+                        optimization_step,
                         created_by
-                    ) VALUES (%s, %s, %s, %s)
+                    ) VALUES (%s, %s, %s, %s, %s)
                     RETURNING id
                 """, (
                     db_video_id,
                     'pending',
                     0,
+                    optimization_step,
                     'youtube-optimizer-system'
                 ))
                 
@@ -135,7 +152,15 @@ def update_optimization_progress(optimization_id: int, progress: int, status: st
         if conn:
             conn.close()
 
-def generate_video_optimization(video: Dict, optimization_id: int) -> Dict:
+def generate_video_optimization(
+        video: Dict,
+        user_id: int,
+        optimization_id: int,
+        optimization_decision_data: Optional[Dict] = None,
+        analytics_data: Optional[Dict] = None,
+        competitor_analytics_data: Optional[Dict] = None,
+        apply_optimization: bool = False
+) -> Dict:
     """
     Generate optimized title, description, and tags for a YouTube video
     
@@ -154,6 +179,9 @@ def generate_video_optimization(video: Dict, optimization_id: int) -> Dict:
     transcript = video.get("transcript")
     has_captions = video.get("has_captions", False)
     db_video_id = video.get("id")
+    like_count = video.get("like_count", 0)
+    comment_count = video.get("comment_count", 0)
+    category_name = video.get("category_name", "")
     
     # Verify optimization record exists
     if optimization_id == 0:
@@ -176,42 +204,84 @@ def generate_video_optimization(video: Dict, optimization_id: int) -> Dict:
     update_optimization_progress(optimization_id, 25)
     
     try:
+
+        thumbnail_optimization_result = do_thumbnail_optimization(
+            video_id=video.get("video_id"),
+            original_title=title,
+            original_description=description,
+            original_tags=tags,
+            transcript=transcript,
+            competitor_analytics_data=competitor_analytics_data,
+            category_name=category_name,
+            user_id=user_id
+        )
+
         # Call the optimization function with all data
         result = get_comprehensive_optimization(
             original_title=title,
             original_description=description,
             original_tags=tags,
             transcript=transcript,
-            has_captions=has_captions
+            has_captions=has_captions,
+            like_count=like_count,
+            comment_count=comment_count,
+            optimization_decision_data=optimization_decision_data,
+            analytics_data=analytics_data,
+            competitor_analytics_data=competitor_analytics_data,
+            category_name=category_name,
+            user_id=user_id
         )
-        
+
+        if not result:
+            raise Exception("Optimization failed")
+
+        best_optimization = max(result, key=lambda x: x['optimization_score'])
+
+        best_optimization.update({
+            'original_title': title,
+            'original_description': description,
+            'original_tags': tags
+        })
+
         # Update progress - LLM processing complete
         update_optimization_progress(optimization_id, 75)
         
         logger.info(f"Video optimization completed successfully for {title}")
         
         # Store the results in the existing optimization record
-        store_optimization_results(optimization_id, db_video_id, result)
+        optimization_results_stored = store_optimization_results(optimization_id, db_video_id, best_optimization)
+
+        if not optimization_results_stored:
+            raise Exception("Failed to store optimization results")
         
         # Add optimization ID to the result
-        result["id"] = optimization_id
-        
+        best_optimization["id"] = optimization_id
+
+        import asyncio
+
+        optimization_applied = False
+        if apply_optimization:
+            optimization_result = apply_optimization_to_youtube_video(optimization_id, user_id)
+            optimization_applied = optimization_result.get('sucesss')
+
         return {
             "id": optimization_id,
-            "original_title": result.get("original_title", ""),
-            "optimized_title": result.get("optimized_title", ""),
-            "original_description": result.get("original_description", ""),
-            "optimized_description": result.get("optimized_description", ""),
-            "original_tags": result.get("original_tags", []),
-            "optimized_tags": result.get("optimized_tags", []),
-            "optimization_notes": result.get("optimization_notes", "")
+            "original_title": best_optimization.get("original_title", ""),
+            "optimized_title": best_optimization.get("optimized_title", ""),
+            "original_description": best_optimization.get("original_description", ""),
+            "optimized_description": best_optimization.get("optimized_description", ""),
+            "original_tags": best_optimization.get("original_tags", []),
+            "optimized_tags": best_optimization.get("optimized_tags", []),
+            "optimization_notes": best_optimization.get("optimization_notes", ""),
+            "is_applied": optimization_applied
         }
     except Exception as e:
         logger.error(f"Error during video optimization: {str(e)}")
         update_optimization_progress(optimization_id, 0, "failed")
         return {
             "error": f"Optimization failed: {str(e)}",
-            "id": optimization_id
+            "id": optimization_id,
+            "is_applied": False
         }
 
 def store_optimization_results(optimization_id: int, db_video_id: int, optimization_data: Dict) -> bool:
@@ -316,7 +386,7 @@ def get_video_optimizations(db_video_id: int, limit: int = 5) -> List[Dict]:
                     progress,
                     created_at
                 FROM video_optimizations
-                WHERE video_id = %s
+                WHERE video_id = %s AND is_applied = TRUE
                 ORDER BY created_at DESC
                 LIMIT %s
             """, (db_video_id, limit))
@@ -359,144 +429,6 @@ def get_video_optimizations(db_video_id: int, limit: int = 5) -> List[Dict]:
     except Exception as e:
         logger.error(f"Error getting video optimizations: {str(e)}")
         return []
-    finally:
-        if conn:
-            conn.close()
-
-def get_optimization_status(optimization_id: int) -> Dict:
-    """
-    Get the current status of a video optimization
-    
-    Args:
-        optimization_id: The ID of the optimization record
-        
-    Returns:
-        dict: Status information including progress percentage
-    """
-    try:
-        conn = get_connection()
-        with conn.cursor() as cursor:
-            cursor.execute("""
-                SELECT 
-                    video_id,
-                    status,
-                    progress,
-                    created_at,
-                    updated_at
-                FROM video_optimizations
-                WHERE id = %s
-            """, (optimization_id,))
-            
-            result = cursor.fetchone()
-            if not result:
-                logger.warning(f"No optimization found with ID {optimization_id}")
-                return {
-                    "error": "Optimization not found",
-                    "id": optimization_id
-                }
-                
-            video_id, status, progress, created_at, updated_at = result
-            
-            status_info = {
-                "id": optimization_id,
-                "video_id": video_id,
-                "status": status,
-                "progress": progress,
-                "created_at": created_at,
-                "updated_at": updated_at
-            }
-            
-            # If optimization is complete, include the full results
-            if status == "completed" and progress == 100:
-                # Get the complete optimization data
-                cursor.execute("""
-                    SELECT 
-                        original_title,
-                        optimized_title,
-                        original_description,
-                        optimized_description,
-                        original_tags,
-                        optimized_tags,
-                        optimization_notes,
-                        is_applied,
-                        applied_at
-                    FROM video_optimizations
-                    WHERE id = %s
-                """, (optimization_id,))
-                
-                complete_data = cursor.fetchone()
-                if complete_data:
-                    (
-                        original_title,
-                        optimized_title,
-                        original_description,
-                        optimized_description,
-                        original_tags,
-                        optimized_tags,
-                        optimization_notes,
-                        is_applied,
-                        applied_at
-                    ) = complete_data
-                    
-                    # Add result data to the response
-                    status_info.update({
-                        "original_title": original_title,
-                        "optimized_title": optimized_title,
-                        "original_description": original_description,
-                        "optimized_description": optimized_description,
-                        "original_tags": original_tags,
-                        "optimized_tags": optimized_tags,
-                        "optimization_notes": optimization_notes,
-                        "is_applied": is_applied,
-                        "applied_at": applied_at
-                    })
-            
-            return status_info
-            
-    except Exception as e:
-        logger.error(f"Error getting optimization status: {str(e)}")
-        return {
-            "error": f"Error getting optimization status: {str(e)}",
-            "id": optimization_id
-        }
-    finally:
-        if conn:
-            conn.close()
-
-def apply_video_optimization(optimization_id: int) -> bool:
-    """
-    Mark a video optimization as applied
-    
-    Args:
-        optimization_id: The ID of the optimization to apply
-        
-    Returns:
-        bool: True if successfully applied, False otherwise
-    """
-    try:
-        conn = get_connection()
-        with conn.cursor() as cursor:
-            cursor.execute("""
-                UPDATE video_optimizations
-                SET is_applied = TRUE, applied_at = NOW(), updated_at = NOW()
-                WHERE id = %s
-                RETURNING video_id
-            """, (optimization_id,))
-            
-            result = cursor.fetchone()
-            if not result:
-                logger.warning(f"No optimization found with ID {optimization_id}")
-                return False
-                
-            video_id = result[0]
-            conn.commit()
-            
-            logger.info(f"Applied video optimization {optimization_id} for video with DB ID {video_id}")
-            return True
-            
-    except Exception as e:
-        logger.error(f"Error applying video optimization: {str(e)}")
-        return False
     finally:
         if conn:
             conn.close()

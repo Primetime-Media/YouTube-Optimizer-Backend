@@ -155,3 +155,10 @@ async def get_channel_optimization_status(channel_id: int):
     except Exception as e:
         logging.error(f"Error getting optimization status: {e}")
         raise HTTPException(status_code=500, detail=f"Error getting status: {str(e)}")
+
+@router.post("/run_video_optimizations")
+async def run_video_optimizations():
+    from utils.auth import get_app_credentials
+    
+    get_app_credentials()
+

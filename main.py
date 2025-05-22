@@ -71,17 +71,6 @@ app.include_router(video_router)
 async def startup_db_client():
     """Initialize the database and scheduler system on startup."""
     init_db()
-    
-    # Run database migrations
-    conn = get_connection()
-    try:
-        from utils.db import run_migrations
-        run_migrations(conn)
-    except Exception as e:
-        logging.error(f"Error running migrations: {e}")
-    finally:
-        conn.close()
-    
     initialize_scheduler()  # Just initializes scheduler resources, doesn't run any jobs
     logging.info("Database and scheduler system initialized with session management support")
 
@@ -765,7 +754,7 @@ async def get_youtube_data(user_id: int, _: dict = Depends(verify_user_auth)):
                        v.position, v.thumbnail_url_default, v.thumbnail_url_medium, 
                        v.thumbnail_url_high, v.thumbnail_url_standard, v.thumbnail_url_maxres,
                        v.view_count, v.like_count, v.comment_count, v.duration, 
-                       v.is_optimized, v.created_at, v.updated_at
+                       v.is_optimized, v.created_at, v.updated_at, v.queued_for_optimization, v.optimizations_completed
                 FROM youtube_videos v
                 JOIN youtube_channels c ON v.channel_id = c.id
                 WHERE c.user_id = %s
@@ -802,7 +791,9 @@ async def get_youtube_data(user_id: int, _: dict = Depends(verify_user_auth)):
                     "duration": video[20],
                     "is_optimized": video[21],
                     "created_at": video[22],
-                    "updated_at": video[23]
+                    "updated_at": video[23],
+                    "queued_for_optimization": video[24],
+                    "optimizations_completed": video[25]
                 })
         
         conn.close()

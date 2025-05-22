@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     database_url: str = Field(default="")
     client_secret_file: str = Field(
         default="client_secret_941974948417-la4udombfq14du8vea6b8jqmo6d8nbv8.apps.googleusercontent.com.json"
+        #default="client_secret_564580630965-comn96hojuk08survr5pl8qin3qec37l.apps.googleusercontent.com.json"
     )
     frontend_url: str = Field(default="http://localhost:3000")
     redirect_uri: str = Field(default="http://localhost:8080/auth/callback")

@@ -1,10 +1,7 @@
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 import logging
-from services.llm_optimization import get_llm_optimized_title, get_channel_optimization
 from services.channel import get_optimization_status as get_channel_optimization_status
 from services.channel import apply_channel_optimization
-from services.video import get_optimization_status as get_video_optimization_status
-from services.video import apply_video_optimization
 from services.youtube import update_youtube_channel_branding, build_youtube_client, update_youtube_video
 from utils.auth import get_user_credentials
 from utils.db import get_connection
@@ -114,7 +111,7 @@ async def apply_optimization_to_youtube_channel(
             "message": "Error applying optimization"
         }
 
-async def apply_optimization_to_youtube_video(
+def apply_optimization_to_youtube_video(
     optimization_id: int, 
     user_id: int,
     only_title: bool = False,
@@ -122,7 +119,7 @@ async def apply_optimization_to_youtube_video(
     only_tags: bool = False
 ) -> Dict:
     """
-    Apply an optimization to a YouTube video by making the actual API calls
+    Apply an optimization to a YouTube video.
     
     Args:
         optimization_id: The ID of the optimization to apply
@@ -143,7 +140,7 @@ async def apply_optimization_to_youtube_video(
     
     try:
         # Get the optimization record
-        optimization = get_video_optimization_status(optimization_id)
+        optimization = get_optimization_status(optimization_id)
         if "error" in optimization:
             logger.error(f"Error retrieving optimization {optimization_id}: {optimization['error']}")
             return {
@@ -245,3 +242,142 @@ async def apply_optimization_to_youtube_video(
             "error": error_msg,
             "message": "Error applying optimization"
         }
+
+
+def apply_video_optimization(optimization_id: int) -> bool:
+    """
+    Mark a video optimization as applied
+
+    Args:
+        optimization_id: The ID of the optimization to apply
+
+    Returns:
+        bool: True if successfully applied, False otherwise
+    """
+    try:
+        conn = get_connection()
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                UPDATE video_optimizations
+                SET is_applied = TRUE, applied_at = NOW(), updated_at = NOW()
+                WHERE id = %s
+                RETURNING video_id
+            """, (optimization_id,))
+
+            result = cursor.fetchone()
+            if not result:
+                logger.warning(f"No optimization found with ID {optimization_id}")
+                return False
+
+            video_id = result[0]
+            conn.commit()
+
+            logger.info(f"Applied video optimization {optimization_id} for video with DB ID {video_id}")
+            return True
+
+    except Exception as e:
+        logger.error(f"Error applying video optimization: {str(e)}")
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+def get_optimization_status(optimization_id: int) -> Dict:
+    """
+    Get the current status of a video optimization
+
+    Args:
+        optimization_id: The ID of the optimization record
+
+    Returns:
+        dict: Status information including progress percentage
+    """
+    try:
+        conn = get_connection()
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT 
+                    video_id,
+                    status,
+                    progress,
+                    created_at,
+                    updated_at
+                FROM video_optimizations
+                WHERE id = %s
+            """, (optimization_id,))
+
+            result = cursor.fetchone()
+            if not result:
+                logger.warning(f"No optimization found with ID {optimization_id}")
+                return {
+                    "error": "Optimization not found",
+                    "id": optimization_id
+                }
+
+            video_id, status, progress, created_at, updated_at = result
+
+            status_info = {
+                "id": optimization_id,
+                "video_id": video_id,
+                "status": status,
+                "progress": progress,
+                "created_at": created_at,
+                "updated_at": updated_at
+            }
+
+            # If optimization is complete, include the full results
+            if status == "completed" and progress == 100:
+                # Get the complete optimization data
+                cursor.execute("""
+                    SELECT 
+                        original_title,
+                        optimized_title,
+                        original_description,
+                        optimized_description,
+                        original_tags,
+                        optimized_tags,
+                        optimization_notes,
+                        is_applied,
+                        applied_at
+                    FROM video_optimizations
+                    WHERE id = %s
+                """, (optimization_id,))
+
+                complete_data = cursor.fetchone()
+                if complete_data:
+                    (
+                        original_title,
+                        optimized_title,
+                        original_description,
+                        optimized_description,
+                        original_tags,
+                        optimized_tags,
+                        optimization_notes,
+                        is_applied,
+                        applied_at
+                    ) = complete_data
+
+                    # Add result data to the response
+                    status_info.update({
+                        "original_title": original_title,
+                        "optimized_title": optimized_title,
+                        "original_description": original_description,
+                        "optimized_description": optimized_description,
+                        "original_tags": original_tags,
+                        "optimized_tags": optimized_tags,
+                        "optimization_notes": optimization_notes,
+                        "is_applied": is_applied,
+                        "applied_at": applied_at
+                    })
+
+            return status_info
+
+    except Exception as e:
+        logger.error(f"Error getting optimization status: {str(e)}")
+        return {
+            "error": f"Error getting optimization status: {str(e)}",
+            "id": optimization_id
+        }
+    finally:
+        if conn:
+            conn.close()
