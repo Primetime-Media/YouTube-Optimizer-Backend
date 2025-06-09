@@ -4,13 +4,15 @@ import anthropic
 from dotenv import load_dotenv
 import json
 import re
-from typing import Dict, List, Optional, Any
+import numpy as np
+import math
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Any, Tuple
 from services.google_trends_helper import get_trending_data_with_serpapi, select_final_hashtags
+from utils.db import get_connection
 
-# Load environment variables
 load_dotenv()
 
-# Configure logging
 logger = logging.getLogger(__name__)
 
 # Initialize Anthropic client
@@ -32,6 +34,762 @@ DEFAULT_GENERIC_KEYWORDS = [
     "music", "podcast", "episode", "series", "funny", "comedy", "asmr", "reaction"
 ]
 
+def remove_hashtags_from_description(description: str) -> str:
+    """
+    Remove all hashtags from description including #idioma: <language_code> tag and language code
+    
+    Args:
+        description: Original description text
+        
+    Returns:
+        Description with all hashtags removed
+    """
+    if not description:
+        return ""
+    
+    # Remove #idioma: <language_code> pattern (case insensitive)
+    description = re.sub(r'#idioma:\s*\w+', '', description, flags=re.IGNORECASE)
+    
+    # Remove all hashtags (# followed by word characters, possibly with underscores and numbers)
+    description = re.sub(r'#\w+', '', description)
+    
+    # Clean up extra whitespace and newlines
+    description = re.sub(r'\s+', ' ', description)
+    description = description.strip()
+    
+    return description
+
+def extract_existing_ctas(description_text: str) -> str:
+    """
+    Extract existing CTAs (calls-to-action) and important links from a description
+
+    Args:
+        description_text: Original video description
+
+    Returns:
+        String containing preserved CTAs and links
+    """
+    if not description_text:
+        return ""
+
+    lines = description_text.splitlines()
+    preserved_lines = []
+
+    # Patterns that indicate CTAs or important information to preserve
+    cta_patterns = [
+        r'http[s]?://',           # Any URL
+        r'www\.',                 # Web addresses
+        r'@\w+',                  # Social media handles
+        r'subscribe',             # Subscribe calls
+        r'follow',                # Follow calls
+        r'check out',             # Check out links
+        r'visit',                 # Visit calls
+        r'download',              # Download links
+        r'get it on',             # App store links
+        r'available on',          # Platform availability
+        r'patreon',               # Patreon links
+        r'discord',               # Discord invites
+        r'support',               # Support links
+        r'merchandise',           # Merch links
+        r'shop',                  # Shopping links
+    ]
+
+    for line in lines:
+        line_lower = line.lower().strip()
+        if line_lower and any(re.search(pattern, line_lower) for pattern in cta_patterns):
+            preserved_lines.append(line.strip())
+
+    # Also look for common CTA formatting patterns
+    for line in lines:
+        line_stripped = line.strip()
+        if line_stripped and (
+            line_stripped.startswith('🔗') or
+            line_stripped.startswith('📱') or
+            line_stripped.startswith('✅') or
+            line_stripped.startswith('👉') or
+            line_stripped.startswith('🌐') or
+            '→' in line_stripped
+        ):
+            if line_stripped not in preserved_lines:
+                preserved_lines.append(line_stripped)
+
+    return '\n'.join(preserved_lines) if preserved_lines else ""
+
+def preserve_ctas_in_optimization(original_description: str, optimized_description: str) -> str:
+    """
+    Integrate preserved CTAs into the optimized description
+
+    Args:
+        original_description: Original video description
+        optimized_description: LLM-generated optimized description
+
+    Returns:
+        Enhanced description with preserved CTAs
+    """
+    preserved_ctas = extract_existing_ctas(original_description)
+
+    if not preserved_ctas:
+        return optimized_description
+
+    # Add preserved CTAs at the end of the optimized description
+    if optimized_description.strip():
+        enhanced_description = f"{optimized_description.strip()}\n\n{preserved_ctas}"
+    else:
+        enhanced_description = preserved_ctas
+
+    logger.info(f"Preserved {len(preserved_ctas.splitlines())} CTA lines in optimized description")
+    return enhanced_description
+
+def detect_and_translate_content(
+    content: str,
+    content_type: str = "transcript",
+    model: str = "claude-3-7-sonnet-20250219"
+) -> Dict[str, str]:
+    """
+    Detect language and translate content to English using Claude
+
+    Args:
+        content: Text content to analyze and potentially translate
+        content_type: Type of content (transcript, title, description, etc.)
+        model: Claude model to use
+
+    Returns:
+        Dict with original_text, translated_text, detected_language, needs_translation
+    """
+    if not client or not content.strip():
+        return {
+            "original_text": content,
+            "translated_text": content,
+            "detected_language": "en",
+            "needs_translation": False
+        }
+
+    try:
+        system_message = """You are a professional translator and language detection expert. 
+        Your task is to detect the language of provided content and translate it to English if needed.
+        You understand the context of YouTube video content and maintain SEO effectiveness in translations."""
+
+        prompt = f"""
+        Analyze this {content_type} content and:
+        1. Detect the language (use ISO 639-1 codes like 'en', 'es', 'fr', 'de', etc.)
+        2. If it's not English, provide a high-quality translation that maintains:
+           - Original meaning and intent
+           - SEO effectiveness for YouTube
+           - Cultural context where appropriate
+           - Natural flow and readability
+        
+        Content to analyze:
+        "{content[:2000]}{'...' if len(content) > 2000 else ''}"
+        
+        Respond in JSON format:
+        {{
+            "detected_language": "language_code",
+            "needs_translation": true/false,
+            "translated_text": "English translation (only if needs_translation is true)",
+            "confidence": 0.0-1.0
+        }}
+        """
+
+        response = client.messages.create(
+            model=model,
+            max_tokens=2000,
+            temperature=0.3,
+            system=system_message,
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        response_text = response.content[0].text
+
+        # Parse JSON response
+        json_match = re.search(r'{[^}]*}', response_text)
+        if json_match:
+            result = json.loads(json_match.group(0))
+
+            detected_lang = result.get("detected_language", "en")
+            needs_translation = result.get("needs_translation", False)
+            translated_text = result.get("translated_text", content) if needs_translation else content
+
+            logger.info(f"Detected language: {detected_lang}, Translation needed: {needs_translation}")
+
+            return {
+                "original_text": content,
+                "translated_text": translated_text,
+                "detected_language": detected_lang,
+                "needs_translation": needs_translation
+            }
+
+    except Exception as e:
+        logger.error(f"Error in language detection/translation: {e}")
+
+    # Fallback - assume English
+    return {
+        "original_text": content,
+        "translated_text": content,
+        "detected_language": "en",
+        "needs_translation": False
+    }
+
+def create_multilingual_hashtags(
+    english_hashtags: List[str],
+    target_language: str,
+    video_context: str = "",
+    model: str = "claude-3-7-sonnet-20250219"
+) -> List[str]:
+    """
+    Create culturally appropriate hashtags for target language using Claude
+
+    Args:
+        english_hashtags: List of English hashtags
+        target_language: Target language code (e.g., 'es', 'fr', 'de')
+        video_context: Brief context about the video for better localization
+        model: Claude model to use
+
+    Returns:
+        List combining English and localized hashtags
+    """
+    if not client or target_language == "en" or not english_hashtags:
+        return english_hashtags
+
+    try:
+        hashtags_str = ", ".join(english_hashtags)
+
+        system_message = """You are a multilingual YouTube SEO expert specializing in hashtag localization. 
+        You understand how to adapt hashtags for different cultures and languages while maintaining SEO effectiveness."""
+
+        prompt = f"""
+        Create culturally appropriate hashtags in {target_language} for YouTube content.
+        
+        Original English hashtags: {hashtags_str}
+        Video context: {video_context}
+        Target language: {target_language}
+        
+        Guidelines:
+        1. Adapt hashtags to be culturally relevant, not just literal translations
+        2. Consider what terms the target audience actually searches for
+        3. Keep hashtags concise and searchable
+        4. Include both direct translations and cultural adaptations where appropriate
+        5. Return 8-12 hashtags total (mix of adapted and original)
+        6. Format without # symbol
+        
+        Return as JSON array:
+        ["hashtag1", "hashtag2", "hashtag3", ...]
+        """
+
+        response = client.messages.create(
+            model=model,
+            max_tokens=800,
+            temperature=0.4,
+            system=system_message,
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        response_text = response.content[0].text
+
+        # Parse JSON response
+        json_match = re.search(r'\[[^\]]*\]', response_text)
+        if json_match:
+            localized_hashtags = json.loads(json_match.group(0))
+
+            # Combine original English hashtags with localized ones
+            combined_hashtags = list(english_hashtags)  # Start with English
+            for hashtag in localized_hashtags:
+                if hashtag not in combined_hashtags:
+                    combined_hashtags.append(hashtag)
+
+            logger.info(f"Created {len(localized_hashtags)} localized hashtags for {target_language}")
+            return combined_hashtags[:15]  # Limit to 15 total hashtags
+
+    except Exception as e:
+        logger.error(f"Error creating multilingual hashtags: {e}")
+
+    # Fallback to original English hashtags
+    return english_hashtags
+
+def add_language_metadata(description: str, language_code: str) -> str:
+    """
+    Add language metadata to video description
+
+    Args:
+        description: Video description
+        language_code: Language code (e.g., 'en', 'es', 'fr')
+
+    Returns:
+        Description with language metadata appended
+    """
+
+    if language_code == "en":
+        language_line = "#Language: English"
+    else:
+        language_names = {
+            "es": "Español", "fr": "Français", "de": "Deutsch", "it": "Italiano",
+            "pt": "Português", "ru": "Русский", "ja": "日本語", "ko": "한국어",
+            "zh": "中文", "ar": "العربية", "hi": "हिन्दी", "th": "ไทย"
+        }
+        language_name = language_names.get(language_code, language_code.upper())
+        language_line = f"#Language: {language_name} ({language_code})"
+
+    return f"{description.strip()}\n\n{language_line}"
+
+def score_hashtags_transparently(
+    hashtags: List[str],
+    video_keywords: List[str],
+    trending_keywords: List[str],
+    competitor_keywords: List[str],
+    weights: Dict[str, float] = None
+) -> List[Dict[str, Any]]:
+    """
+    Score hashtags with transparent scoring for explainable decisions
+
+    Args:
+        hashtags: List of hashtags to score
+        video_keywords: Keywords extracted from video content
+        trending_keywords: Currently trending keywords
+        competitor_keywords: Keywords from top competitor content
+        weights: Scoring weights for different factors
+
+    Returns:
+        List of hashtag objects with scores and explanations
+    """
+    if weights is None:
+        weights = {
+            "video_relevance": 3.0,    # Hashtag matches video content
+            "trending_bonus": 2.0,     # Hashtag is currently trending
+            "competitor_bonus": 1.0,   # Hashtag used by successful competitors
+            "length_penalty": 0.5,     # Penalty for very long hashtags
+            "uniqueness_bonus": 0.5    # Bonus for unique but relevant hashtags
+        }
+
+    scored_hashtags = []
+
+    for hashtag in hashtags:
+        hashtag_clean = hashtag.lower().strip().lstrip('#')
+        score_details = {
+            "hashtag": hashtag,
+            "base_score": 1.0,
+            "video_relevance_score": 0.0,
+            "trending_score": 0.0,
+            "competitor_score": 0.0,
+            "length_score": 0.0,
+            "uniqueness_score": 0.0,
+            "explanations": []
+        }
+
+        total_score = 1.0  # Base score
+
+        # Video relevance scoring
+        video_matches = [kw for kw in video_keywords if kw.lower() in hashtag_clean or hashtag_clean in kw.lower()]
+        if video_matches:
+            relevance_score = len(video_matches) * weights["video_relevance"]
+            score_details["video_relevance_score"] = relevance_score
+            total_score += relevance_score
+            score_details["explanations"].append(f"Matches video keywords: {', '.join(video_matches)}")
+
+        # Trending keywords scoring
+        trending_matches = [kw for kw in trending_keywords if kw.lower() in hashtag_clean or hashtag_clean in kw.lower()]
+        if trending_matches:
+            trending_score = len(trending_matches) * weights["trending_bonus"]
+            score_details["trending_score"] = trending_score
+            total_score += trending_score
+            score_details["explanations"].append(f"Trending keywords: {', '.join(trending_matches)}")
+
+        # Competitor keywords scoring
+        competitor_matches = [kw for kw in competitor_keywords if kw.lower() in hashtag_clean or hashtag_clean in kw.lower()]
+        if competitor_matches:
+            competitor_score = len(competitor_matches) * weights["competitor_bonus"]
+            score_details["competitor_score"] = competitor_score
+            total_score += competitor_score
+            score_details["explanations"].append(f"Used by competitors: {', '.join(competitor_matches)}")
+
+        # Length penalty (very long hashtags are harder to discover)
+        if len(hashtag_clean) > 20:
+            length_penalty = (len(hashtag_clean) - 20) * weights["length_penalty"]
+            score_details["length_score"] = -length_penalty
+            total_score -= length_penalty
+            score_details["explanations"].append(f"Length penalty: {len(hashtag_clean)} characters")
+        elif len(hashtag_clean) < 3:
+            length_penalty = (3 - len(hashtag_clean)) * weights["length_penalty"]
+            score_details["length_score"] = -length_penalty
+            total_score -= length_penalty
+            score_details["explanations"].append(f"Too short penalty: {len(hashtag_clean)} characters")
+
+        # Uniqueness bonus (moderate frequency is ideal)
+        hashtag_frequency = sum(1 for h in hashtags if hashtag_clean in h.lower() or h.lower() in hashtag_clean)
+        if hashtag_frequency == 1:  # Unique but relevant
+            uniqueness_bonus = weights["uniqueness_bonus"]
+            score_details["uniqueness_score"] = uniqueness_bonus
+            total_score += uniqueness_bonus
+            score_details["explanations"].append("Uniqueness bonus: distinctive hashtag")
+
+        score_details["total_score"] = round(total_score, 2)
+        score_details["score_explanation"] = "; ".join(score_details["explanations"]) if score_details["explanations"] else "Base scoring only"
+
+        scored_hashtags.append(score_details)
+
+    scored_hashtags.sort(key=lambda x: x["total_score"], reverse=True)
+
+    return scored_hashtags
+
+def select_top_hashtags_with_scoring(
+    all_hashtags: List[str],
+    video_keywords: List[str],
+    trending_keywords: List[str],
+    competitor_keywords: List[str],
+    max_hashtags: int = 10,
+    min_score: float = 2.0
+) -> Dict[str, Any]:
+    """
+    Select top hashtags using transparent scoring
+
+    Returns:
+        Dict containing selected hashtags and scoring details
+    """
+    scored_hashtags = score_hashtags_transparently(
+        all_hashtags,
+        video_keywords,
+        trending_keywords,
+        competitor_keywords
+    )
+
+    # Filter by minimum score and limit count
+    top_hashtags = [
+        h for h in scored_hashtags
+        if h["total_score"] >= min_score
+    ][:max_hashtags]
+
+    selected_hashtags = [h["hashtag"] for h in top_hashtags]
+
+    logger.info(f"Selected {len(selected_hashtags)} hashtags with scores >= {min_score}")
+
+    return {
+        "selected_hashtags": selected_hashtags,
+        "scoring_details": top_hashtags,
+        "total_evaluated": len(all_hashtags),
+        "selection_criteria": {
+            "max_hashtags": max_hashtags,
+            "min_score": min_score,
+            "avg_score": round(sum(h["total_score"] for h in top_hashtags) / len(top_hashtags), 2) if top_hashtags else 0
+        }
+    }
+
+def extract_chapters_from_transcript(
+    transcript: str, 
+    video_title: str = "",
+    max_chapters: int = 8,
+    min_chapter_length: int = 30,
+    model: str = "claude-3-7-sonnet-20250219"
+) -> List[Dict[str, Any]]:
+    """
+    Extract natural chapter breaks and timestamps from video transcript using Claude
+    
+    Args:
+        transcript: Full video transcript with timing if available
+        video_title: Video title for context
+        max_chapters: Maximum number of chapters to generate
+        min_chapter_length: Minimum length (in seconds) for each chapter
+        model: Claude model to use
+        
+    Returns:
+        List of chapter objects with timestamps and titles
+    """
+    if not client or not transcript or len(transcript) < 200:
+        return []
+    
+    try:
+        system_message = """You are a video editing expert specializing in creating engaging chapter markers for YouTube videos. 
+        You understand how to identify natural topic transitions, key moments, and logical content breaks that improve viewer experience and watch time."""
+        
+        # Limit transcript length for processing
+        if len(transcript) > 3000:
+            transcript_sample = transcript[:1500] + "\n\n[MIDDLE SECTION]\n\n" + transcript[-1500:]
+        else:
+            transcript_sample = transcript
+        
+        prompt = f"""
+        Analyze this video transcript and create YouTube chapter markers that will improve viewer experience and watch time.
+        
+        Video Title: {video_title}
+        
+        Transcript:
+        {transcript_sample}
+        
+        Guidelines for creating chapters:
+        1. Identify natural topic transitions and key moments
+        2. Create 3-{max_chapters} chapters (ideal for user navigation)
+        3. Each chapter should be at least {min_chapter_length} seconds long
+        4. Chapter titles should be engaging and descriptive (under 50 characters)
+        5. First chapter should start at 0:00
+        6. Look for phrases like "now let's", "next", "moving on", "another thing", etc. as transition indicators
+        7. Consider introductions, main topics, examples, and conclusions as natural breaks
+        
+        If transcript doesn't have timestamps, estimate based on content length and speaking pace (average 150-200 words per minute).
+        
+        Return as JSON array:
+        [
+            {{
+                "timestamp": "0:00",
+                "title": "Introduction & Overview",
+                "description": "Brief description of chapter content"
+            }},
+            {{
+                "timestamp": "2:30", 
+                "title": "Main Topic Discussion",
+                "description": "Brief description of chapter content"
+            }}
+        ]
+        
+        Only return the JSON array, no other text.
+        """
+        
+        response = client.messages.create(
+            model=model,
+            max_tokens=1000,
+            temperature=0.4,
+            system=system_message,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        
+        response_text = response.content[0].text
+        
+        # Extract JSON array
+        json_match = re.search(r'\[[^\]]*\]', response_text, re.DOTALL)
+        if json_match:
+            chapters = json.loads(json_match.group(0))
+            
+            if isinstance(chapters, list) and len(chapters) >= 2:
+                # Validate and clean up chapters
+                valid_chapters = []
+                for chapter in chapters:
+                    if isinstance(chapter, dict) and "timestamp" in chapter and "title" in chapter:
+                        # Ensure timestamp format is valid
+                        timestamp = chapter["timestamp"]
+                        if re.match(r'^\d+:\d{2}$', timestamp):  # Format: M:SS or MM:SS
+                            valid_chapters.append({
+                                "timestamp": timestamp,
+                                "title": chapter["title"][:50],  # Limit title length
+                                "description": chapter.get("description", "")[:100]  # Limit description
+                            })
+                
+                if len(valid_chapters) >= 2:
+                    logger.info(f"Extracted {len(valid_chapters)} chapters from transcript")
+                    return valid_chapters
+                
+        logger.warning("Could not extract valid chapters from transcript")
+        return []
+        
+    except Exception as e:
+        logger.error(f"Error extracting chapters from transcript: {e}")
+        return []
+
+def format_chapters_for_description(chapters: List[Dict[str, Any]]) -> str:
+    """
+    Format chapters for inclusion in video description
+    
+    Args:
+        chapters: List of chapter objects with timestamp and title
+        
+    Returns:
+        Formatted string for video description
+    """
+    if not chapters:
+        return ""
+    
+    formatted_lines = ["📖 Chapters:"]
+    for chapter in chapters:
+        timestamp = chapter.get("timestamp", "0:00")
+        title = chapter.get("title", "Chapter")
+        formatted_lines.append(f"{timestamp} {title}")
+    
+    return "\n".join(formatted_lines)
+
+def run_iterative_optimization(
+    optimization_func,
+    iterations: int = 3,
+    selection_criteria: str = "best_score"
+) -> List[Dict]:
+    """
+    Run optimization multiple times and select the best results
+    
+    Args:
+        optimization_func: Function that returns optimization results
+        iterations: Number of optimization runs to perform
+        selection_criteria: How to select the best results ('best_score', 'diversity', 'combined')
+        
+    Returns:
+        Best optimization results from multiple runs
+    """
+    all_results = []
+    
+    for i in range(iterations):
+        logger.info(f"Running optimization iteration {i+1}/{iterations}")
+        
+        try:
+            # Run optimization with slight temperature variation for diversity
+            temperature_adjustment = i * 0.05  # Slight variation each run
+            results = optimization_func(temperature_adjustment=temperature_adjustment)
+            
+            if results:
+                # Add iteration metadata
+                for result in results:
+                    result['iteration'] = i + 1
+                    result['temperature_used'] = 0.7 + temperature_adjustment
+                
+                all_results.extend(results)
+                logger.info(f"Iteration {i+1} generated {len(results)} optimization variations")
+        
+        except Exception as e:
+            logger.error(f"Error in optimization iteration {i+1}: {e}")
+            continue
+    
+    if not all_results:
+        logger.warning("No successful optimization results from any iteration")
+        return []
+    
+    # Select best results based on criteria
+    if selection_criteria == "best_score":
+        # Sort by optimization score and take top 3
+        scored_results = [r for r in all_results if 'optimization_score' in r]
+        if scored_results:
+            scored_results.sort(key=lambda x: x.get('optimization_score', 0), reverse=True)
+            selected_results = scored_results[:3]
+        else:
+            selected_results = all_results[:3]
+    
+    elif selection_criteria == "diversity":
+        # Select diverse results based on title and description differences
+        selected_results = select_diverse_optimizations(all_results, max_results=3)
+    
+    elif selection_criteria == "combined":
+        # Combine score and diversity considerations
+        selected_results = select_best_combined_optimizations(all_results, max_results=3)
+    
+    else:
+        # Default to taking first 3 results
+        selected_results = all_results[:3]
+    
+    logger.info(f"Selected {len(selected_results)} best optimizations from {len(all_results)} total variations")
+    
+    # Add selection metadata
+    for i, result in enumerate(selected_results):
+        result['final_rank'] = i + 1
+        result['selection_method'] = selection_criteria
+    
+    return selected_results
+
+def select_diverse_optimizations(all_results: List[Dict], max_results: int = 3) -> List[Dict]:
+    """
+    Select diverse optimization results to provide variety
+    """
+    if len(all_results) <= max_results:
+        return all_results
+    
+    selected = []
+    remaining = all_results.copy()
+    
+    # Always include the highest scored result first
+    if remaining:
+        best_scored = max(remaining, key=lambda x: x.get('optimization_score', 0))
+        selected.append(best_scored)
+        remaining.remove(best_scored)
+    
+    # Select remaining results based on diversity
+    while len(selected) < max_results and remaining:
+        best_candidate = None
+        max_diversity_score = -1
+        
+        for candidate in remaining:
+            diversity_score = calculate_diversity_score(candidate, selected)
+            if diversity_score > max_diversity_score:
+                max_diversity_score = diversity_score
+                best_candidate = candidate
+        
+        if best_candidate:
+            selected.append(best_candidate)
+            remaining.remove(best_candidate)
+        else:
+            break
+    
+    return selected
+
+def calculate_diversity_score(candidate: Dict, selected: List[Dict]) -> float:
+    """
+    Calculate how different a candidate is from already selected results
+    """
+    if not selected:
+        return 1.0
+    
+    candidate_title = candidate.get('optimized_title', '').lower()
+    candidate_desc = candidate.get('optimized_description', '').lower()
+    
+    min_similarity = float('inf')
+    
+    for selected_item in selected:
+        selected_title = selected_item.get('optimized_title', '').lower()
+        selected_desc = selected_item.get('optimized_description', '').lower()
+        
+        # Simple similarity based on common words
+        title_similarity = calculate_text_similarity(candidate_title, selected_title)
+        desc_similarity = calculate_text_similarity(candidate_desc, selected_desc)
+        
+        # Combined similarity (weighted toward title differences)
+        combined_similarity = (title_similarity * 0.7) + (desc_similarity * 0.3)
+        min_similarity = min(min_similarity, combined_similarity)
+    
+    # Return diversity score (1 - similarity)
+    return 1.0 - min_similarity
+
+def calculate_text_similarity(text1: str, text2: str) -> float:
+    """
+    Calculate basic text similarity based on common words
+    """
+    if not text1 or not text2:
+        return 0.0
+    
+    words1 = set(text1.split())
+    words2 = set(text2.split())
+    
+    if not words1 or not words2:
+        return 0.0
+    
+    intersection = words1.intersection(words2)
+    union = words1.union(words2)
+    
+    return len(intersection) / len(union) if union else 0.0
+
+def select_best_combined_optimizations(all_results: List[Dict], max_results: int = 3) -> List[Dict]:
+    """
+    Select optimizations based on both score and diversity
+    """
+    if len(all_results) <= max_results:
+        return all_results
+    
+    # Score each result with combined score and diversity weight
+    scored_results = []
+    
+    for result in all_results:
+        optimization_score = result.get('optimization_score', 0)
+        
+        # Calculate diversity from all other results
+        diversity_scores = []
+        for other_result in all_results:
+            if other_result != result:
+                diversity = calculate_diversity_score(result, [other_result])
+                diversity_scores.append(diversity)
+        
+        avg_diversity = sum(diversity_scores) / len(diversity_scores) if diversity_scores else 0.5
+        
+        # Combined score: 70% optimization quality, 30% diversity
+        combined_score = (optimization_score * 0.7) + (avg_diversity * 0.3)
+        
+        scored_results.append({
+            **result,
+            'combined_score': combined_score,
+            'diversity_component': avg_diversity
+        })
+    
+    # Sort by combined score and select top results
+    scored_results.sort(key=lambda x: x['combined_score'], reverse=True)
+    return scored_results[:max_results]
+
 def get_comprehensive_optimization(
     original_title: str,
     original_description: str = "",
@@ -46,7 +804,9 @@ def get_comprehensive_optimization(
     category_name: str = "",
     model: str = "claude-3-7-sonnet-20250219",
     max_retries: int = 3,
-    user_id: Optional[int] = None
+    user_id: Optional[int] = None,
+    maintain_full_original_description: bool = True, # Flag to maintain full original description
+    prev_optimizations: List[Dict] = [] # List of existing optimizations
 ) -> Dict:
     """
     Generate comprehensive optimizations for a YouTube video including
@@ -74,7 +834,6 @@ def get_comprehensive_optimization(
             "optimization_notes": 'No optimization performed since Anthropic client not initialized.'
         }
 
-    # Safely check transcript length
     transcript_length = 0
     if transcript is not None:
         transcript_length = len(transcript)
@@ -82,17 +841,38 @@ def get_comprehensive_optimization(
         transcript = ""
     logger.info(f"Transcript length: {transcript_length}")
 
-    # Prepare tags string
+    # Handle multi-language content - detect and translate if needed
+    original_language = "en"
+    translated_transcript = transcript
+    translated_title = original_title
+    translated_description = original_description
+    
+    if transcript and len(transcript) > 100:
+        # Detect and translate transcript
+        transcript_translation = detect_and_translate_content(transcript, "transcript")
+        original_language = transcript_translation["detected_language"]
+        translated_transcript = transcript_translation["translated_text"]
+        
+        # If we translated the transcript, also translate title and description for consistency
+        if transcript_translation["needs_translation"]:
+            logger.info(f"Detected non-English content ({original_language}), translating for optimization")
+            
+            title_translation = detect_and_translate_content(original_title, "title")
+            translated_title = title_translation["translated_text"]
+            
+            if original_description:
+                desc_translation = detect_and_translate_content(original_description, "description")
+                translated_description = desc_translation["translated_text"]
+
     tags_str = ", ".join(original_tags) if original_tags else "No tags available"
 
-    # Create an array to collect error messages from retry attempts
     retry_errors = []
 
-    # Extract video keywords from video data
+    # Extract video keywords from video data (use translated content for better keyword extraction)
     video_keywords = extract_keywords_with_llm(
-        original_title,
-        original_description,
-        transcript,
+        translated_title,
+        translated_description,
+        translated_transcript,
         original_tags,
         min_keywords=3,
         max_keywords=5
@@ -135,7 +915,7 @@ def get_comprehensive_optimization(
                                     try:
                                         value = int(value.replace("%", "").strip())
                                     except (ValueError, TypeError):
-                                        value = 50  # Default value if parsing fails
+                                        value = 50
 
                                 # Add to results if not already in list
                                 if not any(k["query"] == query_text for k in extracted_keywords):
@@ -144,7 +924,7 @@ def get_comprehensive_optimization(
                                         "interest_score": value
                                     })
 
-                    # Extract from rising queries (these are typically high interest)
+                    # Extract from rising queries (typically high interest)
                     rising_queries = queries_data.get("rising", [])
                     if isinstance(rising_queries, list):
                         for query_item in rising_queries:
@@ -198,8 +978,7 @@ def get_comprehensive_optimization(
     # Extract keywords from both data sources
     trending_keywords_data = extract_keywords_from_trend_data(trending_data)
     competitor_trending_keywords_data = extract_keywords_from_trend_data(competitor_trending_data)
-    
-    # Extract just the keywords for logging
+
     trending_keywords = [item["query"] for item in trending_keywords_data]
     competitor_trending_keywords = [item["query"] for item in competitor_trending_keywords_data]
     
@@ -209,7 +988,6 @@ def get_comprehensive_optimization(
     # Process and select optimal hashtags from hero keywords (video) and trend keywords (combined)
     optimized_hashtags = []
     try:
-        # Combine trending data, preserving interest scores
         combined_trend_keywords_data = trending_keywords_data + competitor_trending_keywords_data
         
         # Filter out generic keywords using LLM
@@ -221,7 +999,7 @@ def get_comprehensive_optimization(
                 "transcript": transcript,
                 "category_name": category_name,
             }
-            # Extract just the keyword strings for LLM filtering
+
             keyword_strings = [item["query"] for item in combined_trend_keywords_data]
             filtered_keyword_strings = filter_generic_keywords_with_llm(keywords=keyword_strings, video_data=video_data)
             
@@ -232,14 +1010,37 @@ def get_comprehensive_optimization(
             ]
             logger.info(f"After generic keyword filtering: {len(combined_trend_keywords_data)} keywords remain")
         
-        # Now pass the filtered keywords to select_final_hashtags
-        if combined_trend_keywords_data and user_id:
+        # Select hashtags using transparent scoring system for explainable decisions
+        hashtag_scoring_details = None
+        if False and combined_trend_keywords_data:
+            # Extract just the keywords for transparent scoring
+            all_trend_keywords = [item["query"] for item in combined_trend_keywords_data]
+            competitor_keywords = competitor_analytics_data.get('competitor_keywords', {}).get('keywords', [])
+            
+            # Use transparent scoring system
+            hashtag_selection = select_top_hashtags_with_scoring(
+                all_hashtags=all_trend_keywords,
+                video_keywords=video_keywords,
+                trending_keywords=trending_keywords,
+                competitor_keywords=competitor_keywords,
+                max_hashtags=10,
+                min_score=2.0
+            )
+            
+            optimized_hashtags = hashtag_selection["selected_hashtags"]
+            hashtag_scoring_details = hashtag_selection["scoring_details"]
+            
+            logger.info(f"Selected {len(optimized_hashtags)} hashtags using transparent scoring")
+            logger.info(f"Average score: {hashtag_selection['selection_criteria']['avg_score']}")
+            
+        elif user_id:
+            # Fallback to original method if transparent scoring fails
             optimized_hashtags = select_final_hashtags(
                 trend_keywords_data=combined_trend_keywords_data,
                 user_id=user_id,
                 num_final_hashtags=10
             )
-            logger.info(f"Selected {len(optimized_hashtags)} optimized hashtags: {optimized_hashtags}")
+            logger.info(f"Selected {len(optimized_hashtags)} optimized hashtags using fallback method")
         else:
             if not combined_trend_keywords_data:
                 logger.warning("No trend keywords available for hashtag optimization")
@@ -282,11 +1083,9 @@ def get_comprehensive_optimization(
     # Try multiple times with slightly different prompts
     for attempt in range(max_retries):
         try:
-            # Log retry attempts
             if attempt > 0:
                 logger.info(f"Retry attempt {attempt} for comprehensive optimization")
 
-            # Adjust temperature slightly on retries to get different outputs
             temperature = 0.7 + (attempt * 0.1)
 
             system_message = """You are a YouTube SEO expert who specializes in optimizing videos for maximum engagement, 
@@ -295,7 +1094,6 @@ def get_comprehensive_optimization(
             
             IMPORTANT: Your response MUST be valid JSON with properly escaped characters."""
 
-            # Adjust the prompt slightly for each retry
             json_emphasis = ""
             if attempt > 0:
                 json_emphasis = """
@@ -304,18 +1102,49 @@ def get_comprehensive_optimization(
                 Make sure all quotes are properly escaped and all values are valid JSON.
                 """
 
-            # Format transcript for prompt inclusion
+            # Format transcript for prompt inclusion (use translated version if available)
             transcript_section = ""
-            if transcript and len(transcript) > 0:
-                # If transcript is very long, use the first ~1500 characters
-                if len(transcript) > 2000:
-                    transcript_text = transcript[:1500] + "... [transcript truncated]"
+            if translated_transcript and len(translated_transcript) > 0:
+                if len(translated_transcript) > 2000:
+                    transcript_text = translated_transcript[:1500] + "... [transcript truncated]"
                 else:
-                    transcript_text = transcript
+                    transcript_text = translated_transcript
 
                 transcript_section = f"""
                 VIDEO TRANSCRIPT:
                 {transcript_text}
+                """
+
+            # Language context for optimization
+            language_context = ""
+            if original_language != "en":
+                language_context = f"""
+                LANGUAGE CONTEXT:
+                - Original content language: {original_language}
+                - Content has been translated to English for optimization analysis
+                - Consider creating multilingual hashtags and metadata when appropriate
+                """
+
+            # NEW DESCRIPTION INSTRUCTIONS FOR OPTIMIZATION
+            if maintain_full_original_description:
+                description_instructions_section = f"""
+                For the DESCRIPTION:
+                    - Write a keyword-rich 2-3 line description that captures the essence of the video.
+                    - Do not include any hashtags, links, timestamps, or calls-to-action in the description.
+                    - Avoid any placeholders - the description should be ready to publish as-is
+                    - This MUST be purely a keyword-rich description of the video content.
+                """
+            else:
+                description_instructions_section = f"""
+                For the DESCRIPTION:
+                    - Front-load important keywords and OPTIMIZED HASHTAGS in the first 2-3 sentences.
+                    - Include a clear call-to-action (subscribe, like, comment)
+                    - Add timestamps for longer videos (if applicable)
+                    - Incorporate relevant OPTIMIZED HASHTAGS (3-5 is optimal) throughout the description, especially near related content or calls-to-action.
+                    - Keep it engaging but concise
+                    - EXTREMELY IMPORTANT: DO NOT include placeholder text like "[Link to Playlist]" or "[Social Media Links]" - ONLY include actual, real URLs that appear in the original description
+                    - If you don't have actual URLs or links, do not mention them at all
+                    - Avoid any placeholders - the description should be ready to publish as-is
                 """
 
             prompt = f"""
@@ -329,6 +1158,8 @@ def get_comprehensive_optimization(
             ORIGINAL TAGS: {tags_str}
             
             {transcript_section}
+            
+            {language_context}
             
             {trending_keywords_prompt_section}
             
@@ -355,19 +1186,11 @@ def get_comprehensive_optimization(
             - Use strategic capitalization, symbols, or emojis if appropriate
             - Consider including 1-2 of the most relevant OPTIMIZED HASHTAGS if they fit naturally and enhance discoverability.
 
-            For the DESCRIPTION:
-            - Front-load important keywords and OPTIMIZED HASHTAGS in the first 2-3 sentences.
-            - Include a clear call-to-action (subscribe, like, comment)
-            - Add timestamps for longer videos (if applicable)
-            - Incorporate relevant OPTIMIZED HASHTAGS (3-5 is optimal) throughout the description, especially near related content or calls-to-action.
-            - Keep it engaging but concise
-            - EXTREMELY IMPORTANT: DO NOT include placeholder text like "[Link to Playlist]" or "[Social Media Links]" - ONLY include actual, real URLs that appear in the original description
-            - If you don't have actual URLs or links, do not mention them at all
-            - Avoid any placeholders - the description should be ready to publish as-is
+            {description_instructions_section}
 
             For the TAGS:
             - Focus on trending tags that are relevant to the content.
-            - Crucially, ensure the provided OPTIMIZED HASHTAGS are included in your list of tags.**
+            - Crucially, ensure the provided OPTIMIZED HASHTAGS are included in your list of tags.
             - Each tag should not contain any whitespace or punctuation; they should be single words or joined phrases (e.g., tag, thisisatag).
             - Include exact and phrase match keywords.
             - Focus on specific, niche tags rather than broad ones.
@@ -468,66 +1291,76 @@ def get_comprehensive_optimization(
                 if content.type == "tool_use" and content.name == "provide_comprehensive_video_optimizations":
                     generated_optimizations = content.input
                     if generated_optimizations.get('optimizations'):
-                        return generated_optimizations['optimizations']
+                        # Extract chapters from transcript for longer videos
+                        extracted_chapters = []
+                        if translated_transcript and len(translated_transcript) > 500:  # Only for substantial content
+                            extracted_chapters = extract_chapters_from_transcript(
+                                translated_transcript, 
+                                original_title, 
+                                max_chapters=6
+                            )
+                        
+                        # Apply CTA preservation, chapter integration, and multilingual enhancements to each optimization variation
+                        optimizations = generated_optimizations['optimizations']
+                        for optimization in optimizations:
+                            # Apply CTA preservation
+                            if 'optimized_description' in optimization:
+                                #optimization['optimized_description'] = preserve_ctas_in_optimization(
+                                 #   original_description,
+                                  #  optimization['optimized_description']
+                                #)
 
-            """
-            # Parse the response
-            response_text = message.content[0].text
+                                # Remove all hashtags from original description
+                                original_description_no_hashtags = remove_hashtags_from_description(original_description)
 
-            # Two parsing methods to try
-            parsing_methods = [
-                {
-                    "name": "json_loads",
-                    "func": lambda text: json.loads(text[text.find('['):text.rfind(']')])
-                },
-                {
-                    "name": "json_pattern_match",
-                    "func": lambda text: parse_json_with_pattern(text)
-                },
-                {
-                    "name": "text_extraction",
-                    "func": lambda text: extract_optimization_from_text(
-                    text, original_title, original_description, original_tags
-                )
-                }
-            ]
+                                # Add 5 top hashtags to the top of the description
+                                if optimized_hashtags:
+                                    formatted_top_hashtags = [f"#{tag}" for tag in optimized_hashtags][:5]
+                                    top_hashtags_str = " ".join(formatted_top_hashtags)
 
-            # Try each parsing method
-            last_error = None
-            for method in parsing_methods:
-                try:
-                    logger.info(f"Trying parsing method: {method['name']}")
-                    result = method["func"](response_text)
+                                    formatted_bottom_hashtags = [f"#{tag}" for tag in optimized_hashtags][5:7]
+                                    bottom_hashtags_str = " ".join(formatted_bottom_hashtags)
+                                    language_hashtag = f"#idioma: {original_language}"
 
-                    # --- MODIFIED VALIDATION ---
-                    # Check if result is a list of 3 valid optimization dicts
-                    is_list_of_3 = isinstance(result, list) and len(result) == 3
-                    all_items_valid = False
-                    if is_list_of_3:
-                        # Check each item in the list using the original validation function
-                        all_items_valid = all(is_valid_optimization_result(item) for item in result)
+                                    bottom_line = f"{bottom_hashtags_str} {language_hashtag}"
 
-                    # If we got a valid list of 3 results, return it
-                    if is_list_of_3 and all_items_valid:
-                        logger.info(f"Successfully parsed response as list of 3 with method: {method['name']}")
-                        return result # Return the list of 3 dicts
-                    else:
-                        # Log why validation failed
-                        if not is_list_of_3:
-                             logger.warning(f"Parsing method {method['name']} did not return a list of 3 items. Result type: {type(result)}, Length: {len(result) if isinstance(result, list) else 'N/A'}")
-                        elif not all_items_valid:
-                             logger.warning(f"Parsing method {method['name']} returned a list, but not all 3 items were valid.")
-                        # Raise an error to try the next parsing method or fail the attempt
-                        raise ValueError("Parsed result is not a list of 3 valid optimization objects.")
-                    # --- END MODIFIED VALIDATION ---
+                                    if len(prev_optimizations) == 0:
+                                        new_description = f"""{top_hashtags_str}\n\n{optimization['optimized_description']}\n\n{original_description_no_hashtags}\n\n{bottom_line}"""
+                                    else: # Only add the hashtags lines if this is not the first optimization
+                                        new_description = f"""{top_hashtags_str}\n\n{original_description_no_hashtags}\n\n{bottom_line}"""
 
-                except Exception as e:
-                    last_error = e
-                    logger.warning(f"Parsing method {method['name']} failed: {e}")
+                                    optimization['optimized_description'] = new_description
 
-            # If we got here, all parsing methods failed for this attempt
-            retry_errors.append(f"Attempt {attempt+1}: All parsing methods failed. Last error: {last_error}")
-            """
+                                # Add chapters if extracted
+                                if False and extracted_chapters:
+                                    chapters_formatted = format_chapters_for_description(extracted_chapters)
+                                    optimization['optimized_description'] = f"{optimization['optimized_description']}\n\n{chapters_formatted}"
+                                
+                                # Add language metadata if non-English (done earlier)
+                                if False and original_language != "en":
+                                    optimization['optimized_description'] = add_language_metadata(
+                                        optimization['optimized_description'], 
+                                        original_language
+                                    )
+                            
+                            # Create multilingual hashtags if needed
+                            if original_language != "en" and 'optimized_tags' in optimization:
+                                english_tags = optimization['optimized_tags']
+                                video_context = f"{original_title} - {category_name if category_name else 'Video'}"
+                                
+                                multilingual_tags = create_multilingual_hashtags(
+                                    english_tags, 
+                                    original_language, 
+                                    video_context
+                                )
+                                optimization['optimized_tags'] = multilingual_tags
+                                
+                                # Add language info to optimization notes
+                                if 'optimization_notes' in optimization:
+                                    optimization['optimization_notes'] += f"\n\nLanguage: Enhanced for {original_language} audience with multilingual hashtags."
+                        
+                        return optimizations
+
         except Exception as e:
             logger.error(f"Retry attempt {attempt+1} failed with error: {e}")
             retry_errors.append(f"Attempt {attempt+1}: {str(e)}")
@@ -538,7 +1371,6 @@ def get_comprehensive_optimization(
 
 def parse_json_with_pattern(response_text: str) -> Dict:
     """Parse JSON from text with multiple fallback methods"""
-    # Look for JSON pattern
     json_match = re.search(r'({[\s\S]*})', response_text)
 
     if not json_match:
@@ -563,7 +1395,7 @@ def parse_json_with_pattern(response_text: str) -> Dict:
         except json.JSONDecodeError:
             # Third attempt: More aggressive cleaning
             logger.warning("Control character cleanup failed, trying more aggressive cleaning")
-            # Strip all whitespace and try to fix common JSON errors
+
             clean_json = re.sub(r'[\s\t\n\r]+', ' ', clean_json)
             clean_json = clean_json.replace('}, }', '}}').replace('},}', '}}')
             clean_json = clean_json.replace('], }', ']}').replace(',]}', ']}')
@@ -963,8 +1795,8 @@ async def should_optimize_video(
     ]) if past_optimizations else 'No previous optimizations'
 
     recent_performance_data_prompt = '\n'.join([
-        f"{day['day']}: {day['views']} views, {day['averageViewPercentage']}% watched"
-        for day in analytics_data.get('data_points', [])
+        f"{day['date']}: {day['views']} views, {day.get('view_percentage', 0):.1f}% watched"
+        for day in analytics_data.get('timeseries_data', [])
     ])
 
     system_message = """You are a YouTube SEO expert AI assistant. Your task is to analyze video performance data and decide if the video's metadata (title, description, tags) should be optimized to improve performance. Provide a clear 'YES' or 'NO' decision, a brief reasoning based *only* on the provided data, and a confidence score between 0.0 and 1.0. Respond strictly in JSON format."""
@@ -1026,18 +1858,14 @@ async def should_optimize_video(
                 ]
             )
 
-            # Parse the response
             response_text = message.content[0].text
             logger.debug(f"Claude response for optimization check: {response_text}")
 
-            # Look for JSON array pattern (e.g., [{...}]) as the primary target
             json_match = re.search(r'\[[\s\S]*\]', response_text)
             if json_match:
                 json_str = json_match.group(0)
-                # Attempt to parse the found string as a JSON array
                 response_list = json.loads(json_str)
 
-                # Check if the list is not empty and contains at least one dictionary
                 if isinstance(response_list, list) and len(response_list) > 0 and isinstance(response_list[0], dict):
                     response_data = response_list[0]  # Get the first object from the array
                     decision = response_data.get("decision", "NO").upper()
@@ -1051,7 +1879,6 @@ async def should_optimize_video(
                     raise ValueError("Parsed JSON array is not valid or empty.")
 
             else:
-                # Fallback: If no JSON array is found, attempt to find a JSON object pattern
                 logger.warning("No JSON array pattern found in response, attempting to find JSON object pattern...")
                 json_match_obj = re.search(r'{[\s\S]*}', response_text)
                 if json_match_obj:
@@ -1072,7 +1899,6 @@ async def should_optimize_video(
                     logger.error(f"No JSON pattern (array or object) found in response: {response_text}")
                     raise ValueError("No JSON pattern (array or object) found in response.")
 
-            # Return statement remains the same
             return {
                 "should_optimize": should_optimize,
                 "reasons": reasons,
@@ -1620,7 +2446,6 @@ def extract_competitor_keywords(top_competitor_videos, video_data, max_keywords=
     """
     
     try:
-        # Call the Claude API
         response = client.messages.create(
             model=model,
             max_tokens=1000,
@@ -1628,12 +2453,10 @@ def extract_competitor_keywords(top_competitor_videos, video_data, max_keywords=
             system=system_message,
             messages=[{"role": "user", "content": prompt}]
         )
-        
-        # Parse the response
+
         if response.content and len(response.content) > 0:
             response_text = response.content[0].text.strip()
-            
-            # Extract JSON
+
             result = parse_json_with_pattern(response_text)
             
             if result and "keywords" in result and isinstance(result["keywords"], list):
@@ -1646,8 +2469,7 @@ def extract_competitor_keywords(top_competitor_videos, video_data, max_keywords=
                 result["keywords"] = [kw for kw in processed_keywords if kw][:max_keywords]
                 logger.info(f"Extracted competitor keywords relevant to user video: {result['keywords']}")
                 return result
-        
-        # Fallback if parsing fails
+
         logger.warning("Couldn't parse competitor keywords from model response")
         return {
             "keywords": [],
@@ -1760,3 +2582,575 @@ def filter_generic_keywords_with_llm(
     except Exception as e:
         logger.error(f"Error in LLM keyword filtering: {e}")
         return keywords
+
+
+# ============================================================================
+# STATISTICAL OPTIMIZATION FUNCTIONS
+# ============================================================================
+
+def fetch_video_analytics_timeseries(video_id: str, days: int = 30) -> List[float]:
+    """
+    Fetch daily view data from our analytics system
+    
+    Args:
+        video_id: YouTube video ID
+        days: Number of days to fetch
+        
+    Returns:
+        List of daily view counts
+    """
+    try:
+        conn = get_connection()
+        with conn.cursor() as cursor:
+            # Get the database video ID first
+            cursor.execute("""
+                SELECT id, view_count, published_at FROM youtube_videos WHERE video_id = %s
+            """, (video_id,))
+            
+            result = cursor.fetchone()
+            if not result:
+                logger.warning(f"Video {video_id} not found in database")
+                return []
+            
+            db_video_id, current_views, published_at = result
+            
+            # Try to get daily analytics data if available
+            cursor.execute("""
+                SELECT views, date 
+                FROM video_analytics_daily 
+                WHERE video_id = %s 
+                AND date >= %s
+                ORDER BY date DESC
+                LIMIT %s
+            """, (db_video_id, datetime.now() - timedelta(days=days), days))
+            
+            daily_data = cursor.fetchall()
+            
+            # If we have daily analytics, return that
+            if daily_data:
+                daily_views = [float(row[0]) for row in daily_data]
+                return daily_views
+            
+            # Fallback: estimate daily breakdown from current video data
+            if published_at:
+                days_since_upload = max((datetime.now() - published_at).days, 1)
+                avg_daily = float(current_views) / days_since_upload
+                # Create estimated daily breakdown for recent period
+                estimated_days = min(days, days_since_upload)
+                daily_views = [avg_daily] * estimated_days
+                return daily_views
+            
+            return []
+            
+    except Exception as e:
+        logger.error(f"Error fetching video analytics: {e}")
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+def calculate_optimization_impact(optimization_date: datetime, timeseries_data: List[Dict]) -> float:
+    """
+    Calculate actual uplift from an optimization using analytics data
+    
+    Args:
+        optimization_date: When the optimization was applied
+        timeseries_data: List of daily analytics data points with 'date' and view metrics
+        
+    Returns:
+        Actual uplift percentage (e.g., 0.15 for 15% improvement)
+    """
+    try:
+        # Convert data points to a time-indexed format
+        daily_data = {}
+        for point in timeseries_data:
+            date_str = point.get('date', '')
+            if date_str:
+                try:
+                    day_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+                    views = point.get('views', 0)
+                    daily_data[day_date] = float(views)
+                except (ValueError, TypeError):
+                    continue
+        
+        if not daily_data:
+            return 0.0
+        
+        opt_date = optimization_date.date()
+        
+        # Define pre and post periods (7 days each)
+        pre_start = opt_date - timedelta(days=7)
+        pre_end = opt_date - timedelta(days=1)
+        post_start = opt_date + timedelta(days=1)
+        post_end = opt_date + timedelta(days=7)
+        
+        # Collect pre-optimization views
+        pre_views = []
+        current_date = pre_start
+        while current_date <= pre_end:
+            if current_date in daily_data:
+                pre_views.append(daily_data[current_date])
+            current_date += timedelta(days=1)
+        
+        # Collect post-optimization views
+        post_views = []
+        current_date = post_start
+        while current_date <= post_end:
+            if current_date in daily_data:
+                post_views.append(daily_data[current_date])
+            current_date += timedelta(days=1)
+        
+        # Calculate average views for each period
+        if not pre_views or not post_views:
+            return 0.0
+        
+        avg_pre = np.mean(pre_views)
+        avg_post = np.mean(post_views)
+        
+        # Calculate uplift percentage
+        if avg_pre > 0:
+            uplift = (avg_post - avg_pre) / avg_pre
+            # Cap the uplift to reasonable bounds (-50% to +200%)
+            return max(-0.5, min(2.0, uplift))
+        
+        return 0.0
+        
+    except Exception as e:
+        logger.error(f"Error calculating optimization impact: {e}")
+        return 0.0
+
+def load_video_optimization_state(video_id: str, analytics_data: Dict = None) -> Tuple[List[float], Optional[str], Optional[str]]:
+    """
+    Load video optimization metadata from database and calculate actual uplifts when possible
+    
+    Args:
+        video_id: YouTube video ID
+        analytics_data: Optional analytics data containing timeseries_data for uplift calculation
+        
+    Returns:
+        (prior_uplifts, last_opt_time, next_run_time)
+    """
+    conn = None
+    try:
+        conn = get_connection()
+        with conn.cursor() as cursor:
+            # Get the database video ID
+            cursor.execute("""
+                SELECT id FROM youtube_videos WHERE video_id = %s
+            """, (video_id,))
+            
+            result = cursor.fetchone()
+            if not result:
+                return [], None, None
+            
+            db_video_id = result[0]
+            
+            # Get past optimization data
+            cursor.execute("""
+                SELECT applied_at, created_at
+                FROM video_optimizations 
+                WHERE video_id = %s AND is_applied = TRUE
+                ORDER BY applied_at DESC
+                LIMIT 10
+            """, (db_video_id,))
+            
+            optimization_history = cursor.fetchall()
+            
+            if not optimization_history:
+                # No optimization history - provide baseline for first-time optimization
+                # Check video age to determine readiness
+                cursor.execute("""
+                    SELECT published_at FROM youtube_videos WHERE id = %s
+                """, (db_video_id,))
+                published_result = cursor.fetchone()
+                
+                if published_result:
+                    published_at = published_result[0]
+                    video_age = (datetime.utcnow() - published_at).days
+                    
+                    # Only allow optimization if video has had time to stabilize (48+ hours)
+                    if video_age >= 2:
+                        # Return baseline state indicating readiness for first optimization
+                        return [0.0], None, None  # Single 0.0 indicates baseline
+                
+                # Video too new or no publish date
+                return [], None, None
+            
+            # Get the most recent optimization
+            last_applied_at = optimization_history[0][0]
+            
+            # Calculate prior uplifts - use real data if available, otherwise estimate
+            prior_uplifts = []
+            
+            if analytics_data and 'timeseries_data' in analytics_data:
+                # Calculate ACTUAL uplifts using real analytics data
+                logger.info(f"Calculating actual uplifts for {len(optimization_history)} optimizations using analytics data")
+                timeseries_data = analytics_data['timeseries_data']
+                
+                for i, (applied_at, _) in enumerate(optimization_history):
+                    actual_uplift = calculate_optimization_impact(applied_at, timeseries_data)
+                    prior_uplifts.append(actual_uplift)
+                    logger.debug(f"Optimization {i+1} applied at {applied_at}: {actual_uplift:.1%} uplift")
+            else:
+                # Fallback to estimated uplifts (original behavior)
+                logger.info(f"Using estimated uplifts for {len(optimization_history)} optimizations (no analytics data)")
+                for i, (applied_at, _) in enumerate(optimization_history):
+                    # Estimate uplift - use diminishing returns formula
+                    estimated_uplift = max(0.02, 0.08 * (0.7 ** i))  # 8% first, then diminishing
+                    prior_uplifts.append(estimated_uplift)
+            
+            # Calculate next run time (7 days after last optimization)
+            next_run_time = (last_applied_at + timedelta(days=7)).isoformat() if last_applied_at else None
+            
+            return (
+                prior_uplifts,
+                last_applied_at.isoformat() if last_applied_at else None,
+                next_run_time
+            )
+            
+    except Exception as e:
+        logger.error(f"Error loading video optimization state: {e}")
+        return [], None, None
+    finally:
+        if conn:
+            conn.close()
+
+def compute_baseline_stats(views: List[float]) -> Tuple[float, float, float]:
+    """
+    Compute baseline statistics from view data
+    Returns: (mean, std_dev, coefficient_of_variation)
+    """
+    if not views:
+        return 0.0, 0.0, 0.0
+    
+    mean_val = np.mean(views)
+    std_val = np.std(views, ddof=1) if len(views) > 1 else 0.0
+    cv = std_val / mean_val if mean_val > 0 else 0.0
+    
+    return float(mean_val), float(std_val), float(cv)
+
+def compute_min_detectable_uplift(cv: float, alpha: float = 0.05) -> float:
+    """
+    Compute minimum detectable uplift based on coefficient of variation
+    """
+    # Use z-score approximation since scipy might not be available
+    z_score = 1.96  # 95% confidence (approximation of stats.norm.ppf(1 - alpha/2))
+    return 2 * z_score * cv
+
+def compute_sample_size(z_score: float, effect_size: float, cv: float = 0.2) -> int:
+    """
+    Compute required sample size for detecting effect
+    """
+    if effect_size == 0:
+        return 30  # Default minimum
+    
+    n = (2 * (z_score ** 2) * (cv ** 2)) / (effect_size ** 2)
+    return max(7, min(30, int(n)))  # Clamp between 7 and 30 days
+
+def compute_measurement_window(sample_size: int, baseline_views: float) -> int:
+    """
+    Compute optimal measurement window based on sample size and traffic
+    """
+    if baseline_views >= 1000:  # High traffic
+        return max(3, min(sample_size, 7))
+    elif baseline_views >= 100:  # Medium traffic  
+        return max(7, min(sample_size, 14))
+    else:  # Low traffic
+        return max(14, min(sample_size, 30))
+
+def get_statistical_thresholds(view_velocity: float) -> Tuple[float, float]:
+    """
+    Get optimization thresholds based on view velocity
+    Returns: (min_uplift_threshold, min_gain_threshold)
+    """
+    if view_velocity >= 1000:
+        return 0.04, 0.025  # 4% uplift, 2.5% gain
+    elif view_velocity >= 200:
+        return 0.05, 0.03   # 5% uplift, 3% gain  
+    else:
+        return 0.06, 0.035  # 6% uplift, 3.5% gain
+
+def compute_decay_factor(prior_uplifts: List[float]) -> float:
+    """
+    Compute decay factor based on historical optimization performance
+    """
+    if len(prior_uplifts) < 2:
+        return 0.5  # Default decay
+    
+    # Calculate geometric mean of historical uplifts
+    log_sum = sum(math.log(max(uplift, 0.01)) for uplift in prior_uplifts)
+    return math.exp(log_sum / len(prior_uplifts))
+
+def statistical_should_optimize(
+    video_id: str,
+    current_analytics: Dict[str, Any] = {},
+    force_recheck: bool = False
+) -> Optional[Dict[str, Any]]:
+    """
+    Statistical optimization decision engine
+    Uses provided analytics data instead of database calls for efficiency
+    
+    Args:
+        video_id: YouTube video ID
+        current_analytics: Current analytics data structure with timeseries_data and summary
+        force_recheck: Skip cooling-off period check
+        
+    Returns:
+        Dict with optimization decision or None if in cooling-off period
+    """
+    logger.info(f"Running statistical optimization analysis for video: {video_id}")
+    
+    # Check if we have analytics data to work with
+    if not current_analytics or 'timeseries_data' not in current_analytics:
+        logger.warning(f"No analytics data provided for video {video_id}")
+        return {
+            'decision': False,
+            'confidence': 0.0,
+            'reasoning': 'No analytics data provided for statistical analysis'
+        }
+    
+    # Load video state from our database for optimization history, pass analytics for actual uplift calculation
+    prior_uplifts, last_opt_time, next_run_time = load_video_optimization_state(video_id, current_analytics)
+    
+    now = datetime.utcnow()
+    
+    # Check cooling-off period (equivalent to original next_run check)
+    if not force_recheck and next_run_time:
+        next_run_dt = datetime.fromisoformat(next_run_time)
+        if now < next_run_dt:
+            logger.info(f"Video {video_id} in cooling-off period until {next_run_time}")
+            return None
+    
+    # Extract view data from analytics timeseries_data
+    timeseries_data = current_analytics.get('timeseries_data', [])
+    if not timeseries_data:
+        logger.warning(f"No timeseries data in analytics data for video {video_id}")
+        return {
+            'decision': False,
+            'confidence': 0.0,
+            'reasoning': 'No timeseries data in analytics data for statistical analysis'
+        }
+    
+    # Extract daily view counts from analytics data (use 'views' or 'engagedViews')
+    daily_views = []
+    for point in timeseries_data:
+        views = point.get('views', 0)
+        daily_views.append(float(views))
+    
+    if not daily_views:
+        logger.warning(f"No view data extracted from analytics for video {video_id}")
+        return {
+            'decision': False,
+            'confidence': 0.0,
+            'reasoning': 'No view data found in analytics for statistical analysis'
+        }
+    
+    # Use the most recent 7 days as baseline (or all data if less than 7 days)
+    DEFAULT_BASELINE_DAYS = 7
+    adjusted_baseline = daily_views[-min(len(daily_views), DEFAULT_BASELINE_DAYS):]
+    
+    # Compute baseline statistics
+    mu, sig, cv = compute_baseline_stats(adjusted_baseline)
+    V_pre = mu  # Baseline view velocity
+    
+    if V_pre == 0:
+        logger.warning(f"Zero baseline views for video {video_id}")
+        return {
+            'decision': True,
+            'confidence': 0.9,
+            'reasoning': 'Zero baseline performance detected'
+        }
+    
+    # Compute statistical parameters
+    Z_SCORE = 1.96  # 95% confidence
+    E = compute_min_detectable_uplift(cv)
+    M = compute_sample_size(Z_SCORE, E, cv)
+    W = compute_measurement_window(M, V_pre)
+    
+    # Use recent data as post-optimization performance
+    # Take the most recent W days for measurement window
+    recent_data = daily_views[-min(len(daily_views), W):]
+    V_post = float(np.mean(recent_data)) if recent_data else 0.0
+    
+    # Calculate observed uplift
+    U_obs = (V_post - V_pre) / V_pre if V_pre > 0 else 0.0
+    
+    # Get thresholds based on traffic level
+    T_min, G_min = get_statistical_thresholds(V_pre)
+    
+    # Compute decay factor from historical performance
+    decay_factor = compute_decay_factor(prior_uplifts)
+    
+    # Predict next gain (simplified version of original algorithm)
+    if prior_uplifts:
+        avg_historical_uplift = np.mean(prior_uplifts)
+        G_next = avg_historical_uplift * decay_factor
+    else:
+        G_next = 0.05 * decay_factor  # Default 5% expected gain
+    
+    # Make optimization decision (core logic from original)
+    meets_uplift_threshold = U_obs >= T_min
+    meets_gain_threshold = G_next >= G_min
+    decision = meets_uplift_threshold and meets_gain_threshold
+    
+    # Calculate confidence based on statistical significance
+    confidence_factors = []
+    
+    # Traffic-based confidence
+    if V_pre >= 1000:
+        confidence_factors.append(0.9)
+    elif V_pre >= 200:
+        confidence_factors.append(0.7)
+    else:
+        confidence_factors.append(0.5)
+    
+    # Coefficient of variation confidence (lower CV = higher confidence)
+    cv_confidence = max(0.2, 1.0 - min(cv, 1.0))
+    confidence_factors.append(cv_confidence)
+    
+    # Historical performance confidence
+    if prior_uplifts:
+        hist_confidence = min(0.9, len(prior_uplifts) / 10.0)  # More history = higher confidence
+        confidence_factors.append(hist_confidence)
+    
+    # Data quality confidence (more data points = higher confidence)
+    data_quality_confidence = min(0.9, len(daily_views) / 14.0)  # Up to 14 days gives max confidence
+    confidence_factors.append(data_quality_confidence)
+    
+    confidence = np.mean(confidence_factors)
+    
+    # Build reasoning
+    reasoning_parts = []
+    reasoning_parts.append(f"Baseline views: {V_pre:.1f}/day")
+    reasoning_parts.append(f"Recent views: {V_post:.1f}/day") 
+    reasoning_parts.append(f"Observed uplift: {U_obs:.1%}")
+    reasoning_parts.append(f"Required uplift: {T_min:.1%}")
+    reasoning_parts.append(f"Predicted gain: {G_next:.1%}")
+    reasoning_parts.append(f"Required gain: {G_min:.1%}")
+    reasoning_parts.append(f"Data points: {len(daily_views)} days")
+    
+    if decision:
+        reasoning = f"Statistical criteria met: {'; '.join(reasoning_parts)}"
+    else:
+        reasoning = f"Statistical criteria not met: {'; '.join(reasoning_parts)}"
+    
+    logger.info(f"Statistical decision for {video_id}: {decision} (confidence: {confidence:.3f})")
+    
+    return {
+        'decision': decision,
+        'confidence': confidence,
+        'reasoning': reasoning,
+        'statistical_metrics': {
+            'baseline_views': V_pre,
+            'recent_views': V_post,
+            'observed_uplift': U_obs,
+            'required_uplift': T_min,
+            'predicted_gain': G_next,
+            'required_gain': G_min,
+            'coefficient_variation': cv,
+            'decay_factor': decay_factor,
+            'measurement_window': W,
+            'sample_size': M,
+            'prior_optimizations': len(prior_uplifts),
+            'data_points_count': len(daily_views),
+            'total_views': current_analytics.get('summary', {}).get('total_views', 0)
+        }
+    }
+
+
+async def enhanced_should_optimize_video(
+    video_data: Dict[str, Any],
+    channel_subscriber_count: int,
+    analytics_data: Dict[str, Any] = {},
+    past_optimizations: List[Dict[str, Any]] = [],
+    use_statistical_analysis: bool = True,
+    model: str = "claude-3-7-sonnet-20250219"
+) -> Dict[str, Any]:
+    """
+    Enhanced optimization decision combining LLM analysis with statistical optimization
+    
+    Args:
+        video_data: Video metadata from database
+        channel_subscriber_count: Channel subscriber count for context
+        analytics_data: Analytics data for the video
+        past_optimizations: Historical optimization records
+        use_statistical_analysis: Whether to include statistical analysis
+        model: The Claude model to use for LLM analysis
+        
+    Returns:
+        Combined optimization decision with confidence scoring
+    """
+    logger.info(f"Enhanced optimization analysis for video: {video_data.get('title', 'Unknown')}")
+    
+    # Run existing LLM-based analysis
+    llm_decision = await should_optimize_video(
+        video_data=video_data,
+        channel_subscriber_count=channel_subscriber_count,
+        analytics_data=analytics_data,
+        past_optimizations=past_optimizations,
+        model=model
+    )
+    
+    if not use_statistical_analysis:
+        return llm_decision
+    
+    # Run statistical analysis using video_id
+    video_id = video_data.get('video_id')
+    if not video_id:
+        logger.warning("No video_id provided for statistical analysis")
+        return llm_decision
+    
+    statistical_result = statistical_should_optimize(
+        video_id=video_id,
+        current_analytics=analytics_data
+    )
+
+    if statistical_result is None:
+        return {
+            'should_optimize': False,
+            'confidence': 0.9,
+            'reasons': 'Video in cooling-off period after recent optimization',
+            'method': 'statistical_cooldown',
+            'llm_analysis': llm_decision,
+            'statistical_analysis': None
+        }
+    
+    # Combine LLM and statistical decisions
+    llm_weight = 0.6
+    stat_weight = 0.4
+    
+    # Combine confidence scores
+    combined_confidence = (
+        llm_decision['confidence'] * llm_weight +
+        statistical_result['confidence'] * stat_weight
+    )
+    
+    # Decision logic: both should agree OR one should have very high confidence
+    llm_recommends = llm_decision['should_optimize']
+    stat_recommends = statistical_result['decision']
+    
+    if llm_recommends and stat_recommends:
+        final_decision = True
+        method = 'hybrid_agreement'
+        reasoning = "Both LLM and statistical analysis recommend optimization"
+    elif llm_recommends and llm_decision['confidence'] > 0.85:
+        final_decision = True  
+        method = 'llm_strong'
+        reasoning = f"LLM analysis strongly recommends optimization (confidence: {llm_decision['confidence']:.2f}) despite statistical uncertainty"
+    elif stat_recommends and statistical_result['confidence'] > 0.85:
+        final_decision = True
+        method = 'statistical_strong'  
+        reasoning = f"Statistical analysis strongly recommends optimization (confidence: {statistical_result['confidence']:.2f}) despite LLM uncertainty"
+    else:
+        final_decision = False
+        method = 'hybrid_reject'
+        reasoning = f"Insufficient agreement: LLM={llm_recommends} (conf: {llm_decision['confidence']:.2f}), Statistical={stat_recommends} (conf: {statistical_result['confidence']:.2f})"
+    
+    return {
+        'should_optimize': final_decision,
+        'confidence': combined_confidence,
+        'reasons': reasoning,
+        'method': method,
+        'llm_analysis': llm_decision,
+        'statistical_analysis': statistical_result
+    }

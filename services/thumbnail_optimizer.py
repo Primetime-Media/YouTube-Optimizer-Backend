@@ -10,12 +10,24 @@ import shutil
 from google import genai
 from pydantic import BaseModel, Field, ValidationError, ConfigDict
 from typing import List, Optional, Dict, Any
-from google.genai.types import GenerateContentResponse, FileState
+from google.genai.types import (
+    GenerateContentResponse,
+    FileState,
+    HarmCategory,
+    SafetySetting,
+    GenerateContentConfig
+)
 import cv2
 import numpy as np
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from openai import OpenAI
+import base64
+import openai
+from google.cloud import vision
+
+client = vision.ImageAnnotatorClient()
 
 load_dotenv()
 
@@ -65,11 +77,17 @@ class ThumbnailEvaluation(BaseModel):
     emotional_alignment: EvaluationMetric = Field(..., description="How well the emotional tone matches the video content")
     content_relevance: EvaluationMetric = Field(..., description="Relevance of the thumbnail to the actual video content")
     text_visibility: EvaluationMetric = Field(..., description="Readability and effectiveness of any text in the thumbnail")
-    composition: EvaluationMetric = Field(..., description="Overall composition and visual balance of the thumbnail")
+    composition: EvaluationMetric = Field(..., description="Overall composition, visual balance, and cinematic quality")
     emotional_impact: EvaluationMetric = Field(..., description="Strength of emotional response the thumbnail evokes")
+    uniqueness_trend_fit: EvaluationMetric = Field(..., description="Originality and alignment with platform trends")
+    seasonal_alignment: EvaluationMetric = Field(..., description="Relevance to current seasons or trends if applicable")
     overall_score: int = Field(..., ge=1, le=10, description="Overall score for the thumbnail (1-10)")
     overall_impression: str = Field(..., description="General impression and summary of the thumbnail's effectiveness")
     improvement_suggestions: List[str] = Field(default_factory=list, description="List of specific suggestions for improving the thumbnail")
+    total_score: int = Field(..., ge=1, le=100, description="Total cumulative score out of 100 points")
+    ctr_uplift_range: str = Field(..., description="Estimated range of CTR improvement this thumbnail might provide")
+    confidence_level: str = Field(..., description="Confidence level in this evaluation (Low, Medium, High)")
+    margin_compliance_violations: List[str] = Field(default_factory=list, description="List of elements too close to thumbnail margins")
 
 def generate_content_from_file(
     file_path: str,
@@ -136,12 +154,102 @@ def generate_content_from_file(
         logging.info(f"Generating content with Gemini model '{model_name}'...")
         if generation_config:
             logging.info(f"Using generation config: {generation_config}")
+
+        response_mime_type = "text/plain"
+        if generation_config and "response_mime_type" in generation_config:
+            response_mime_type = generation_config["response_mime_type"]
+
+        response_schema = None
+        if generation_config and "response_schema" in generation_config:
+            response_schema = generation_config["response_schema"]
+
+        # Define fallback models in order of preference
+        fallback_models = [
+            model_name,
+            "gemini-2.5-pro-preview-05-06",
+            "gemini-2.5-pro-preview-06-05",
+            "gemini-2.0-flash",
+            "gemini-2.5-flash-preview-05-20"
+        ]
         
-        response = client.models.generate_content(
-            model=model_name,
-            contents=[uploaded_file, prompt],
-            config=generation_config
-        )
+        # Remove duplicates while preserving order
+        seen = set()
+        fallback_models = [x for x in fallback_models if not (x in seen or seen.add(x))]
+        
+        response = None
+        for model_attempt, current_model in enumerate(fallback_models):
+            logging.info(f"Trying model: {current_model} (attempt {model_attempt + 1}/{len(fallback_models)})")
+            
+            for retry_attempt in range(3):
+                try:
+                    response = client.models.generate_content(
+                        model=current_model,
+                        contents=[uploaded_file, prompt],
+                        config=GenerateContentConfig(
+                            response_mime_type=response_mime_type,
+                            response_schema=response_schema,
+                            safety_settings=[
+                                SafetySetting(
+                                    category='HARM_CATEGORY_HATE_SPEECH',
+                                    threshold='BLOCK_NONE'
+                                ),
+                                SafetySetting(
+                                    category='HARM_CATEGORY_HARASSMENT',
+                                    threshold='BLOCK_NONE'
+                                ),
+                                SafetySetting(
+                                    category='HARM_CATEGORY_SEXUALLY_EXPLICIT',
+                                    threshold='BLOCK_NONE'
+                                ),
+                                SafetySetting(
+                                    category='HARM_CATEGORY_DANGEROUS_CONTENT',
+                                    threshold='BLOCK_NONE'
+                                ),
+                                SafetySetting(
+                                    category='HARM_CATEGORY_CIVIC_INTEGRITY',
+                                    threshold='BLOCK_NONE'
+                                )
+                            ]
+                        )
+                    )
+                    
+                    # Check if response was blocked
+                    if response and hasattr(response, 'prompt_feedback') and response.prompt_feedback:
+                        if hasattr(response.prompt_feedback, 'block_reason') and response.prompt_feedback.block_reason:
+                            logging.warning(f"Model {current_model} blocked content with reason: {response.prompt_feedback.block_reason}")
+                            response = None  # Reset response to trigger fallback
+                            break  # Break retry loop and try next model
+                    
+                    # Check if candidates are empty (another type of blocking)
+                    if response and (not hasattr(response, 'candidates') or not response.candidates):
+                        logging.warning(f"Model {current_model} returned empty candidates - likely blocked content")
+                        response = None  # Reset response to trigger fallback
+                        break  # Break retry loop and try next model
+                    
+                    logging.info(f"Successfully generated content with model: {current_model}")
+                    break
+                except Exception as e:
+                    error_message = str(e)
+                    logging.error(f"Model {current_model}, retry {retry_attempt + 1} failed with error: {e}")
+                    
+                    # Check if it's a model overloaded error
+                    if "overloaded" in error_message.lower() or "503" in error_message:
+                        logging.warning(f"Model {current_model} is overloaded, will try next model if available")
+                        break  # Break retry loop and try next model
+                    
+                    # For other errors, retry with exponential backoff
+                    if retry_attempt < 2:
+                        time.sleep(2 ** retry_attempt)
+            else:
+                # If we completed all retries without success, continue to next model
+                continue
+
+            if response:
+                break
+        
+        if not response:
+            logging.error(f"Failed to generate content after trying all models: {fallback_models}")
+            return None
 
         if uploaded_file_name:
             logging.info(f"Attempting to delete uploaded file: {uploaded_file_name}")
@@ -340,15 +448,16 @@ def do_thumbnail_optimization(
 
         local_video_filename = f"{video_id}.mp4"
 
-        #extracted_frames = download_youtube_video_and_extract_frames(video_id, local_video_filename)
-        
-        extracted_frames = [
-            '/Users/jasonramirez/Documents/youtube-optimizer/backend/extracted_thumbnails/orig_y8yDBm7PvbM_llm_sharp_thumb_01_at_0_167s_Manstandingheroicallyontop.jpg',
-            '/Users/jasonramirez/Documents/youtube-optimizer/backend/extracted_thumbnails/orig_y8yDBm7PvbM_llm_sharp_thumb_02_at_0_731s_Cowboymakesawhipsoundsol.jpg',
-            '/Users/jasonramirez/Documents/youtube-optimizer/backend/extracted_thumbnails/orig_y8yDBm7PvbM_llm_sharp_thumb_03_at_8_660s_Manlookssurprisedbythefor.jpg',
-            '/Users/jasonramirez/Documents/youtube-optimizer/backend/extracted_thumbnails/orig_y8yDBm7PvbM_llm_sharp_thumb_04_at_37_619s_Manputshisfingeronhishea.jpg',
-            '/Users/jasonramirez/Documents/youtube-optimizer/backend/extracted_thumbnails/orig_y8yDBm7PvbM_llm_sharp_thumb_05_at_51_141s_Thesonicboomwiththefists.jpg'
-        ]
+        extracted_frames = download_youtube_video_and_extract_frames(video_id, local_video_filename)
+
+        if False:
+            extracted_frames = [
+                '/Users/jasonramirez/Documents/youtube-optimizer/backend/extracted_thumbnails/orig_y8yDBm7PvbM_llm_sharp_thumb_01_at_0_167s_Manstandingheroicallyontop.jpg',
+                '/Users/jasonramirez/Documents/youtube-optimizer/backend/extracted_thumbnails/orig_y8yDBm7PvbM_llm_sharp_thumb_02_at_0_731s_Cowboymakesawhipsoundsol.jpg',
+                '/Users/jasonramirez/Documents/youtube-optimizer/backend/extracted_thumbnails/orig_y8yDBm7PvbM_llm_sharp_thumb_03_at_8_660s_Manlookssurprisedbythefor.jpg',
+                '/Users/jasonramirez/Documents/youtube-optimizer/backend/extracted_thumbnails/orig_y8yDBm7PvbM_llm_sharp_thumb_04_at_37_619s_Manputshisfingeronhishea.jpg',
+                '/Users/jasonramirez/Documents/youtube-optimizer/backend/extracted_thumbnails/orig_y8yDBm7PvbM_llm_sharp_thumb_05_at_51_141s_Thesonicboomwiththefists.jpg'
+            ]
 
         if not extracted_frames:
             logging.error("No frames were extracted from the video")
@@ -424,6 +533,7 @@ def do_thumbnail_optimization(
                 - 16:9 aspect ratio optimization
                 - Faces and emotions drive engagement
                 - Use of directional cues to guide attention
+                - DO NOT include hashtags
                 """
 
                 #color_prompt_instructions = Do not use YouTube color schema (red, white, black)
@@ -503,11 +613,90 @@ def do_thumbnail_optimization(
                 Return ONLY the transformation prompt, nothing else. Be extremely specific and detailed in your instructions.
                 """
                 
+                # Create the transcript section separately without nesting f-strings
+                transcript_section = ""
+                if transcript and len(transcript) > 10:
+                    transcript_section = f"Consider key moments or themes from the transcript for contextual relevance and potential visual cues:\n{transcript[:300]}..."
+                
+                prompt = f"""
+                You are tasked with analyzing this video frame and creating a precise prompt for an AI image generation model to transform it into a high-CTR YouTube thumbnail.
+                Remember to leverage principles of visual psychology and YouTube platform best practices, including:
+                - Clear focal point, high contrast, minimal text (3-5 words max if needed), brand consistency, avoiding the bottom-right timestamp area.
+                - Prioritizing faces and emotions for engagement, and using directional cues.
+                - Evoking emotions like curiosity (information gaps), intrigue (mysterious elements), awe (impressive visuals), urgency (time-sensitivity), or relatability (authentic human emotions).
+
+                # CONTEXT
+                Video Title: {original_title}
+                Video Category: {category_name}
+                Key Tags: {', '.join(original_tags) if original_tags else 'None provided'}
+
+                # OBJECTIVE
+                Create a detailed prompt that will guide an image generation model to transform this frame into a thumbnail that:
+                1. Maximizes click-through rate (CTR)
+                2. Stands out in YouTube's competitive feed
+                3. Accurately represents the video content
+                4. Creates curiosity without misleading viewers
+
+                # TRANSFORMATION REQUIREMENTS
+                - Output dimensions: 1920×1080 pixels (16:9 aspect ratio)
+                - Photorealistic, high-quality appearance (DSLR-like)
+                - Mobile-optimized visibility (clear at small sizes)
+                - Vibrant colors that avoid YouTube UI clash (minimize dominant red/white/black)
+                - Strong focal point with cinematic lighting
+                - Rule of thirds composition with optimal negative space
+                - Emotional impact through expressions, color, and composition
+                - Text limited to 3-5 words maximum, if needed (must be extremely legible)
+                - DO NOT include hashtags or other social media elements
+
+                # ANALYZE FIRST, THEN CREATE
+                First, analyze the provided frame for:
+                - Current strengths (what to preserve or enhance)
+                - Weaknesses (what to improve or change)
+                - Subject positioning and focus (how to make it more compelling)
+                - Lighting and color profile (opportunities for enhancement)
+                - Emotional impact (current vs. desired)
+                - Potential for creating curiosity or intrigue
+
+                Then, review these competitor insights to understand what works in this niche and identify differentiation opportunities:
+                {competitor_insights}
+
+                {transcript_section}
+
+                # OUTPUT INSTRUCTIONS
+                Based on your analysis, create a detailed, specific prompt for an image generation model that will:
+
+                1. DEFINE CORE TRANSFORMATION: Start with a clear, concise statement of what the thumbnail should depict and the overall desired mood/style. (e.g., "A dramatic, high-contrast close-up of [subject] looking surprised, with a vibrant, slightly blurred background of [scene element], conveying intense curiosity.")
+
+                2. SPECIFY VISUAL ENHANCEMENTS:
+                - Subject treatment: Detail specific adjustments to the main subject (e.g., "Sharpen the subject's eyes," "Slightly exaggerate the surprised facial expression," "Reposition subject to the left third of the frame, looking towards the right," "Enhance the texture of the subject's clothing").
+                - Background modifications: Specify how to treat the background (e.g., "Apply a Gaussian blur of 5px to the background," "Replace background with a subtly desaturated, abstract representation of [video theme]," "Darken the background to make the subject pop," "Introduce subtle motion blur to background elements").
+                - Color adjustments: Be specific about the color palette and its application (e.g., "Implement a teal and orange color grade," "Increase vibrance by +20 and saturation by +10 for key elements," "Use complementary colors for subject and background for maximum contrast," "Ensure skin tones remain natural").
+                - Lighting effects: Describe the desired lighting setup (e.g., "Add a strong key light from the top-left, casting a soft Rembrandt triangle on the right cheek," "Introduce a subtle blue rim light from the back-right to separate the subject from the background," "Create a cinematic glow around highlighted edges of the subject").
+                - Depth adjustments: Specify how to create or enhance depth (e.g., "Implement a shallow depth of field effect with the focal plane on the subject's eyes," "Add subtle atmospheric haze in the background," "Layer foreground elements if appropriate to create parallax").
+
+                3. DETAIL TEXT OVERLAY (if applicable, max 3-5 words):
+                - Exact words: Provide the precise text (e.g., "SECRET REVEALED!").
+                - Font specifications: Suggest font characteristics (e.g., "Use a bold, sans-serif font like Montserrat ExtraBold," "Font size should be approximately 1/10th of the thumbnail height").
+                - Positioning and effects: Describe placement and visual treatments for legibility (e.g., "Position text in the upper-left quadrant," "Apply a white color with a 2px black outline or a subtle drop shadow (75% opacity, 5px distance, 90-degree angle) for maximum contrast against varied backgrounds," "Ensure text does not cover critical parts of the main subject").
+
+                4. ADDRESS EMOTIONAL IMPACT:
+                - Primary emotion to evoke: Clearly state the main emotion (e.g., "Curiosity," "Surprise," "Excitement," "Awe").
+                - Visual cues for emotion: Detail how visuals will convey this (e.g., "Subject's wide eyes and slightly open mouth to show surprise," "Use of upward diagonal lines in composition to create a sense of excitement," "Dramatic lighting to build intrigue").
+                - Facial expression adjustments (if people are present): Be specific (e.g., "Enhance the smile to appear more genuine and inviting," "Intensify the look of concentration in the eyes").
+
+                5. ENSURE TECHNICAL QUALITY & DIFFERENTIATION:
+                - Mobile visibility optimizations: Reiterate the need for clarity (e.g., "Ensure the main subject and any text are clearly distinguishable even at 100x56 pixels").
+                - Feed differentiation elements: Suggest unique visual hooks (e.g., "Employ an unusual color combination not seen in competitor thumbnails," "Use a distinct graphical element like a glowing outline or a unique framing device").
+                - Professional polish specifications: Emphasize overall quality (e.g., "The final image should look like a professional photograph or high-quality render, free of artifacts or pixelation," "Ensure all elements are harmoniously blended").
+
+                Your output should be ONLY the transformation prompt, ready to be sent directly to an image generation model. Be extremely specific with technical details (e.g., blur amounts, color values if known, lighting direction) while maintaining clarity. Focus on measurable enhancements rather than vague directives. The prompt should be a cohesive paragraph or set of instructions that an image model can interpret effectively.
+                """
+                
                 # Generate the transformation prompt
                 response = generate_content_from_file(
                     file_path=frame_path,
                     model_name="gemini-2.5-pro-preview-05-06",
-                    prompt=user_prompt
+                    prompt=prompt
                 )
                 
                 # Clean and return the generated prompt
@@ -548,12 +737,22 @@ def do_thumbnail_optimization(
                         })
                 except Exception as e:
                     logging.error(f"Error processing frame {frame_path}: {str(e)}")
-            
-            # TODO: generate_thumbnail_prompt in process_single_thumbnail function
-            # TODO: Return top thumbnail
-        
-        
-        return results
+
+        if len(results) == 0:
+            raise ValueError("No optimized thumbnails generated")
+
+        results.sort(
+            key=lambda r: r.get('optimized_thumbnail', {}).get('evaluation', {}).total_score,
+            reverse=True
+        )
+
+        final_results = [r for r in results if len(r.get('optimized_thumbnail', {}).get('evaluation').margin_compliance_violations) < 2]
+
+        if len(final_results) == 0:
+            raise ValueError("No optimized thumbnails with margin compliance violations")
+
+        return final_results[0]
+
     except Exception as e:
         logging.error(f"Error processing frames: {str(e)}")
         return None
@@ -586,7 +785,7 @@ def process_single_thumbnail(
         timestamp = int(time.time())
         output_path = os.path.join(
             output_dir,
-            f"optimized_{os.path.splitext(os.path.basename(frame_path))[0]}_{timestamp}.png"
+            f"optimized_{os.path.splitext(os.path.basename(frame_path))[0]}_{timestamp}.jpg"
         )
         
         # Optimize the thumbnail
@@ -612,6 +811,7 @@ def process_single_thumbnail(
         if not evaluation:
             logging.warning(f"Failed to evaluate thumbnail {result_path}")
             evaluation = {"error": "Evaluation failed"}
+            return None
         
         # Prepare the result
         result = {
@@ -656,38 +856,60 @@ def evaluate_thumbnail_with_gemini(image_path: str, prompt: str, video_title: st
            - Are the colors vibrant and eye-catching?
            - Is there sufficient contrast between elements?
            - Does the color scheme avoid YouTube UI colors (red, white, black dominance)?
+           - Is the color palette cohesive and optimized for platform differentiation?
         
         3. Curiosity Gap:
            - Does the thumbnail create intrigue or curiosity?
            - Would it make someone want to click to learn more?
+           - Does it tease content without revealing everything?
         
         4. Emotional Alignment:
            - Does the thumbnail match the emotional tone of the title and description?
-           Title: {video_title}
-           Description: {video_description}
+           - Title: {video_title}
+           - Description: {video_description}
         
         5. Content Relevance:
-           - Is the thumbnail relevant to the video content?
+           - Is the thumbnail semantically relevant to the video content?
            - Does it accurately represent what the video is about?
+           - Is there a clear connection between visual elements and the title/topic?
         
         6. Text Visibility:
            - If there's text, is it large and readable on small screens?
            - Is there sufficient contrast between text and background?
+           - Is the text placement optimal and limited to 3-5 impactful words?
         
         7. Composition:
            - Is the main subject properly framed and positioned?
            - Does it follow the rule of thirds?
            - Are important elements away from the bottom right corner (timestamp area)?
+           - Is there cinematic depth of field and professional lighting?
         
         8. Emotional Impact:
            - What emotion does this thumbnail primarily evoke?
            - Is this appropriate for the video content?
+           - How strong is the emotional resonance?
+        
+        9. Uniqueness & Trend Fit:
+           - How original is this thumbnail compared to competitors?
+           - Does it avoid generic stock poses and angles?
+           - Does it incorporate current platform trends where appropriate?
+        
+        10. Seasonal or Trend Alignment:
+           - Does the thumbnail reflect current seasons or trends if applicable?
+           - Are there visual cues that connect to timely events or themes?
         
         Please provide:
         1. A score from 1-10 for each category
         2. Specific feedback for each category
         3. Overall impression
         4. Specific suggestions for improvement
+        5. A total score out of 100 (sum of all categories)
+        6. Estimated CTR uplift range (e.g., "5-10%", "10-15%", "15%+")
+        7. Confidence level in this evaluation (Low, Medium, High)
+        8. Margin Compliance Violations - Identify and report ALL of the following violations:
+           - Any overlaid text graphics that are cut off or not SUFFICIENTLY readable
+           - Any text overlays containing MORE than 7 words (excessive text violation)
+           - Any inclusion of hashtags (# symbols) in the thumbnail image (hashtag violation)
         
         Return your response as a JSON object with this structure:
         {{
@@ -699,9 +921,15 @@ def evaluate_thumbnail_with_gemini(image_path: str, prompt: str, video_title: st
             "text_visibility": {{"score": 0-10, "feedback": ""}},
             "composition": {{"score": 0-10, "feedback": ""}},
             "emotional_impact": {{"score": 0-10, "feedback": ""}},
+            "uniqueness_trend_fit": {{"score": 0-10, "feedback": ""}},
+            "seasonal_alignment": {{"score": 0-10, "feedback": ""}},
             "overall_score": 0-10,
             "overall_impression": "",
-            "improvement_suggestions": ["improvement suggestion 1", ...]
+            "improvement_suggestions": ["improvement suggestion 1", ...],
+            "total_score": 0-100,
+            "ctr_uplift_range": "",
+            "confidence_level": "",
+            "margin_compliance_violations": ["specific violation type and description", ...]
         }}
         """                    
         
@@ -729,20 +957,47 @@ def evaluate_thumbnail_with_gemini(image_path: str, prompt: str, video_title: st
 def get_suggested_thumbnail_times(
     video_file_path: str,
     num_suggestions: int = 5,
-    model_name: str = "gemini-2.0-flash"
+    model_name: str = "gemini-2.5-pro-preview-05-06",
+    #model_name:str = "gemini-2.0-flash"
 ) -> Optional[SuggestedThumbnails]:
     prompt = f"""
     Analyze the provided video to identify the best {num_suggestions} moments for YouTube thumbnails.
+    
+    CRITICAL: These selected frames will be used as reference images for AI image generation to create the final optimized thumbnails. Therefore, visual clarity and detail definition are absolutely essential.
+    
     For each moment, provide the exact timestamp in seconds (e.g., 45.67).
     Also, provide a concise description explaining why this frame would make a highly click-worthy thumbnail.
-    Consider YouTube best practices:
-    - Clear subject focus (face, product, key action)
-    - Strong emotion or intrigue
-    - Visually appealing composition, color, and contrast
-    - Minimal or impactful text (if any naturally occurs in the frame)
-    - Branding elements if present and relevant
-    - Avoid blurry, dark, or cluttered frames.
-    - The thumbnail should accurately represent the video content while maximizing curiosity and click-through rate.
+    
+    Prioritize frames with EXCEPTIONAL visual quality and clarity:
+    
+    **FACE VISIBILITY REQUIREMENTS (if faces are present):**
+    - Faces must be clearly visible, well-lit, and sharply defined
+    - Face should occupy sufficient frame space (not tiny/distant)
+    - Eyes should be clearly visible and preferably looking toward camera
+    - Facial expressions should be distinct and engaging (surprise, joy, concentration, etc.)
+    - Avoid faces that are partially obscured, in shadow, or at extreme angles
+    
+    **TECHNICAL CLARITY REQUIREMENTS:**
+    - Frame must be sharp with high detail definition (essential for AI reference)
+    - Excellent lighting with good contrast between subject and background
+    - Clear distinction of edges, textures, and fine details
+    - Avoid motion blur, camera shake, or focus issues
+    - Rich color saturation and proper exposure
+    
+    **COMPOSITION AND ENGAGEMENT:**
+    - Strong subject focus (face, product, key action, dramatic moment)
+    - Compelling emotion, intrigue, or peak action moment
+    - Visually appealing composition with clear focal points
+    - Good contrast and color separation for AI processing
+    - Minimal visual noise or distracting background elements
+    
+    **ADDITIONAL CONSIDERATIONS:**
+    - Branding elements if present and clearly visible
+    - Text elements only if they're crisp and legible
+    - Moments that accurately represent video content while maximizing curiosity
+    - Peak emotional or action moments that tell a story
+    
+    Remember: Since these frames will guide AI image generation, every visual element must be crystal clear and well-defined. Prefer slightly static moments over action if it means significantly better clarity.
 
     Return these suggestions formatted STRICTLY as a JSON object matching the following Pydantic schema:
     {{
@@ -845,7 +1100,7 @@ def extract_frames_at_suggested_times(
     logging.info(f"Attempting to get thumbnail suggestions for: {video_file_path}")
     suggested_thumbnails_data: SuggestedThumbnails = get_suggested_thumbnail_times(
         video_file_path=video_file_path,
-        num_suggestions=num_suggestions_for_llm
+        num_suggestions=num_suggestions_for_llm,
     )
 
     if not suggested_thumbnails_data or not suggested_thumbnails_data.suggested_scenes:
@@ -916,16 +1171,35 @@ def extract_frames_at_suggested_times(
                 logging.warning(f"No candidate frames were successfully extracted for scene {i+1} at LLM time {llm_timestamp:.2f}s. Skipping this suggestion.")
                 continue
 
-            logging.info(f"Analyzing {len(candidate_frame_files)} candidate frames for sharpness for scene {i+1}...")
+            logging.info(f"Analyzing {len(candidate_frame_files)} candidate frames for sharpness and face quality for scene {i+1}...")
+            highest_combined_score = 0
             for cand_frame_path_obj in candidate_frame_files:
                 sharpness = _calculate_frame_sharpness(str(cand_frame_path_obj))
-                logging.debug(f"Candidate {cand_frame_path_obj.name}: sharpness = {sharpness:.2f}")
-                if sharpness > highest_sharpness:
+                
+                # Analyze faces in the frame
+                face_analysis = analyze_frame_faces(str(cand_frame_path_obj))
+                
+                # Calculate combined score balancing sharpness and face quality
+                combined_score = calculate_combined_frame_score(sharpness, face_analysis)
+
+                if face_analysis:
+                    logging.debug(f"Candidate {cand_frame_path_obj.name}: sharpness = {sharpness:.2f}, "
+                                f"face score = {face_analysis['overall_score']:.2f} "
+                                f"(visible: {face_analysis['highly_visible']}, "
+                                f"camera direction: {face_analysis['looking_at_camera']}), "
+                                f"combined = {combined_score:.2f}")
+                else:
+                    logging.debug(f"Candidate {cand_frame_path_obj.name}: sharpness = {sharpness:.2f}, "
+                                f"no faces detected, combined = {combined_score:.2f}")
+                
+                if combined_score > highest_combined_score:
+                    highest_combined_score = combined_score
                     highest_sharpness = sharpness
-                    best_frame_path = str(cand_frame_path_obj) # Store the path of the temp file
+                    best_frame_path = str(cand_frame_path_obj)
 
             if best_frame_path:
-                logging.info(f"Best sharpness for scene {i+1} (LLM time {llm_timestamp:.2f}s) is {highest_sharpness:.2f} from {Path(best_frame_path).name}")
+                logging.info(f"Best combined score for scene {i+1} (LLM time {llm_timestamp:.2f}s) is {highest_combined_score:.2f} "
+                           f"(sharpness: {highest_sharpness:.2f}) from {Path(best_frame_path).name}")
                 
                 # Construct final output path
                 timestamp_str = f"{Path(best_frame_path).stem.split('_time_')[-1].replace('s','').replace('.', '_')}" # from temp filename like candidate_001_time_123.456s
@@ -948,9 +1222,7 @@ def extract_frames_at_suggested_times(
     
     return extracted_final_frame_paths
 
-from openai import OpenAI
-import base64
-import openai 
+
 
 
 def optimize_thumbnail_with_openai(
@@ -986,18 +1258,30 @@ def optimize_thumbnail_with_openai(
     try:
         client = OpenAI()
 
-        prompt = f"""{custom_prompt_instructions}
+        prompt = f"""
+        
+        IMAGE EDITING INSTRUCTIONS:
+        {custom_prompt_instructions}
+        
+        ADDITIONAL INSTRUCTIONS:
+        
         Thoroughly analyze the provided image, which is a frame from a video.
-        Your task is to transform it into a highly engaging and click-compelling YouTube thumbnail.
+        Your task is to transform it into a highly engaging and click-compelling YouTube thumbnail based on the providedinstructions
         Preserve the main subject and the core essence of the original scene faithfully.
         Enhancements should make the thumbnail vibrant, clear, and professional for a YouTube audience.
-        {f"If appropriate for the image, consider overlaying the text '{video_title}'. The text MUST be bold, with EXTREMELY HIGH CONTRAST against its background to ensure absolute readability. It should be stylishly designed and strategically placed for maximum impact. Only add text if it significantly enhances the thumbnail and does not obscure critical visual elements. If the text cannot be made perfectly clear and legible, do not add it." if video_title else ""}
+        {f"If appropriate for the image, consider overlaying the text '{video_title}'. CRITICAL TEXT PLACEMENT REQUIREMENTS: The text MUST be positioned well within the image boundaries - at least 10% away from ALL edges (top, bottom, left, right) to ensure it's never cut off or cropped. The text MUST be bold, with EXTREMELY HIGH CONTRAST against its background to ensure absolute readability. It should be stylishly designed and strategically placed in the central 80% of the image for maximum impact and guaranteed visibility. Only add text if it significantly enhances the thumbnail and does not obscure critical visual elements. If the text cannot be made FULLY and perfectly clear, legible, and positioned safely away from all edges, do not add it." if video_title else ""}
         Boost colors and contrast to make the image pop, but maintain a natural look.
         Ensure the main focal point is exceptionally clear and sharp.
-        Consider YouTube best practices for thumbnails: strong emotion, intrigue, clear subject, rule of thirds.
+        Consider YouTube best practices for thumbnails: strong emotion, intrigue, clear subject, rule of thirds. DO NOT INCLUDE ANY HASHTAGS.
         The final image should be polished, high-resolution, and immediately grab attention on a crowded YouTube feed.
         Do not add any watermarks or signatures.
-        CRITICAL: The appearance of any people or characters in the original image MUST remain UNCHANGED. Do NOT alter facial features, expressions, body shape, or clothing. The goal is to enhance the *surrounding* visual elements and the overall composition, not the individuals themselves.
+        
+        CRITICAL: 
+            1. The appearance of any people or characters in the original image MUST remain UNCHANGED. Do NOT alter facial features, expressions, body shape, or clothing. The goal is to enhance the *surrounding* visual elements and the overall composition, not the individuals themselves.
+            2. TEXT POSITIONING: ANY AND ALL TEXT MUST BE ENTIRELY WITHIN THE SAFE ZONE - positioned at least 10% away from ALL image edges (top, bottom, left, right). The text should occupy only the central 80% area of the image to guarantee it's never cut off, cropped, or truncated. NO TEXT should touch or come close to any edge.
+            3. TEXT READABILITY: ALL TEXT MUST BE ENTIRELY AND CLEARLY READABLE, with EXTREMELY HIGH CONTRAST against its background. The text must be large enough to read clearly even when the thumbnail is viewed at small sizes.
+            4. YOU MAY ONLY ADD TEXT SPECIFICALLY MENTIONED IN THE IMAGE EDITING INSTRUCTIONS.
+            
         The enhancements should primarily focus on visual elements such as colors, contrast, sharpness, and potentially overlaying text to grab the viewer's attention, similar to how a human thumbnail designer would enhance a thumbnail without distorting the core content.
         The goal is enhancement, not a radical transformation of the original image's subject or characters.
         """
@@ -1008,7 +1292,8 @@ def optimize_thumbnail_with_openai(
             response = client.images.edit(
                 model=model_name,
                 image=image_file_rb,
-                quality="high",
+                quality="high",  # Use medium instead of high to reduce file size
+                #size="1024x1024",  # Optimal size for YouTube thumbnails, smaller than default
                 prompt=prompt,
                 n=1,
             )
@@ -1024,11 +1309,47 @@ def optimize_thumbnail_with_openai(
         output_image_path_obj = Path(output_image_path)
         output_image_path_obj.parent.mkdir(parents=True, exist_ok=True)
 
+        # Check file size and compress if needed to stay under YouTube's 2MB limit
+        file_size_mb = len(image_bytes) / (1024 * 1024)
+        logging.info(f"Generated image size: {file_size_mb:.2f} MB")
+        
+        if file_size_mb > 2.0:
+            logging.warning(f"Image size ({file_size_mb:.2f} MB) exceeds YouTube's 2MB limit. Compressing...")
+            
+            # Use PIL to compress the image
+            from PIL import Image
+            import io
+            
+            # Load image from bytes
+            img = Image.open(io.BytesIO(image_bytes))
+            
+            # Start with quality 85 and reduce until under 2MB
+            quality = 85
+            while quality > 20:  # Don't go below quality 20
+                output_buffer = io.BytesIO()
+                img.save(output_buffer, format='JPEG', quality=quality, optimize=True)
+                compressed_bytes = output_buffer.getvalue()
+                compressed_size_mb = len(compressed_bytes) / (1024 * 1024)
+                
+                if compressed_size_mb <= 2.0:
+                    logging.info(f"Compressed to {compressed_size_mb:.2f} MB with quality {quality}")
+                    image_bytes = compressed_bytes
+                    # Update output path to .jpg since we converted to JPEG
+                    if output_image_path_obj.suffix.lower() == '.png':
+                        output_image_path_obj = output_image_path_obj.with_suffix('.jpg')
+                    break
+                
+                quality -= 10
+            
+            if len(image_bytes) / (1024 * 1024) > 2.0:
+                logging.warning("Could not compress image below 2MB while maintaining reasonable quality")
+
         with open(output_image_path_obj, "wb") as f:
             f.write(image_bytes)
         
         resolved_output_path = str(output_image_path_obj.resolve())
-        logging.info(f"Successfully optimized thumbnail with OpenAI saved to: {resolved_output_path}")
+        final_size_mb = len(image_bytes) / (1024 * 1024)
+        logging.info(f"Successfully optimized thumbnail with OpenAI saved to: {resolved_output_path} (Final size: {final_size_mb:.2f} MB)")
         return resolved_output_path
 
     except openai.APIError as e:
@@ -1545,8 +1866,7 @@ def download_youtube_video_and_extract_frames(video_id: str, output_path: str, t
         return None
     
     logging.info(f"Video Sieve Output URL: {video_url}")
-    
-    # Download the video
+
     if not download_video_from_url(video_url, output_path):
         logging.error("Failed to download video from Sieve URL")
         return None
@@ -1567,9 +1887,183 @@ def download_youtube_video_and_extract_frames(video_id: str, output_path: str, t
     except Exception as e:
         logging.error(f"Error extracting frames: {str(e)}")
         return None
+
+def detect_faces(path):
+    """Detects faces in an image."""
+    for attempt in range(3):
+        try:
+            with open(path, "rb") as image_file:
+                content = image_file.read()
+            image = vision.Image(content=content)
+            response = client.face_detection(image=image)
+            faces = response.face_annotations
+            return faces
+        except Exception as e:
+            logging.warning(f"Face detection failed on attempt {attempt + 1}: {e}")
+            time.sleep(2 ** (attempt + 1))
+
+    return []
+
+def calculate_face_prominence_score(face_data, image_width=1280, image_height=720):
+    """
+    Calculate overall face prominence score (0-1) based on:
+    - Size/visibility in frame
+    - Direction toward camera  
+    - Eye alignment
+    - Detection quality
+    
+    Args:
+        face_data: Google Vision API face detection result
+        image_width: Image width in pixels
+        image_height: Image height in pixels
+        
+    Returns:
+        Dict with detailed scoring breakdown
+    """
+    try:
+        # 1. Size scoring - how much of the frame does the face occupy?
+        bounding_poly = face_data.bounding_poly.vertices
+        face_width = bounding_poly[1].x - bounding_poly[0].x
+        face_height = bounding_poly[2].y - bounding_poly[1].y
+        face_area = face_width * face_height
+
+        # Normalize by image size
+        size_percentage = face_area / (image_width * image_height)
+        # Faces >1% of frame get high scores, scale appropriately
+        size_score = min(1.0, size_percentage * 100)
+
+        # 2. Direction scoring - is the face looking toward camera?
+        pan_score = max(0, 1 - abs(face_data.pan_angle) / 15.0)  # ±15° is good
+        tilt_score = max(0, 1 - abs(face_data.tilt_angle) / 20.0)  # ±20° is acceptable
+        direction_score = (pan_score + tilt_score) / 2
+
+        # 3. Quality scoring - detection confidence and image quality
+        quality_score = (face_data.detection_confidence + face_data.landmarking_confidence) / 2
+
+        # Bonus for good image quality indicators
+        blur_bonus = 0.1 if face_data.blurred_likelihood.name == "VERY_UNLIKELY" else 0
+        exposure_bonus = 0.1 if face_data.under_exposed_likelihood.name == "VERY_UNLIKELY" else 0
+        quality_score = min(1.0, quality_score + blur_bonus + exposure_bonus)
+
+        # 4. Position scoring - center of frame is generally better for thumbnails
+        face_center_x = (bounding_poly[0].x + bounding_poly[1].x) / 2
+        face_center_y = (bounding_poly[0].y + bounding_poly[2].y) / 2
+
+        center_distance = ((face_center_x - image_width/2)**2 + (face_center_y - image_height/2)**2)**0.5
+        max_distance = (image_width**2 + image_height**2)**0.5 / 2
+        position_score = 1 - (center_distance / max_distance)
+
+        # 5. Expression scoring - positive expressions are better for thumbnails
+        expression_score = 0.5  # Default neutral
+        if face_data.joy_likelihood.name in ["LIKELY", "VERY_LIKELY"]:
+            expression_score = 0.8
+        elif face_data.surprise_likelihood.name in ["LIKELY", "VERY_LIKELY"]:
+            expression_score = 0.7  # Surprise can be good for thumbnails
+        elif face_data.sorrow_likelihood.name in ["LIKELY", "VERY_LIKELY"]:
+            expression_score = 0.3  # Sadness usually not great for thumbnails
+        elif face_data.anger_likelihood.name in ["LIKELY", "VERY_LIKELY"]:
+            expression_score = 0.4  # Anger can work but context-dependent
+
+        # Weighted combination - prioritize size and direction for thumbnails
+        final_score = (
+            size_score * 0.35 +        # Size is most important for visibility
+            direction_score * 0.30 +   # Camera direction is crucial for engagement
+            quality_score * 0.20 +     # Quality ensures the face is clear
+            position_score * 0.10 +    # Position helps but less critical
+            expression_score * 0.05    # Expression is a nice bonus
+        )
+
+        return {
+            'overall_score': final_score,
+            'size_score': size_score,
+            'direction_score': direction_score,
+            'quality_score': quality_score,
+            'position_score': position_score,
+            'expression_score': expression_score,
+            'face_area_pixels': face_area,
+            'face_percentage': size_percentage * 100,
+            'looking_at_camera': direction_score > 0.6,
+            'highly_visible': size_score > 0.3,
+            'pan_angle': face_data.pan_angle,
+            'tilt_angle': face_data.tilt_angle,
+            'detection_confidence': face_data.detection_confidence
+        }
+
+    except Exception as e:
+        logging.error(f"Error calculating face prominence score: {e}")
+        return None
+
+def analyze_frame_faces(image_path):
+    """
+    Analyze all faces in a frame and return the best face score
+    
+    Returns:
+        Dict with best face analysis or None if no faces detected
+    """
+    try:
+        faces = detect_faces(image_path)
+        
+        if not faces:
+            return None
+            
+        # Get image dimensions
+        import cv2
+        img = cv2.imread(image_path)
+        if img is None:
+            return None
+            
+        height, width = img.shape[:2]
+        
+        best_face_score = 0
+        best_face_analysis = None
+        
+        for face in faces:
+            face_analysis = calculate_face_prominence_score(face, width, height)
+            if face_analysis['overall_score'] > best_face_score:
+                best_face_score = face_analysis['overall_score']
+                best_face_analysis = face_analysis
+        
+        return best_face_analysis
+        
+    except Exception as e:
+        logging.error(f"Error analyzing faces in {image_path}: {e}")
+        return None
+
+def calculate_combined_frame_score(sharpness, face_analysis=None, sharpness_weight=0.6, face_weight=0.4):
+    """
+    Calculate combined score balancing sharpness and face quality
+    
+    Args:
+        sharpness: Frame sharpness score
+        face_analysis: Face analysis result (can be None)
+        sharpness_weight: Weight for sharpness (default 60%)
+        face_weight: Weight for face quality (default 40%)
+        
+    Returns:
+        Combined score normalized to sharpness scale
+    """
+    # Normalize sharpness to 0-1 scale (assuming typical range 0-2000)
+    normalized_sharpness = min(1.0, sharpness / 2000.0)
+    
+    if face_analysis is None:
+        # No face detected - use pure sharpness
+        return sharpness
+    
+    # Face detected - combine scores
+    face_score = face_analysis['overall_score']
+    
+    # Calculate weighted combination
+    combined_normalized = (normalized_sharpness * sharpness_weight) + (face_score * face_weight)
+    
+    # Scale back to sharpness range for consistent comparison
+    combined_score = combined_normalized * 2000.0
+    
+    return combined_score
         
 # --- Example Usage ---
 if __name__ == "__main__":
+
+
     def format_evaluation_results(evaluation: ThumbnailEvaluation) -> str:
         """Format a ThumbnailEvaluation object into a readable string."""
         metrics = [
@@ -1600,87 +2094,88 @@ if __name__ == "__main__":
         
         return '\n'.join(result)
 
-    thumbnail_optimization_results = do_thumbnail_optimization(
-        video_id="y8yDBm7PvbM",
-        original_title="Testing What Happens If You Jump On A Moving Train",
-        original_description="""Sometimes you gotta go full Tom Cruise to really teach the science. Now go grow your brain even more and get 2 FREE boxes at: https://crunchlabs.com/HotAirBalloon
-        Get your CrunchLabs box today:
-        Build Box for kids click here: https://crunchlabs.com/HotAirBalloon
-        Hack Pack for teens and adults click here: https://crunchlabs.com/HotAirBalloonHP
+    if True:
+        thumbnail_optimization_results = do_thumbnail_optimization(
+            video_id="y8yDBm7PvbM",
+            original_title="Testing What Happens If You Jump On A Moving Train",
+            original_description="""Sometimes you gotta go full Tom Cruise to really teach the science. Now go grow your brain even more and get 2 FREE boxes at: https://crunchlabs.com/HotAirBalloon
+            Get your CrunchLabs box today:
+            Build Box for kids click here: https://crunchlabs.com/HotAirBalloon
+            Hack Pack for teens and adults click here: https://crunchlabs.com/HotAirBalloonHP
+    
+    
+            Thanks to these folks for providing some of the music in the video:
+            Ponder- ‪@Pondermusic‬ 
+            Laura Shigihara - ‪@supershigi‬ 
+            Andrew Applepie -   / andrewapplepie  
+            Blue Wednesday -   / bluewednesday  
+            Danijel Zambo - https://open.spotify.com/intl-de/arti...
+    
+            PLATINUM TICKET INSTANT WIN GAME
+            NO PURCHASE NECESSARY. Promotion starts on 06/1/2024 & ends on 05/31/25, subject to monthly entry deadlines. Open to legal residents of the 50 U.S. & D.C., 18+. 1 prize per month: each month is its own separate promotion. For the first 2-3 months, winner may be notified via phone call instead of winning game piece. If a monthly prize is unclaimed/forfeited, it will be awarded via 2nd chance drawing. See Official Rules at crunchlabs.com/sweepstakes for full details on eligibility requirements, how to enter, free method of entry, prize claim procedure, prize description and limitations. Void where prohibited.
+    
+            PLATINUM DIPLOMA SWEEPSTAKES
+            NO PURCHASE NECESSARY. Ends 4/30/25, Open to legal residents of the 50 U.S. & D.C., 14+. Visit https://www.crunchlabs.com/pages/crun... for Official Rules including full details on eligibility requirements, how to enter, entry periods, free method of entry, entry limits, prize claim procedure, prize description and limitations. Void where prohibited.
+            """,
+            original_tags=[],
+            transcript="",
+            competitor_analytics_data={},
+            category_name="",
+            user_id=1
+        )
 
+        # Run the optimization
+        thumbnail_optimization_results = do_thumbnail_optimization(
+            video_id="y8yDBm7PvbM",
+            original_title="Testing What Happens If You Jump On A Moving Train",
+            original_description="""Sometimes you gotta go full Tom Cruise to really teach the science...""",
+            original_tags=[],
+            transcript="",
+            competitor_analytics_data={},
+            category_name="",
+            user_id=1
+        )
 
-        Thanks to these folks for providing some of the music in the video:
-        Ponder- ‪@Pondermusic‬ 
-        Laura Shigihara - ‪@supershigi‬ 
-        Andrew Applepie -   / andrewapplepie  
-        Blue Wednesday -   / bluewednesday  
-        Danijel Zambo - https://open.spotify.com/intl-de/arti...
+        if thumbnail_optimization_results:
+            # Create output directory
+            output_dir = Path("thumbnail_optimization_results")
+            output_dir.mkdir(exist_ok=True)
 
-        PLATINUM TICKET INSTANT WIN GAME
-        NO PURCHASE NECESSARY. Promotion starts on 06/1/2024 & ends on 05/31/25, subject to monthly entry deadlines. Open to legal residents of the 50 U.S. & D.C., 18+. 1 prize per month: each month is its own separate promotion. For the first 2-3 months, winner may be notified via phone call instead of winning game piece. If a monthly prize is unclaimed/forfeited, it will be awarded via 2nd chance drawing. See Official Rules at crunchlabs.com/sweepstakes for full details on eligibility requirements, how to enter, free method of entry, prize claim procedure, prize description and limitations. Void where prohibited.
+            # Generate timestamp for filenames
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        PLATINUM DIPLOMA SWEEPSTAKES
-        NO PURCHASE NECESSARY. Ends 4/30/25, Open to legal residents of the 50 U.S. & D.C., 14+. Visit https://www.crunchlabs.com/pages/crun... for Official Rules including full details on eligibility requirements, how to enter, entry periods, free method of entry, entry limits, prize claim procedure, prize description and limitations. Void where prohibited.
-        """,
-        original_tags=[],
-        transcript="",
-        competitor_analytics_data={},
-        category_name="",
-        user_id=1
-    )
+            # Save raw results
+            raw_output = output_dir / f"thumbnail_optimization_raw_{timestamp}.json"
+            with open(raw_output, 'w') as f:
+                json.dump(thumbnail_optimization_results, f, indent=2, default=str)
+            print(f"\nSaved raw results to: {raw_output}")
 
-    # Run the optimization
-    thumbnail_optimization_results = do_thumbnail_optimization(
-        video_id="y8yDBm7PvbM",
-        original_title="Testing What Happens If You Jump On A Moving Train",
-        original_description="""Sometimes you gotta go full Tom Cruise to really teach the science...""",
-        original_tags=[],
-        transcript="",
-        competitor_analytics_data={},
-        category_name="",
-        user_id=1
-    )
+            # Process and save formatted results
+            formatted_results = []
+            frames = thumbnail_optimization_results.get('frames', [])
 
-    if thumbnail_optimization_results:
-        # Create output directory
-        output_dir = Path("thumbnail_optimization_results")
-        output_dir.mkdir(exist_ok=True)
-        
-        # Generate timestamp for filenames
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        
-        # Save raw results
-        raw_output = output_dir / f"thumbnail_optimization_raw_{timestamp}.json"
-        with open(raw_output, 'w') as f:
-            json.dump(thumbnail_optimization_results, f, indent=2, default=str)
-        print(f"\nSaved raw results to: {raw_output}")
+            for i, frame in enumerate(frames, 1):
+                frame_result = {
+                    "frame_number": i,
+                    "original_frame": frame.get('original_frame'),
+                    "optimized_thumbnail": frame.get('optimized_thumbnail'),
+                    "prompt": frame.get('prompt'),
+                    "evaluation": format_evaluation_results(frame.get('evaluation')) if frame.get('evaluation') else None
+                }
+                formatted_results.append(frame_result)
 
-        # Process and save formatted results
-        formatted_results = []
-        frames = thumbnail_optimization_results.get('frames', [])
-        
-        for i, frame in enumerate(frames, 1):
-            frame_result = {
-                "frame_number": i,
-                "original_frame": frame.get('original_frame'),
-                "optimized_thumbnail": frame.get('optimized_thumbnail'),
-                "prompt": frame.get('prompt'),
-                "evaluation": format_evaluation_results(frame.get('evaluation')) if frame.get('evaluation') else None
-            }
-            formatted_results.append(frame_result)
+            # Save formatted results
+            formatted_output = output_dir / f"thumbnail_optimization_formatted_{timestamp}.json"
+            with open(formatted_output, 'w') as f:
+                json.dump(formatted_results, f, indent=2)
+            print(f"Saved formatted results to: {formatted_output}")
 
-        # Save formatted results
-        formatted_output = output_dir / f"thumbnail_optimization_formatted_{timestamp}.json"
-        with open(formatted_output, 'w') as f:
-            json.dump(formatted_results, f, indent=2)
-        print(f"Saved formatted results to: {formatted_output}")
-
-        # Print first thumbnail's evaluation
-        if formatted_results and formatted_results[0].get('evaluation'):
-            print("\nFirst Thumbnail Evaluation:")
-            print(formatted_results[0]['evaluation'])
-    else:
-        print("Thumbnail optimization failed")
+            # Print first thumbnail's evaluation
+            if formatted_results and formatted_results[0].get('evaluation'):
+                print("\nFirst Thumbnail Evaluation:")
+                print(formatted_results[0]['evaluation'])
+        else:
+            print("Thumbnail optimization failed")
 
     
 
@@ -1693,12 +2188,15 @@ if __name__ == "__main__":
     #extracted_frames = extract_frames_at_suggested_times("test_video.mp4")
 
     extracted_final_frame_paths = [
+        '/Users/jasonramirez/Documents/youtube-optimizer/backend/services/extracted_thumbnails/test_video_llm_sharp_thumb_01_at_1_370s_MansurroundedbysnakesCapt.jpg',
         '/Users/jasonramirez/Documents/youtube-optimizer/backend/services/extracted_thumbnails/orig_test_video_llm_sharp_thumb_01_at_1_370s_MansurroundedbysnakesCapt.jpg',
         '/Users/jasonramirez/Documents/youtube-optimizer/backend/services/extracted_thumbnails/orig_test_video_llm_sharp_thumb_02_at_34_350s_ManholdingasteakDrawsatt.jpg',
         '/Users/jasonramirez/Documents/youtube-optimizer/backend/services/extracted_thumbnails/orig_test_video_llm_sharp_thumb_03_at_51_340s_Twolionssurroundingsleeping.jpg',
         '/Users/jasonramirez/Documents/youtube-optimizer/backend/services/extracted_thumbnails/orig_test_video_llm_sharp_thumb_04_at_37_040s_Drivingonadangerousnarrow.jpg',
         '/Users/jasonramirez/Documents/youtube-optimizer/backend/services/extracted_thumbnails/orig_test_video_llm_sharp_thumb_05_at_76_122s_Sharkapproachingthescreen.jpg'
     ]
+
+    detect_faces(extracted_final_frame_paths[0])
 
     optimize_thumbnail_with_openai(
         extracted_final_frame_paths[0],

@@ -116,7 +116,8 @@ def apply_optimization_to_youtube_video(
     user_id: int,
     only_title: bool = False,
     only_description: bool = False,
-    only_tags: bool = False
+    only_tags: bool = False,
+    thumbnail_file: str = None
 ) -> Dict:
     """
     Apply an optimization to a YouTube video.
@@ -211,7 +212,8 @@ def apply_optimization_to_youtube_video(
             optimization_id=optimization_id,
             only_title=only_title,
             only_description=only_description,
-            only_tags=only_tags
+            only_tags=only_tags,
+            thumbnail_file=thumbnail_file
         )
 
         if update_result["success"]:

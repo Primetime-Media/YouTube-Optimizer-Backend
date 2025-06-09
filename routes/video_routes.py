@@ -10,7 +10,7 @@ from services.video import (
     get_video_optimizations
 )
 from services.optimizer import apply_optimization_to_youtube_video, get_optimization_status
-from services.llm_optimization import should_optimize_video
+from services.llm_optimization import should_optimize_video, enhanced_should_optimize_video
 from services.youtube import fetch_video_timeseries_data, fetch_and_store_youtube_analytics
 from services.competitor_analysis import get_competitor_analysis
 from utils.auth import get_user_credentials, get_user_from_session, User
@@ -221,7 +221,7 @@ async def apply_optimization_to_video(optimization_id: int, user = Depends(get_u
 @router.get("/")
 @router.get("/performance/all")
 async def get_all_videos_performance(
-    interval: str = "30m",
+    interval: str = "1d",
     limit: int = 100,
     offset: int = 0,
     refresh: bool = False,
@@ -545,7 +545,9 @@ async def get_channel_videos_performance(
                 else:
                     # Get cached timeseries data
                     logger.info(f"Fetching timeseries data for video {video_id} with interval {interval}")
-                    timeseries_data = fetch_video_timeseries_data(video_id, interval)
+                    analytics_data = fetch_video_timeseries_data(video_id, interval)
+
+                    """
                     # Extract analytics data from timeseries_data if available
                     if timeseries_data and isinstance(timeseries_data, dict):
                         analytics_data = {
@@ -554,6 +556,7 @@ async def get_channel_videos_performance(
                             "ctr": timeseries_data.get("ctr", {}).get("latest", 0),
                             "avg_view_duration": timeseries_data.get("average_view_duration", {}).get("latest", 0),
                         }
+                    """
                 
                 # Get detailed video data
                 detailed_video_data = get_video_data(video_id)
@@ -564,7 +567,7 @@ async def get_channel_videos_performance(
 
                 # Call LLM to determine if optimization is needed
                 logger.info(f"Calling LLM to evaluate if video {video_id} needs optimization")
-                optimization_decision = await should_optimize_video(
+                optimization_decision = await enhanced_should_optimize_video(
                     detailed_video_data,
                     channel_subscriber_count,
                     analytics_data,
@@ -591,6 +594,7 @@ async def get_channel_videos_performance(
                     analytics_data=analytics_data,
                     competitor_analytics_data=competitor_analysis,
                     apply_optimization=True,
+                    prev_optimizations=optimizations
                 )
 
                 if video_optimization_details['is_applied']:

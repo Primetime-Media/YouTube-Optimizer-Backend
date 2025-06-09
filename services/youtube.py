@@ -32,9 +32,9 @@ def build_youtube_client(credentials):
         return build(
             'youtube', 
             'v3', 
-            #credentials=credentials,
+            credentials=credentials,
             # These developer keys help ensure user quota is prioritized
-            developerKey="AIzaSyBjCjbw01rBJPVwCzZArqZ1-gHBct9m8cU",#None,   Explicitly set to None to use only user credentials
+            #developerKey="AIzaSyBjCjbw01rBJPVwCzZArqZ1-gHBct9m8cU",#None,   Explicitly set to None to use only user credentials
             cache_discovery=False,  # Disable cache to ensure fresh credentials are used
         )
     except Exception as e:
@@ -75,6 +75,119 @@ def get_user_id_for_channel(channel_id: int) -> Optional[int]:
     finally:
         if conn:
             conn.close()
+
+def set_video_thumbnail(youtube_client, video_id: str, thumbnail_file: str) -> Dict:
+    """
+    Set a custom thumbnail for a YouTube video
+    
+    Args:
+        youtube_client: YouTube API client
+        video_id: The YouTube video ID
+        thumbnail_file: Path to the thumbnail image file
+        
+    Returns:
+        dict: Result of the thumbnail upload operation
+    """
+    try:
+        import os
+        from googleapiclient.http import MediaFileUpload
+        
+        logger.info(f"Starting thumbnail upload for video {video_id}")
+        
+        # Validate file exists
+        if not os.path.exists(thumbnail_file):
+            return {
+                "success": False,
+                "error": f"Thumbnail file not found: {thumbnail_file}"
+            }
+
+        from PIL import Image
+        # Convert PNG to JPG if needed
+        if thumbnail_file.lower().endswith('.png'):
+            try:
+                # Create output filename with .jpg extension
+                jpg_file = os.path.splitext(thumbnail_file)[0] + '.jpg'
+
+                # Open image and convert to RGB (removes alpha channel if present)
+                with Image.open(thumbnail_file) as img:
+                    if img.mode in ('RGBA', 'P'):
+                        img = img.convert('RGB')
+                    # Save as JPG with 90% quality (good balance between quality and size)
+                    img.save(jpg_file, 'JPEG', quality=90, optimize=True, progressive=True)
+
+                # Update thumbnail_file to use the new JPG
+                thumbnail_file = jpg_file
+                logger.info(f"Converted PNG to JPG: {thumbnail_file}")
+
+            except Exception as e:
+                logger.error(f"Error converting PNG to JPG: {e}")
+                return {
+                    "success": False,
+                    "error": f"Failed to convert PNG to JPG: {str(e)}"
+                }
+
+        # Validate file size (YouTube limit is 2MB)
+        file_size = os.path.getsize(thumbnail_file)
+        if file_size > 2 * 1024 * 1024:  # 2MB in bytes
+            return {
+                "success": False,
+                "error": f"Thumbnail file too large: {file_size} bytes (max 2MB)"
+            }
+        
+        # Validate file extension
+        valid_extensions = ['.jpg', '.jpeg', '.png', '.gif', '.bmp']
+        file_ext = os.path.splitext(thumbnail_file)[1].lower()
+        if file_ext not in valid_extensions:
+            return {
+                "success": False,
+                "error": f"Invalid file type: {file_ext}. Must be one of {valid_extensions}"
+            }
+        
+        # Create media upload object with proper MIME type mapping
+        mime_type_map = {
+            '.jpg': 'image/jpeg',
+            '.jpeg': 'image/jpeg', 
+            '.png': 'image/png',
+            '.gif': 'image/gif',
+            '.bmp': 'image/bmp'
+        }
+        mimetype = mime_type_map.get(file_ext, 'image/jpeg')  # Default to jpeg
+        
+        media = MediaFileUpload(
+            thumbnail_file,
+            mimetype=mimetype,
+            resumable=True
+        )
+        
+        # Upload the thumbnail
+        logger.info(f"Uploading thumbnail for video {video_id}")
+        upload_response = youtube_client.thumbnails().set(
+            videoId=video_id,
+            media_body=media
+        ).execute()
+        
+        logger.info(f"Successfully uploaded thumbnail for video {video_id}")
+        return {
+            "success": True,
+            "message": "Thumbnail uploaded successfully",
+            "video_id": video_id,
+            "thumbnail_info": upload_response
+        }
+        
+    except HttpError as e:
+        error_content = json.loads(e.content.decode())
+        error_message = error_content.get("error", {}).get("message", str(e))
+        logger.error(f"YouTube API error uploading thumbnail: {error_message}")
+        return {
+            "success": False,
+            "error": f"YouTube API error: {error_message}"
+        }
+    except Exception as e:
+        logger.error(f"Error uploading thumbnail for video {video_id}: {e}")
+        return {
+            "success": False,
+            "error": f"Error uploading thumbnail: {str(e)}"
+        }
             
 def update_youtube_video(
     youtube_client,
@@ -85,7 +198,8 @@ def update_youtube_video(
     optimization_id: int = None,
     only_title: bool = False,
     only_description: bool = False,
-    only_tags: bool = False
+    only_tags: bool = False,
+    thumbnail_file: str = None
 ) -> Dict:
     """
     Update a YouTube video's metadata with optimized values
@@ -100,6 +214,7 @@ def update_youtube_video(
         only_title: If true, only update the title
         only_description: If true, only update the description
         only_tags: If true, only update the tags
+        thumbnail_file: Path to thumbnail file to upload (optional)
         
     Returns:
         dict: Result of the update operation
@@ -201,10 +316,19 @@ def update_youtube_video(
                 conn.close()
             
             logger.info(f"Successfully updated fields {', '.join(updated_fields)} for video {video_id}")
+            
+            # Upload thumbnail if provided
+            thumbnail_result = None
+            if thumbnail_file:
+                thumbnail_result = set_video_thumbnail(youtube_client, video_id, thumbnail_file)
+                if not thumbnail_result.get("success"):
+                    logger.warning(f"Thumbnail upload failed for video {video_id}: {thumbnail_result.get('error')}")
+            
             return {
                 "success": True,
                 "message": f"Video fields ({', '.join(updated_fields)}) updated successfully",
-                "video_id": video_id
+                "video_id": video_id,
+                "thumbnail_result": thumbnail_result
             }
             
         except HttpError as e:
@@ -1316,9 +1440,7 @@ def fetch_granular_view_data(credentials, video_id: str, interval: str = '30m',
         try:
             publish_date = datetime.datetime.strptime(publish_date_str, "%Y-%m-%dT%H:%M:%SZ")
         except ValueError:
-             # Handle potential alternative formats if necessary
              logger.error(f"Could not parse publish date string: {publish_date_str}. Falling back.")
-             # Fallback or raise error - for now, let's use a default if parsing fails
              publish_date = datetime.datetime.now() - datetime.timedelta(days=28) # Or handle error differently
 
         now = datetime.datetime.now()
@@ -1336,10 +1458,9 @@ def fetch_granular_view_data(credentials, video_id: str, interval: str = '30m',
             dimensions = ['day'] # Default to 'day' dimension
 
         logger.info(f"Using interval: {interval}, start_date: {start_date}, end_date: {end_date}, dimensions: {dimensions}") # Log interval, start date, dimensions
-        
-        # Define available metrics
+
         metrics = [
-            'engagedViews', 'views', 'estimatedMinutesWatched', 'averageViewPercentage', # Ensure 'views' is used
+            'engagedViews', 'views', 'estimatedMinutesWatched', 'averageViewPercentage', 'likes', 'dislikes', 'comments',
         ]
         
         # Prepare request parameters
@@ -1352,22 +1473,20 @@ def fetch_granular_view_data(credentials, video_id: str, interval: str = '30m',
             "filters": f"video=={video_id}",
             "sort": ','.join(dimensions)  # Sort by time dimensions
         }
-        logger.info(f"YouTube Analytics API request parameters: {params}") # Log API request parameters
+        logger.info(f"YouTube Analytics API request parameters: {params}")
         
         analytics_response = youtube_analytics.reports().query(**params).execute()
-        logger.debug(f"Raw YouTube Analytics API response: {analytics_response}") # Log raw API response at DEBUG level
+        logger.debug(f"Raw YouTube Analytics API response: {analytics_response}")
 
-        logger.info(f"Analytics API response column headers: {analytics_response.get('columnHeaders')}") # Log column headers
-        logger.info(f"Analytics API response rows: {analytics_response.get('rows')}") # Log rows from response
-        
+        logger.info(f"Analytics API response column headers: {analytics_response.get('columnHeaders')}")
+        logger.info(f"Analytics API response rows: {analytics_response.get('rows')}")
+
         # Process the time-series data
         timeseries_data = []
-        
-        # Extract column headers
+
         column_headers = analytics_response.get('columnHeaders', [])
         header_names = [header['name'] for header in column_headers]
-        
-        # Process rows into time series data points
+
         for row in analytics_response.get('rows', []):
             data_point = {}
             
@@ -1797,11 +1916,43 @@ def fetch_video_timeseries_data(video_id: str, interval: str = 'day', force_refr
             logger.info(f"Credentials for user {user_id} expired, attempting refresh.")
             try:
                 from google.auth.transport.requests import Request
+                from google.auth.exceptions import RefreshError
+                
+                # Log refresh token info for debugging (partial token only)
+                token_prefix = credentials.refresh_token[:10] if credentials.refresh_token else "None"
+                logger.info(f"Attempting refresh with token prefix: {token_prefix}...")
+                
+                # Validate refresh token before attempting refresh
+                if not credentials.refresh_token or len(credentials.refresh_token) < 10:
+                    logger.error(f"Invalid refresh token for user {user_id}: token too short or empty")
+                    return {'error': 'Invalid refresh token, please re-authenticate', 'video_id': video_id, 'auth_required': True}
+                
+                # Log client ID for debugging OAuth configuration issues
+                client_id_prefix = credentials.client_id[:12] if credentials.client_id else "None"
+                logger.info(f"Refresh attempt with client_id prefix: {client_id_prefix}...")
+                
                 credentials.refresh(Request())
                 logger.info(f"Credentials refreshed successfully for user {user_id}.")
-                # TODO: Update stored credentials in DB after refresh? (Requires utils.auth modification)
+                
+                # Update stored credentials in DB after successful refresh
+                try:
+                    from utils.auth import update_user_credentials
+                    if hasattr(update_user_credentials, '__call__'):
+                        update_user_credentials(user_id, credentials)
+                        logger.info(f"Updated stored credentials for user {user_id}")
+                except (ImportError, AttributeError) as auth_err:
+                    logger.warning(f"Could not update stored credentials: {auth_err}")
+                    
+            except RefreshError as refresh_err:
+                logger.error(f"OAuth refresh failed for user {user_id}: {refresh_err}")
+                # Check if it's an invalid_grant error specifically
+                if 'invalid_grant' in str(refresh_err):
+                    logger.error(f"Refresh token invalid/expired for user {user_id}. User needs to re-authenticate.")
+                    return {'error': 'Authentication expired, please re-authenticate', 'video_id': video_id, 'auth_required': True}
+                else:
+                    return {'error': f'Failed to refresh credentials: {refresh_err}', 'video_id': video_id}
             except Exception as refresh_err:
-                 logger.error(f"Failed to refresh credentials for user {user_id}: {refresh_err}")
+                 logger.error(f"Unexpected error during credential refresh for user {user_id}: {refresh_err}")
                  return {'error': 'Failed to refresh credentials', 'video_id': video_id}
         elif credentials.expired:
              logger.error(f"Credentials for user {user_id} expired and no refresh token available.")
@@ -1883,6 +2034,12 @@ def fetch_video_timeseries_data(video_id: str, interval: str = 'day', force_refr
     except Exception as e:
         logger.error(f"Unhandled error during timeseries data fetch for {video_id}: {e}", exc_info=True)
         return {'error': f'An unexpected error occurred: {str(e)}', 'video_id': video_id}
+
+def process_timeseries_data(rows, video_id: str, interval: str):
+    """
+    Process timeseries data rows from database into formatted response
+    """
+    result_data = []
     aggregated_data = {}
     
     for row in rows:

@@ -159,7 +159,8 @@ def generate_video_optimization(
         optimization_decision_data: Optional[Dict] = None,
         analytics_data: Optional[Dict] = None,
         competitor_analytics_data: Optional[Dict] = None,
-        apply_optimization: bool = False
+        apply_optimization: bool = False,
+        prev_optimizations: Optional[List[Dict]] = None
 ) -> Dict:
     """
     Generate optimized title, description, and tags for a YouTube video
@@ -204,17 +205,18 @@ def generate_video_optimization(
     update_optimization_progress(optimization_id, 25)
     
     try:
-
-        thumbnail_optimization_result = do_thumbnail_optimization(
-            video_id=video.get("video_id"),
-            original_title=title,
-            original_description=description,
-            original_tags=tags,
-            transcript=transcript,
-            competitor_analytics_data=competitor_analytics_data,
-            category_name=category_name,
-            user_id=user_id
-        )
+        if True:
+            # TODO: PARALLELIZE THUMBNAIL OPTIMIZATION AND COMPREHENSIVE OPTIMIZATION
+            thumbnail_optimization_result = do_thumbnail_optimization(
+                video_id=video.get("video_id"),
+                original_title=title,
+                original_description=description,
+                original_tags=tags,
+                transcript=transcript,
+                competitor_analytics_data=competitor_analytics_data,
+                category_name=category_name,
+                user_id=user_id
+            )
 
         # Call the optimization function with all data
         result = get_comprehensive_optimization(
@@ -229,7 +231,8 @@ def generate_video_optimization(
             analytics_data=analytics_data,
             competitor_analytics_data=competitor_analytics_data,
             category_name=category_name,
-            user_id=user_id
+            user_id=user_id,
+            prev_optimizations=prev_optimizations
         )
 
         if not result:
@@ -242,6 +245,9 @@ def generate_video_optimization(
             'original_description': description,
             'original_tags': tags
         })
+
+        if thumbnail_optimization_result:
+            best_optimization.update({"thumbnail_optimization_file": thumbnail_optimization_result.get("optimized_thumbnail", {}).get("optimized_thumbnail")})
 
         # Update progress - LLM processing complete
         update_optimization_progress(optimization_id, 75)
@@ -261,7 +267,7 @@ def generate_video_optimization(
 
         optimization_applied = False
         if apply_optimization:
-            optimization_result = apply_optimization_to_youtube_video(optimization_id, user_id)
+            optimization_result = apply_optimization_to_youtube_video(optimization_id, user_id, thumbnail_file=best_optimization.get("thumbnail_optimization_file"))
             optimization_applied = optimization_result.get('sucesss')
 
         return {

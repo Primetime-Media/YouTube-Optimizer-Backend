@@ -43,3 +43,36 @@ dist/
 *.egg-info/
 *.egg
 *.whl
+
+# Media files
+*.mp4
+*.avi
+*.mov
+*.wmv
+*.flv
+*.webm
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.tiff
+*.webp
+*.zip
+*.rar
+*.7z
+*.tar
+*.gz
+
+# Generated thumbnails and uploads
+extracted_thumbnails/
+services/extracted_thumbnails/
+services/user_uploads/
+user_uploads/
+services/thumbnails/
+thumbnail_optimization_results/
+services/thumbnail_optimization_results/
+
+# Optimized files
+optimized_*
+*_output.*

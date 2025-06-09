@@ -45,3 +45,22 @@ Thumbs.db
 build/
 dist/
 *.whl
+
+# Videos
+*.mp4
+
+# Generated thumbnails and data
+extracted_thumbnails/
+services/extracted_thumbnails/
+services/thumbnails/
+thumbnail_optimization_results/
+user_uploads/
+
+# Python cache & virtual env
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# OS / Editor specific
+.DS_Store
