@@ -516,9 +516,9 @@ async def get_channel_videos_performance(
 
                 num_optimizations_applied = len([opt for opt in optimizations if opt.get("is_applied")])
 
-                # If no optimizations have been applied and video was published less than 24 hours ago, skip
-                if num_optimizations_applied == 0 and False:# published_at > datetime.now() - timedelta(days=1):
-                    logger.info(f"Video {video_id} was optimized recently, skipping optimization.")
+                # If the video has already been optimized within the last 24 hours, skip it
+                if last_optimized_at and (datetime.now() - last_optimized_at).total_seconds() < 86400:
+                    logger.info(f"Video {video_id} has already been optimized within the last 24 hours, skipping")
                     continue
 
                 analytics_data = {}

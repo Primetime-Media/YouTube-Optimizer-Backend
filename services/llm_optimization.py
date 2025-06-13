@@ -1778,135 +1778,138 @@ async def should_optimize_video(
                 "confidence": float
             }
     """
-    logger.info(f"Evaluating if video '{video_data.get('title', 'Unknown')}' should be optimized")
+    try:
+        logger.info(f"Evaluating if video '{video_data.get('title', 'Unknown')}' should be optimized")
 
-    if past_optimizations:
-        #TODO: Integrate past optimizations analysis
-        past_optimizations_analysis = analyze_past_optimizations(past_optimizations, video_data, channel_subscriber_count, analytics_data)
+        if past_optimizations:
+            #TODO: Integrate past optimizations analysis
+            past_optimizations_analysis = analyze_past_optimizations(past_optimizations, video_data, channel_subscriber_count, analytics_data)
 
-    past_optimizations_prompt = '\n'.join([
-        (lambda o:
-         f"- Date: {o.get('created_at', 'Unknown')}\n"
-         f"  Title: {o.get('optimized_title', 'Not changed')}\n"
-         f"  Description: {o.get('optimized_description', 'Not changed')}\n"
-         f"  Tags: {', '.join(o.get('optimized_tags', [])) if isinstance(o.get('optimized_tags'), list) else 'Not changed'}"
-         )(opt)
-        for opt in past_optimizations
-    ]) if past_optimizations else 'No previous optimizations'
+        past_optimizations_prompt = '\n'.join([
+            (lambda o:
+             f"- Date: {o.get('created_at', 'Unknown')}\n"
+             f"  Title: {o.get('optimized_title', 'Not changed')}\n"
+             f"  Description: {o.get('optimized_description', 'Not changed')}\n"
+             f"  Tags: {', '.join(o.get('optimized_tags', [])) if isinstance(o.get('optimized_tags'), list) else 'Not changed'}"
+             )(opt)
+            for opt in past_optimizations
+        ]) if past_optimizations else 'No previous optimizations'
 
-    recent_performance_data_prompt = '\n'.join([
-        f"{day['date']}: {day['views']} views, {day.get('view_percentage', 0):.1f}% watched"
-        for day in analytics_data.get('timeseries_data', [])
-    ])
+        recent_performance_data_prompt = '\n'.join([
+            f"{day.get('day', day.get('date', 'Unknown'))}: {day['views']} views, {day.get('view_percentage', day.get('average_view_percentage', 0)):.1f}% watched" if day.get('day') else f"{day.get('day', day.get('date', 'Unknown'))}: {day['views']} views, {day.get('view_percentage', day.get('average_view_percentage', 0)):.1f}% watched"
+            for day in analytics_data.get('timeseries_data', [])
+        ])
 
-    system_message = """You are a YouTube SEO expert AI assistant. Your task is to analyze video performance data and decide if the video's metadata (title, description, tags) should be optimized to improve performance. Provide a clear 'YES' or 'NO' decision, a brief reasoning based *only* on the provided data, and a confidence score between 0.0 and 1.0. Respond strictly in JSON format."""
+        system_message = """You are a YouTube SEO expert AI assistant. Your task is to analyze video performance data and decide if the video's metadata (title, description, tags) should be optimized to improve performance. Provide a clear 'YES' or 'NO' decision, a brief reasoning based *only* on the provided data, and a confidence score between 0.0 and 1.0. Respond strictly in JSON format."""
 
-    prompt = f"""
-    Analyze the video data provided and respond with only "YES" or "NO" regarding whether 
-    the video should be optimized based on its current performance and metadata quality.
+        prompt = f"""
+        Analyze the video data provided and respond with only "YES" or "NO" regarding whether 
+        the video should be optimized based on its current performance and metadata quality.
+    
+        Consider the following factors:
+    
+        VIDEO INFORMATION:
+        - Title: {video_data.get('title', 'N/A')}
+        - Description: {video_data.get('description', 'N/A')}
+        - Tags: {', '.join(video_data.get('tags', [])) if video_data.get('tags') else 'No tags'}
+        - View Count: {video_data.get('view_count', 0)}
+        - Published At: {video_data.get('published_at', 'Unknown')}
+    
+        CHANNEL INFORMATION:
+        - Subscriber Count: {channel_subscriber_count}
+    
+        ENGAGEMENT METRICS:
+        - Likes: {video_data.get('like_count', 0)}
+        - Comments: {video_data.get('comments', 0)}
+        - Recent Performance: {recent_performance_data_prompt if recent_performance_data_prompt else 'No recent performance data'}
+    
+        PAST OPTIMIZATIONS:
+        {
+        past_optimizations_prompt if past_optimizations else 'No previous optimizations'
+        }
+    
+        KEY DECISION FACTORS:
+        1. Is the video underperforming relative to the channel's typical performance?
+        2. Are there clear SEO issues with the title, description or tags?
+        3. Could the video benefit from updated metadata based on current trends?
+        4. If the video was recently optimized, has it been enough time to evaluate performance?
+        5. Does the engagement rate (likes/views, comments/views) suggest improvements are needed?
+    
+        Your response MUST be in the following JSON format:
+        [
+            {{
+                "decision": "YES" or "NO",
+                "reasoning": "Reasoning for decision",
+                "confidence": 0.0 to 1.0
+            }}
+        ]
+        """
 
-    Consider the following factors:
+        for _ in range(3):
 
-    VIDEO INFORMATION:
-    - Title: {video_data.get('title', 'N/A')}
-    - Description: {video_data.get('description', 'N/A')}
-    - Tags: {', '.join(video_data.get('tags', [])) if video_data.get('tags') else 'No tags'}
-    - View Count: {video_data.get('view_count', 0)}
-    - Published At: {video_data.get('published_at', 'Unknown')}
+            try:
+                logger.info("Calling Claude API to determine optimization need")
+                message = client.messages.create(
+                    model=model,
+                    max_tokens=200,
+                    temperature=0.5,
+                    system=system_message,
+                    messages=[
+                        {"role": "user", "content": prompt}
+                    ]
+                )
 
-    CHANNEL INFORMATION:
-    - Subscriber Count: {channel_subscriber_count}
+                response_text = message.content[0].text
+                logger.debug(f"Claude response for optimization check: {response_text}")
 
-    ENGAGEMENT METRICS:
-    - Likes: {video_data.get('like_count', 0)}
-    - Comments: {video_data.get('comments', 0)}
-    - Recent Performance: {recent_performance_data_prompt if recent_performance_data_prompt else 'No recent performance data'}
+                json_match = re.search(r'\[[\s\S]*\]', response_text)
+                if json_match:
+                    json_str = json_match.group(0)
+                    response_list = json.loads(json_str)
 
-    PAST OPTIMIZATIONS:
-    {
-    past_optimizations_prompt if past_optimizations else 'No previous optimizations'
-    }
-
-    KEY DECISION FACTORS:
-    1. Is the video underperforming relative to the channel's typical performance?
-    2. Are there clear SEO issues with the title, description or tags?
-    3. Could the video benefit from updated metadata based on current trends?
-    4. If the video was recently optimized, has it been enough time to evaluate performance?
-    5. Does the engagement rate (likes/views, comments/views) suggest improvements are needed?
-
-    Your response MUST be in the following JSON format:
-    [
-        {{
-            "decision": "YES" or "NO",
-            "reasoning": "Reasoning for decision",
-            "confidence": 0.0 to 1.0
-        }}
-    ]
-    """
-
-    for _ in range(3):
-
-        try:
-            logger.info("Calling Claude API to determine optimization need")
-            message = client.messages.create(
-                model=model,
-                max_tokens=200,
-                temperature=0.5,
-                system=system_message,
-                messages=[
-                    {"role": "user", "content": prompt}
-                ]
-            )
-
-            response_text = message.content[0].text
-            logger.debug(f"Claude response for optimization check: {response_text}")
-
-            json_match = re.search(r'\[[\s\S]*\]', response_text)
-            if json_match:
-                json_str = json_match.group(0)
-                response_list = json.loads(json_str)
-
-                if isinstance(response_list, list) and len(response_list) > 0 and isinstance(response_list[0], dict):
-                    response_data = response_list[0]  # Get the first object from the array
-                    decision = response_data.get("decision", "NO").upper()
-                    should_optimize = decision == "YES"
-                    reasons = response_data.get("reasoning", "LLM provided no reasoning.")
-                    confidence = float(response_data.get("confidence", 0.5))  # Ensure confidence is float
-                    logger.info(f"Claude decision (from array): {decision}, Confidence: {confidence}, Reasoning: {reasons}")
-                else:
-                    # Log an error if the structure is not the expected list of dicts
-                    logger.error(f"Parsed JSON array is not valid or empty: {json_str}")
-                    raise ValueError("Parsed JSON array is not valid or empty.")
-
-            else:
-                logger.warning("No JSON array pattern found in response, attempting to find JSON object pattern...")
-                json_match_obj = re.search(r'{[\s\S]*}', response_text)
-                if json_match_obj:
-                    json_str_obj = json_match_obj.group(0)
-                    response_data = json.loads(json_str_obj)  # Assume it's just the object
-                    # Ensure the parsed data is a dictionary
-                    if isinstance(response_data, dict):
+                    if isinstance(response_list, list) and len(response_list) > 0 and isinstance(response_list[0], dict):
+                        response_data = response_list[0]  # Get the first object from the array
                         decision = response_data.get("decision", "NO").upper()
                         should_optimize = decision == "YES"
                         reasons = response_data.get("reasoning", "LLM provided no reasoning.")
                         confidence = float(response_data.get("confidence", 0.5))  # Ensure confidence is float
-                        logger.info(f"Claude decision (from object fallback): {decision}, Confidence: {confidence}, Reasoning: {reasons}")
+                        logger.info(f"Claude decision (from array): {decision}, Confidence: {confidence}, Reasoning: {reasons}")
                     else:
-                        logger.error(f"Fallback JSON object pattern parsed but is not a dictionary: {json_str_obj}")
-                        raise ValueError("Fallback JSON object pattern parsed but is not a dictionary.")
+                        # Log an error if the structure is not the expected list of dicts
+                        logger.error(f"Parsed JSON array is not valid or empty: {json_str}")
+                        raise ValueError("Parsed JSON array is not valid or empty.")
+
                 else:
-                    # Log an error if neither pattern is found
-                    logger.error(f"No JSON pattern (array or object) found in response: {response_text}")
-                    raise ValueError("No JSON pattern (array or object) found in response.")
+                    logger.warning("No JSON array pattern found in response, attempting to find JSON object pattern...")
+                    json_match_obj = re.search(r'{[\s\S]*}', response_text)
+                    if json_match_obj:
+                        json_str_obj = json_match_obj.group(0)
+                        response_data = json.loads(json_str_obj)  # Assume it's just the object
+                        # Ensure the parsed data is a dictionary
+                        if isinstance(response_data, dict):
+                            decision = response_data.get("decision", "NO").upper()
+                            should_optimize = decision == "YES"
+                            reasons = response_data.get("reasoning", "LLM provided no reasoning.")
+                            confidence = float(response_data.get("confidence", 0.5))  # Ensure confidence is float
+                            logger.info(f"Claude decision (from object fallback): {decision}, Confidence: {confidence}, Reasoning: {reasons}")
+                        else:
+                            logger.error(f"Fallback JSON object pattern parsed but is not a dictionary: {json_str_obj}")
+                            raise ValueError("Fallback JSON object pattern parsed but is not a dictionary.")
+                    else:
+                        # Log an error if neither pattern is found
+                        logger.error(f"No JSON pattern (array or object) found in response: {response_text}")
+                        raise ValueError("No JSON pattern (array or object) found in response.")
 
-            return {
-                "should_optimize": should_optimize,
-                "reasons": reasons,
-                "confidence": confidence
-            }
+                return {
+                    "should_optimize": should_optimize,
+                    "reasons": reasons,
+                    "confidence": confidence
+                }
 
-        except Exception as e:
-            logger.error(f"Error determining if video should be optimized via Claude: {str(e)}")
+            except Exception as e:
+                logger.error(f"Error determining if video should be optimized via Claude: {str(e)}")
+    except Exception as e:
+        logger.error(f"Error determining if video should be optimized via Claude: {str(e)}")
 
     return {
         "should_optimize": False,
@@ -3080,77 +3083,89 @@ async def enhanced_should_optimize_video(
     Returns:
         Combined optimization decision with confidence scoring
     """
-    logger.info(f"Enhanced optimization analysis for video: {video_data.get('title', 'Unknown')}")
-    
-    # Run existing LLM-based analysis
-    llm_decision = await should_optimize_video(
-        video_data=video_data,
-        channel_subscriber_count=channel_subscriber_count,
-        analytics_data=analytics_data,
-        past_optimizations=past_optimizations,
-        model=model
-    )
-    
-    if not use_statistical_analysis:
-        return llm_decision
-    
-    # Run statistical analysis using video_id
-    video_id = video_data.get('video_id')
-    if not video_id:
-        logger.warning("No video_id provided for statistical analysis")
-        return llm_decision
-    
-    statistical_result = statistical_should_optimize(
-        video_id=video_id,
-        current_analytics=analytics_data
-    )
+    try:
+        logger.info(f"Enhanced optimization analysis for video: {video_data.get('title', 'Unknown')}")
 
-    if statistical_result is None:
+        # Run existing LLM-based analysis
+        llm_decision = await should_optimize_video(
+            video_data=video_data,
+            channel_subscriber_count=channel_subscriber_count,
+            analytics_data=analytics_data,
+            past_optimizations=past_optimizations,
+            model=model
+        )
+
+        if not use_statistical_analysis:
+            return llm_decision
+
+        # Run statistical analysis using video_id
+        video_id = video_data.get('video_id')
+        if not video_id:
+            logger.warning("No video_id provided for statistical analysis")
+            return llm_decision
+
+        statistical_result = statistical_should_optimize(
+            video_id=video_id,
+            current_analytics=analytics_data
+        )
+
+        if statistical_result is None:
+            return {
+                'should_optimize': False,
+                'confidence': 0.9,
+                'reasons': 'Video in cooling-off period after recent optimization',
+                'method': 'statistical_cooldown',
+                'llm_analysis': llm_decision,
+                'statistical_analysis': None
+            }
+
+        # Combine LLM and statistical decisions
+        llm_weight = 0.6
+        stat_weight = 0.4
+
+        # Combine confidence scores
+        combined_confidence = (
+            llm_decision['confidence'] * llm_weight +
+            statistical_result['confidence'] * stat_weight
+        )
+
+        # Decision logic: both should agree OR one should have very high confidence
+        llm_recommends = llm_decision['should_optimize']
+        stat_recommends = statistical_result['decision']
+
+        if llm_recommends and stat_recommends:
+            final_decision = True
+            method = 'hybrid_agreement'
+            reasoning = "Both LLM and statistical analysis recommend optimization"
+        elif llm_recommends and llm_decision['confidence'] > 0.85:
+            final_decision = True
+            method = 'llm_strong'
+            reasoning = f"LLM analysis strongly recommends optimization (confidence: {llm_decision['confidence']:.2f}) despite statistical uncertainty"
+        elif stat_recommends and statistical_result['confidence'] > 0.85:
+            final_decision = True
+            method = 'statistical_strong'
+            reasoning = f"Statistical analysis strongly recommends optimization (confidence: {statistical_result['confidence']:.2f}) despite LLM uncertainty"
+        else:
+            final_decision = False
+            method = 'hybrid_reject'
+            reasoning = f"Insufficient agreement: LLM={llm_recommends} (conf: {llm_decision['confidence']:.2f}), Statistical={stat_recommends} (conf: {statistical_result['confidence']:.2f})"
+
+        return {
+            'should_optimize': final_decision,
+            'confidence': combined_confidence,
+            'reasons': reasoning,
+            'method': method,
+            'llm_analysis': llm_decision,
+            'statistical_analysis': statistical_result
+        }
+
+    except Exception as e:
+        logger.error(f"Error in enhanced optimization analysis: {e}")
         return {
             'should_optimize': False,
-            'confidence': 0.9,
-            'reasons': 'Video in cooling-off period after recent optimization',
-            'method': 'statistical_cooldown',
-            'llm_analysis': llm_decision,
+            'confidence': 0.0,
+            'reasons': f"Error in enhanced optimization analysis: {e}",
+            'method': 'error',
+            'llm_analysis': None,
             'statistical_analysis': None
         }
-    
-    # Combine LLM and statistical decisions
-    llm_weight = 0.6
-    stat_weight = 0.4
-    
-    # Combine confidence scores
-    combined_confidence = (
-        llm_decision['confidence'] * llm_weight +
-        statistical_result['confidence'] * stat_weight
-    )
-    
-    # Decision logic: both should agree OR one should have very high confidence
-    llm_recommends = llm_decision['should_optimize']
-    stat_recommends = statistical_result['decision']
-    
-    if llm_recommends and stat_recommends:
-        final_decision = True
-        method = 'hybrid_agreement'
-        reasoning = "Both LLM and statistical analysis recommend optimization"
-    elif llm_recommends and llm_decision['confidence'] > 0.85:
-        final_decision = True  
-        method = 'llm_strong'
-        reasoning = f"LLM analysis strongly recommends optimization (confidence: {llm_decision['confidence']:.2f}) despite statistical uncertainty"
-    elif stat_recommends and statistical_result['confidence'] > 0.85:
-        final_decision = True
-        method = 'statistical_strong'  
-        reasoning = f"Statistical analysis strongly recommends optimization (confidence: {statistical_result['confidence']:.2f}) despite LLM uncertainty"
-    else:
-        final_decision = False
-        method = 'hybrid_reject'
-        reasoning = f"Insufficient agreement: LLM={llm_recommends} (conf: {llm_decision['confidence']:.2f}), Statistical={stat_recommends} (conf: {statistical_result['confidence']:.2f})"
-    
-    return {
-        'should_optimize': final_decision,
-        'confidence': combined_confidence,
-        'reasons': reasoning,
-        'method': method,
-        'llm_analysis': llm_decision,
-        'statistical_analysis': statistical_result
-    }

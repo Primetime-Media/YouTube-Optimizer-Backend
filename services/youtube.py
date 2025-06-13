@@ -33,8 +33,7 @@ def build_youtube_client(credentials):
             'youtube', 
             'v3', 
             credentials=credentials,
-            # These developer keys help ensure user quota is prioritized
-            #developerKey="AIzaSyBjCjbw01rBJPVwCzZArqZ1-gHBct9m8cU",#None,   Explicitly set to None to use only user credentials
+            #developerKey="AIzaSyDrvHTmmZ5Vek_nN8moZVquSeQe1v4fY_0",
             cache_discovery=False,  # Disable cache to ensure fresh credentials are used
         )
     except Exception as e:
@@ -2209,7 +2208,7 @@ async def fetch_and_store_youtube_analytics(user_id, video_id, credentials_dict=
                 'video_id': video_id,
                 'success': True,
                 'summary': analytics_data.get('summary', {}),
-                'data_points': analytics_data.get('timeseries_data', []),
+                'timeseries_data': analytics_data.get('timeseries_data', []),
                 'time_range': analytics_data.get('time_range', {'start_date': start_date, 'end_date': end_date})
             }
             

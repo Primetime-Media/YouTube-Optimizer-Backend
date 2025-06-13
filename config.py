@@ -11,13 +11,26 @@ class Settings(BaseSettings):
     """Application settings."""
     app_name: str = Field(default="YouTube Optimizer")
     debug: bool = Field(default=False)
+    environment: str = Field(default="development")  # development, production
     database_url: str = Field(default="")
     client_secret_file: str = Field(
         default="client_secret_941974948417-la4udombfq14du8vea6b8jqmo6d8nbv8.apps.googleusercontent.com.json"
         #default="client_secret_564580630965-comn96hojuk08survr5pl8qin3qec37l.apps.googleusercontent.com.json"
     )
+    
+    # Environment-specific URLs
     frontend_url: str = Field(default="http://localhost:3000")
-    redirect_uri: str = Field(default="http://localhost:8080/auth/callback")
+    backend_url: str = Field(default="http://localhost:8080")
+    
+    @property
+    def redirect_uri(self) -> str:
+        """Dynamic redirect URI based on backend URL."""
+        return f"{self.backend_url}/auth/callback"
+    
+    @property 
+    def is_production(self) -> bool:
+        """Check if running in production."""
+        return self.environment.lower() == "production"
     
     # Database settings
     postgres_user: str = Field(default="")

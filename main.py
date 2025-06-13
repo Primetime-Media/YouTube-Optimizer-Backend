@@ -1,8 +1,9 @@
 from fastapi import FastAPI, Response, HTTPException, Request, Depends, BackgroundTasks, Cookie
+from fastapi.security import HTTPBearer
 from datetime import datetime, timedelta
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, validator
 from typing import Optional, List, Dict, Any
 from dotenv import load_dotenv
 import os
@@ -41,25 +42,54 @@ load_dotenv()
 # Use redirect URI from settings
 REDIRECT_URI = settings.redirect_uri
 
-# Allow insecure transport for local development
-os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
+# Only allow insecure transport in development
+if not settings.is_production:
+    os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
 
 # Session configuration
 SESSION_COOKIE_NAME = "youtube_optimizer_session"
 SESSION_EXPIRY_DAYS = 14  # Session validity period
 SESSION_SECRET = os.getenv("SESSION_SECRET", secrets.token_hex(32))
 
-app = FastAPI(title=settings.app_name)
+app = FastAPI(
+    title=settings.app_name,
+    debug=settings.debug,
+    docs_url="/docs" if not settings.is_production else None,
+    redoc_url="/redoc" if not settings.is_production else None
+)
 
-# Configure CORS for local development
+# Configure CORS
+allowed_origins = [settings.frontend_url]
+if not settings.is_production:
+    allowed_origins.extend(["http://localhost:3000", "http://127.0.0.1:3000"])
+
+logging.info(f"Allowed origins: {allowed_origins}")
+logging.info(f"Environment: {settings.environment}")
+logging.info(f"Frontend URL: {settings.frontend_url}")
+logging.info(f"Backend URL: {settings.backend_url}")
+logging.info(f"Is production: {settings.is_production}")
+logging.info(f"Redirect URI: {REDIRECT_URI}")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[settings.frontend_url, "http://localhost:3000"],  # Explicitly add localhost
-    allow_credentials=True,  # This is critical for cookies
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["content-type", "set-cookie"]  # Expose set-cookie header
+    allow_origins=allowed_origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
+    allow_headers=["Authorization", "Content-Type"],
+    expose_headers=["content-type"]
 )
+
+# Security headers middleware
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    if settings.is_production:
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    return response
 
 # Include routers
 app.include_router(analytics_router) 
@@ -86,8 +116,9 @@ def create_session(user_id: int, response: Response, request: Request) -> str:
     """Create a new session for a user and set the session cookie"""
     session_token = secrets.token_urlsafe(32)
     
-    # Use simpler approach for expiration date
-    expires_at = datetime.now() + timedelta(days=SESSION_EXPIRY_DAYS)
+    # Use timezone-aware expiration date
+    from datetime import timezone
+    expires_at = datetime.now(timezone.utc) + timedelta(days=SESSION_EXPIRY_DAYS)
     
     conn = get_db_connection()
     try:
@@ -101,16 +132,19 @@ def create_session(user_id: int, response: Response, request: Request) -> str:
             
         # For development, use simpler cookie settings that will work
         # Set the session cookie - use max_age instead of expires to avoid timezone issues
-        logging.info(f"Creating cookie for session token {session_token[:10]}...")
+        if settings.debug:
+            logging.info(f"Creating session token for user {user_id}")
         
-        # Debug origin to help with CORS issues
-        logging.info(f"Request origin: {request.headers.get('origin')}")
-        logging.info(f"Setting cookie for request from: {request.client.host}:{request.client.port}")
-        
-        # Try using a simpler cookie approach with no restrictions for debugging
-        cookie_value = f"{SESSION_COOKIE_NAME}={session_token}; Path=/; Max-Age={SESSION_EXPIRY_DAYS * 24 * 60 * 60}; HttpOnly"
-        response.headers["Set-Cookie"] = cookie_value
-        logging.info(f"Set cookie header: {response.headers.get('set-cookie')}")
+        # Set secure session cookie
+        response.set_cookie(
+            key=SESSION_COOKIE_NAME,
+            value=session_token,
+            max_age=SESSION_EXPIRY_DAYS * 24 * 60 * 60,
+            path="/",
+            httponly=True,
+            secure=settings.is_production,
+            samesite="lax"
+        )
         
         logging.info(f"Created session for user {user_id}")
         return session_token
@@ -128,10 +162,11 @@ def get_user_from_session(session_token: str) -> Optional[dict]:
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
-            # First, check if this token exists at all
-            cursor.execute("SELECT COUNT(*) FROM users WHERE session_token = %s", (session_token,))
-            count = cursor.fetchone()[0]
-            logging.info(f"Found {count} users with matching session token")
+            # Check if this token exists
+            if settings.debug:
+                cursor.execute("SELECT COUNT(*) FROM users WHERE session_token = %s", (session_token,))
+                count = cursor.fetchone()[0]
+                logging.info(f"Found {count} users with matching session token")
             
             cursor.execute("""
                 SELECT id, google_id, email, name, permission_level, is_free_trial, session_expires
@@ -144,11 +179,24 @@ def get_user_from_session(session_token: str) -> Optional[dict]:
                 logging.info(f"No user found with session token {session_token[:10]}...")
                 return None
                 
-            # Skip expiration check for now to focus on basic session functionality
-            logging.info(f"Found session token with expiry: {result[6]}")
-            
-            # We'll just assume the session is valid for testing purposes
-            # In production, proper expiry checks would be important
+            # Check if session has expired
+            session_expires = result[6]
+            if session_expires:
+                # Handle timezone-aware comparison
+                current_time = datetime.now()
+                if session_expires.tzinfo is not None:
+                    # session_expires is timezone-aware, make current_time timezone-aware
+                    from datetime import timezone
+                    current_time = datetime.now(timezone.utc)
+                    if session_expires.tzinfo != timezone.utc:
+                        session_expires = session_expires.astimezone(timezone.utc)
+                else:
+                    # session_expires is naive, use naive current_time
+                    current_time = datetime.now()
+                
+                if current_time > session_expires:
+                    logging.info(f"Session token expired at {session_expires}")
+                    return None
             
             logging.info(f"Found valid session for user ID {result[0]}")
             return {
@@ -181,10 +229,12 @@ def delete_session(session_token: str, response: Response):
             """, (session_token,))
             conn.commit()
             
-        # Clear the session cookie with minimal settings
+        # Clear the session cookie securely
         response.delete_cookie(
             key=SESSION_COOKIE_NAME,
-            path="/"
+            path="/",
+            secure=not settings.debug,
+            samesite="lax"
         )
     except Exception as e:
         logging.error(f"Error deleting session: {e}")
@@ -193,17 +243,12 @@ def delete_session(session_token: str, response: Response):
 
 async def get_current_user(session: Optional[str] = Cookie(None, alias=SESSION_COOKIE_NAME)) -> Optional[dict]:
     """Get the current authenticated user from the session cookie"""
-    logging.info(f"get_current_user called with session cookie: {session[:10] if session else None}")
-    
     if not session:
-        logging.info("No session cookie found")
         return None
     
     user = get_user_from_session(session)
-    if user:
-        logging.info(f"Found user from session: {user['id']}")
-    else:
-        logging.info(f"No user found for session token {session[:10]}...")
+    if settings.debug and user:
+        logging.info(f"Authenticated user: {user['id']}")
         
     return user
 
@@ -212,28 +257,20 @@ async def get_current_user(session: Optional[str] = Cookie(None, alias=SESSION_C
 """
 
 @app.get("/")
-async def root(response: Response):
-    # Set a simple test cookie
-    response.set_cookie(
-        key="test_cookie",
-        value="test_value",
-        max_age=3600,
-        path="/"
-    )
-    return {"message": "YouTube Optimizer API is running (with test cookie)"}
+async def root():
+    return {"message": "YouTube Optimizer API is running", "status": "healthy"}
 
-@app.get("/test-cookie")
-async def test_cookie(request: Request):
-    """Test endpoint to check if cookies are being sent properly"""
-    cookies = request.cookies
-    test_cookie = cookies.get("test_cookie")
-    logging.info(f"Test cookie in request: {test_cookie}")
-    
-    return {
-        "has_test_cookie": test_cookie is not None,
-        "test_cookie_value": test_cookie,
-        "all_cookies": dict(cookies)
-    }
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for monitoring."""
+    try:
+        # Quick database connectivity check
+        conn = get_db_connection()
+        conn.close()
+        return {"status": "healthy", "database": "connected"}
+    except Exception:
+        raise HTTPException(status_code=503, detail="Database connection failed")
+
 
 @app.get("/api/scopes")
 async def get_required_scopes():
@@ -255,13 +292,8 @@ async def get_current_user_info(request: Request, user: Optional[dict] = Depends
     """Get the current authenticated user information from session cookie.
     This endpoint can be used by the frontend to validate if the user is logged in.
     """
-    # Debug the request headers to see if cookies are being sent
-    logging.info(f"API /me Request headers: {dict(request.headers)}")
-    
-    # Check for cookie in request
-    cookies = request.cookies
-    session_cookie = cookies.get(SESSION_COOKIE_NAME)
-    logging.info(f"Session cookie in request: {session_cookie[:10] if session_cookie else None}")
+    if settings.debug:
+        logging.info(f"API /me called for user: {user['id'] if user else 'none'}")
     
     if not user:
         logging.info("User not authenticated")
@@ -359,17 +391,6 @@ async def fetch_and_store_transcript(video_id: str, user_id: int):
         logging.error(f"Error fetching transcript: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error fetching transcript: {str(e)}")
 
-@app.get("/db-test")
-def db_test():
-    try:
-        conn = get_db_connection()
-        with conn.cursor() as cursor:
-            cursor.execute("SELECT version();")
-            result = cursor.fetchone()
-        conn.close()
-        return {"status": "success", "message": f"Database connection successful: {result[0]}"}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
 
 
 @app.get("/login")
