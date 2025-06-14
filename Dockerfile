@@ -15,14 +15,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq-dev \
     # For compiling Python packages
     build-essential \
-    # Required for OpenCV
-    libgl1-mesa-glx \
+    # Required for OpenCV (minimal set)
     libglib2.0-0 \
     libsm6 \
     libxext6 \
-    libxrender-dev \
+    libxrender1 \
     libgomp1 \
-    libgthread-2.0-0 \
+    # Additional dependencies that might be needed
+    libgcc-s1 \
     # Clean up
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
