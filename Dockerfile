@@ -9,12 +9,20 @@ ENV PYTHONUNBUFFERED=1 \
 # Set working directory
 WORKDIR /app
 
-# Install system dependencies for PostgreSQL
+# Install system dependencies for PostgreSQL and OpenCV
 RUN apt-get update && apt-get install -y --no-install-recommends \
     # Required for psycopg2 (PostgreSQL adapter)
     libpq-dev \
     # For compiling Python packages
     build-essential \
+    # Required for OpenCV
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender-dev \
+    libgomp1 \
+    libgthread-2.0-0 \
     # Clean up
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
