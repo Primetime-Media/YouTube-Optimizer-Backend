@@ -428,7 +428,6 @@ def get_competitor_thumbnail_descriptions(
     
     #for result in results:
      #   competitor_analytics_data['competitors'][result['video_id']]['thumbnail_descriptions'] = result
-
     return competitor_analytics_data
 
 

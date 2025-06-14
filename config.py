@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     client_secret_file: str = Field(
         default="client_secret_941974948417-la4udombfq14du8vea6b8jqmo6d8nbv8.apps.googleusercontent.com.json"
         #default="client_secret_564580630965-comn96hojuk08survr5pl8qin3qec37l.apps.googleusercontent.com.json"
+        #default="client_secret_41623680225-kc0lu4b8jsoqfb4ogul8ug4cn646a99l.apps.googleusercontent.com.json"
     )
     
     # Environment-specific URLs

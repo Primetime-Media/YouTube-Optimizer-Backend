@@ -135,16 +135,27 @@ def create_session(user_id: int, response: Response, request: Request) -> str:
         if settings.debug:
             logging.info(f"Creating session token for user {user_id}")
         
-        # Set secure session cookie
-        response.set_cookie(
-            key=SESSION_COOKIE_NAME,
-            value=session_token,
-            max_age=SESSION_EXPIRY_DAYS * 24 * 60 * 60,
-            path="/",
-            httponly=True,
-            secure=settings.is_production,
-            samesite="lax"
-        )
+        # Set secure session cookie for cross-site requests in production
+        if settings.is_production:
+            response.set_cookie(
+                key=SESSION_COOKIE_NAME,
+                value=session_token,
+                max_age=SESSION_EXPIRY_DAYS * 24 * 60 * 60,
+                path="/",
+                httponly=True,
+                secure=True,
+                samesite="none"
+            )
+        else:
+            response.set_cookie(
+                key=SESSION_COOKIE_NAME,
+                value=session_token,
+                max_age=SESSION_EXPIRY_DAYS * 24 * 60 * 60,
+                path="/",
+                httponly=True,
+                secure=False,
+                samesite="lax"
+            )
         
         logging.info(f"Created session for user {user_id}")
         return session_token
@@ -230,12 +241,20 @@ def delete_session(session_token: str, response: Response):
             conn.commit()
             
         # Clear the session cookie securely
-        response.delete_cookie(
-            key=SESSION_COOKIE_NAME,
-            path="/",
-            secure=not settings.debug,
-            samesite="lax"
-        )
+        if settings.is_production:
+            response.delete_cookie(
+                key=SESSION_COOKIE_NAME,
+                path="/",
+                secure=True,
+                samesite="none"
+            )
+        else:
+            response.delete_cookie(
+                key=SESSION_COOKIE_NAME,
+                path="/",
+                secure=False,
+                samesite="lax"
+            )
     except Exception as e:
         logging.error(f"Error deleting session: {e}")
     finally:
