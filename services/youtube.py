@@ -537,6 +537,9 @@ def fetch_channel_info(credentials):
 def fetch_videos(credentials, max_results=50):
     """Fetch the user's uploaded videos with additional data."""
     try:
+
+        logger.info(f"Fetching videos for user {credentials.user_id} with max_results: {max_results}")
+        
         # Build the YouTube API client using our helper that ensures user quota
         youtube = build_youtube_client(credentials)
 
@@ -2255,7 +2258,7 @@ async def fetch_and_store_youtube_analytics(user_id, video_id, credentials_dict=
         logger.error(f"Error in analytics refresh for video {video_id}: {e}", exc_info=True)
         return {'error': str(e), 'video_id': video_id}
 
-async def fetch_and_store_youtube_data(user_id, max_videos=50):
+async def fetch_and_store_youtube_data(user_id, max_videos=10000):
     """
     Fetch and store all YouTube data for a user.
     
@@ -2264,6 +2267,9 @@ async def fetch_and_store_youtube_data(user_id, max_videos=50):
         max_videos: Maximum number of videos to fetch (to save quota)
     """
     try:
+
+        logger.info(f"Fetching YouTube data for user {user_id} with max_videos: {max_videos}")
+        
         # Import here to avoid circular import
         from utils.auth import get_user_credentials
         
