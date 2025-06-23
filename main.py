@@ -886,10 +886,21 @@ async def logout(response: Response, session: Optional[str] = Cookie(None, alias
             delete_session(session, response)
             logging.info("User session deleted successfully")
         
-        return {"message": "Logged out successfully"}
+        return {
+            "message": "Logged out successfully",
+            "external_home_url": settings.external_home_url
+        }
     except Exception as e:
         logging.error(f"Error during logout: {e}")
-        return {"message": "Logout completed, but with errors"}
+        return {
+            "message": "Logout completed, but with errors",
+            "external_home_url": settings.external_home_url
+        }
+
+@app.get("/config/external-home-url")
+async def get_external_home_url():
+    """Get the external home page URL for logout redirects."""
+    return {"external_home_url": settings.external_home_url}
 
 class VideoOptimizationStatus(BaseModel):
     is_optimized: bool

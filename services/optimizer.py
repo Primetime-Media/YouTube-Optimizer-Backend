@@ -12,7 +12,7 @@ async def apply_optimization_to_youtube_channel(
     optimization_id: int, 
     user_id: int,
     only_description: bool = False,
-    only_keywords: bool = False
+    only_keywords: bool = True
 ) -> Dict:
     """
     Apply an optimization to a YouTube channel by making the actual API calls

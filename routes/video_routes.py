@@ -565,6 +565,44 @@ async def get_channel_videos_performance(
                     logger.warning(f"No detailed data found for video {video_id}")
                     continue
 
+                # Fetch transcript if missing
+                if not detailed_video_data.get('transcript'):
+                    # Use existing credentials_dict or fetch fresh ones
+                    transcript_credentials_dict = credentials_dict
+                    if not transcript_credentials_dict:
+                        logger.info(f"No credentials available, fetching credentials for user {channel_owner_id}")
+                        try:
+                            transcript_credentials_dict = get_credentials_dict(channel_owner_id)
+                        except Exception as cred_err:
+                            logger.warning(f"Failed to get credentials for transcript fetching: {cred_err}")
+                    
+                    if transcript_credentials_dict:
+                        logger.info(f"Fetching transcript for video {video_id}")
+                        try:
+                            from services.youtube import fetch_video_transcript
+                            from google.oauth2.credentials import Credentials
+                            
+                            # Convert credentials dict to Credentials object
+                            creds = Credentials(
+                                token=transcript_credentials_dict['token'],
+                                refresh_token=transcript_credentials_dict['refresh_token'],
+                                token_uri=transcript_credentials_dict['token_uri'],
+                                client_id=transcript_credentials_dict['client_id'],
+                                client_secret=transcript_credentials_dict['client_secret'],
+                                scopes=transcript_credentials_dict['scopes']
+                            )
+                            
+                            transcript_data = fetch_video_transcript(creds, video_id)
+                            if transcript_data.get('transcript'):
+                                detailed_video_data['transcript'] = transcript_data['transcript']
+                                logger.info(f"Successfully fetched transcript for video {video_id}")
+                            else:
+                                logger.info(f"No transcript available for video {video_id}")
+                        except Exception as transcript_err:
+                            logger.warning(f"Failed to fetch transcript for video {video_id}: {transcript_err}")
+                    else:
+                        logger.info(f"No valid credentials available for transcript fetching for video {video_id}")
+
                 # Call LLM to determine if optimization is needed
                 logger.info(f"Calling LLM to evaluate if video {video_id} needs optimization")
                 optimization_decision = await enhanced_should_optimize_video(

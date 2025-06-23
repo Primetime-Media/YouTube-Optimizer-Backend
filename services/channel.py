@@ -382,7 +382,7 @@ def update_optimization_progress(optimization_id: int, progress: int, status: st
         if conn:
             conn.close()
 
-def store_optimization_results(optimization_id: int, channel_id: int, optimization_data: Dict) -> bool:
+def store_optimization_results(optimization_id: int, channel_id: int, optimization_data: Dict, update_description: bool = False) -> bool:
     """
     Store optimization results in an existing optimization record
     
@@ -390,6 +390,7 @@ def store_optimization_results(optimization_id: int, channel_id: int, optimizati
         optimization_id: The ID of the existing optimization record
         channel_id: The database ID of the channel
         optimization_data: Dict containing optimization results
+        update_description: Whether to update the description (default: False)
         
     Returns:
         bool: Success status
@@ -401,6 +402,9 @@ def store_optimization_results(optimization_id: int, channel_id: int, optimizati
         # Update the existing record with optimization results
         conn = get_connection()
         with conn.cursor() as cursor:
+            # By default, keep original description and only update keywords
+            description_to_store = optimization_data.get("original_description", "") if not update_description else optimization_data.get("optimized_description", "")
+            
             cursor.execute("""
                 UPDATE channel_optimizations
                 SET 
@@ -416,7 +420,7 @@ def store_optimization_results(optimization_id: int, channel_id: int, optimizati
                 RETURNING id
             """, (
                 optimization_data.get("original_description", ""),
-                optimization_data.get("optimized_description", ""),
+                description_to_store,
                 optimization_data.get("original_keywords", ""),
                 optimization_data.get("optimized_keywords", ""),
                 optimization_data.get("optimization_notes", ""),

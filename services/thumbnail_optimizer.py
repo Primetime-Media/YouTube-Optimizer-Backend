@@ -1404,7 +1404,7 @@ def submit_youtube_download_job(youtube_url: str, api_key: str) -> str | None:
         "inputs": {
             "url": youtube_url,
             "download_type": "video", # Or "audio"
-            "resolution": "highest-available",
+            "resolution": "lowest-available",
             "include_audio": True,
             "start_time": 0,
             "end_time": -1, # -1 means download until the end

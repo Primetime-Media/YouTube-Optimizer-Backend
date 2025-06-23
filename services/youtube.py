@@ -633,7 +633,28 @@ def fetch_videos(credentials, max_results=50):
             
             all_videos.extend(video_items) # Extend with modified items
 
-        logger.info(f"Fetched {len(all_videos)} videos with category names using user's quota")
+        # Fetch transcripts for all videos to complete the data
+        logger.info(f"Fetching transcripts for {len(all_videos)} videos")
+        for video in all_videos:
+            video_id = video['id']
+            try:
+                transcript_data = fetch_video_transcript(credentials, video_id)
+                # Add transcript data to the video object
+                video['transcript_data'] = transcript_data
+                if transcript_data.get('transcript'):
+                    logger.debug(f"Successfully fetched transcript for video {video_id}")
+                else:
+                    logger.debug(f"No transcript available for video {video_id}")
+            except Exception as transcript_err:
+                logger.warning(f"Failed to fetch transcript for video {video_id}: {transcript_err}")
+                # Set default transcript data on failure
+                video['transcript_data'] = {
+                    'transcript': None,
+                    'has_captions': False,
+                    'caption_language': None
+                }
+
+        logger.info(f"Fetched {len(all_videos)} videos with category names and transcripts using user's quota")
         return all_videos
 
     except HttpError as e:
@@ -813,10 +834,11 @@ def store_youtube_data(user_id, channel_info, videos, credentials):
                     # Extract thumbnails with null safety
                     thumbnails = video['snippet'].get('thumbnails', {})
 
-                    # Set default values - we're skipping captions when storing videos
-                    transcript_text = None
-                    has_captions = False
-                    caption_language = None
+                    # Extract transcript data from the video object (fetched in fetch_videos)
+                    transcript_data = video.get('transcript_data', {})
+                    transcript_text = transcript_data.get('transcript')
+                    has_captions = transcript_data.get('has_captions', False)
+                    caption_language = transcript_data.get('caption_language')
                     
                     # Extract enhanced video data
                     # Content details
@@ -1421,10 +1443,22 @@ def fetch_granular_view_data(credentials, video_id: str, interval: str = '30m',
         
         # Get video publish date to determine data availability
         logger.info("Fetching video data to get publish date") # Log video data fetch
-        video_response = youtube_data.videos().list(
-            part="snippet",
-            id=video_id
-        ).execute()
+        try:
+            video_response = youtube_data.videos().list(
+                part="snippet",
+                id=video_id
+            ).execute()
+        except Exception as e:
+            from google.auth.exceptions import RefreshError
+            if isinstance(e, RefreshError) and 'invalid_grant' in str(e):
+                logger.error(f"Authentication expired while fetching video data for {video_id}")
+                return {
+                    'video_id': video_id,
+                    'error': 'Authentication expired, please re-authenticate',
+                    'status_code': 401,
+                    'auth_required': True
+                }
+            raise
         
         if not video_response.get('items'):
             logger.warning(f"Video {video_id} not found") # Log video not found

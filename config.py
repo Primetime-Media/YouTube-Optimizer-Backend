@@ -23,6 +23,10 @@ class Settings(BaseSettings):
     frontend_url: str = Field(default="http://localhost:3000")
     backend_url: str = Field(default="http://localhost:8080")
     
+    # External home page URL for logout redirects
+    # This should be set to the main marketing site/home page on a separate domain
+    external_home_url: str = Field(default="http://localhost:3000")  # Fallback to frontend_url in development
+    
     @property
     def redirect_uri(self) -> str:
         """Dynamic redirect URI based on backend URL."""
