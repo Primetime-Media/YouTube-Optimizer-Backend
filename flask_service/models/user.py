@@ -72,23 +72,35 @@ class UserModel:
             conn.close()
     
     @staticmethod
-    def queue_user_videos_for_optimization(user_id):
-        """Queue user videos (published in last 30 days) for optimization."""
+    def queue_user_videos_for_optimization(user_id, limit_to_30_days=True):
+        """Queue user videos for optimization with optional 30-day limit."""
         conn = get_connection()
         
         try:
             with conn.cursor() as cursor:
-                # Get videos published in the last 30 days that aren't already queued or optimized
-                thirty_days_ago = datetime.now(timezone.utc) - timedelta(days=30)
-                cursor.execute("""
-                    SELECT v.id, v.video_id
-                    FROM youtube_videos v
-                    JOIN youtube_channels c ON v.channel_id = c.id  
-                    WHERE c.user_id = %s 
-                    AND v.queued_for_optimization = FALSE 
-                    AND v.is_optimized = FALSE
-                    AND v.published_at >= %s
-                """, (user_id, thirty_days_ago))
+                # Build query based on 30-day limit flag
+                if limit_to_30_days:
+                    # Get videos published in the last 30 days that aren't already queued or optimized
+                    thirty_days_ago = datetime.now(timezone.utc) - timedelta(days=30)
+                    cursor.execute("""
+                        SELECT v.id, v.video_id
+                        FROM youtube_videos v
+                        JOIN youtube_channels c ON v.channel_id = c.id  
+                        WHERE c.user_id = %s 
+                        AND v.queued_for_optimization = FALSE 
+                        AND v.is_optimized = FALSE
+                        AND v.published_at >= %s
+                    """, (user_id, thirty_days_ago))
+                else:
+                    # Get all videos that aren't already queued or optimized
+                    cursor.execute("""
+                        SELECT v.id, v.video_id
+                        FROM youtube_videos v
+                        JOIN youtube_channels c ON v.channel_id = c.id  
+                        WHERE c.user_id = %s 
+                        AND v.queued_for_optimization = FALSE 
+                        AND v.is_optimized = FALSE
+                    """, (user_id,))
                 
                 videos = cursor.fetchall()
                 

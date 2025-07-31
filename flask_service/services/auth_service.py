@@ -18,6 +18,9 @@ class AuthService:
         auth_info = auth_data.get('auth', {})
         metadata = auth_data.get('metadata', {})
         
+        # Extract 30-day limit flag (defaults to True for safety)
+        limit_to_30_days = auth_data.get('limit_to_30_days', True)
+        
         # Validate required fields
         required_user_fields = ['google_id', 'email', 'name']
         required_auth_fields = ['google_access_token', 'google_id_token']
@@ -44,8 +47,8 @@ class AuthService:
         
         # Queue videos for optimization
         try:
-            queued_count = UserModel.queue_user_videos_for_optimization(user_id)
-            logger.info(f"Queued {queued_count} videos for optimization for user {user_id}")
+            queued_count = UserModel.queue_user_videos_for_optimization(user_id, limit_to_30_days)
+            logger.info(f"Queued {queued_count} videos for optimization for user {user_id} (30-day limit: {limit_to_30_days})")
         except Exception as e:
             logger.error(f"Error queueing videos for optimization: {e}")
             queued_count = 0
