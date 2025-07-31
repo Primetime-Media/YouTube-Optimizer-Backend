@@ -80,7 +80,7 @@ class UserModel:
             with conn.cursor() as cursor:
                 # Build query based on 30-day limit flag
                 if limit_to_30_days:
-                    # Get videos published in the last 30 days that aren't already queued or optimized
+                    # Get videos published 30 days or older that aren't already queued or optimized
                     thirty_days_ago = datetime.now(timezone.utc) - timedelta(days=30)
                     cursor.execute("""
                         SELECT v.id, v.video_id
@@ -89,7 +89,7 @@ class UserModel:
                         WHERE c.user_id = %s 
                         AND v.queued_for_optimization = FALSE 
                         AND v.is_optimized = FALSE
-                        AND v.published_at >= %s
+                        AND v.published_at <= %s
                     """, (user_id, thirty_days_ago))
                 else:
                     # Get all videos that aren't already queued or optimized
