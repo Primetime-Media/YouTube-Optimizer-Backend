@@ -8,6 +8,7 @@ venv/
 .env/
 .venv/
 ENV/
+flask-venv/
 
 # Ignore IDE-specific files
 .idea/
@@ -76,3 +77,5 @@ services/thumbnail_optimization_results/
 # Optimized files
 optimized_*
 *_output.*
+
+.claude
