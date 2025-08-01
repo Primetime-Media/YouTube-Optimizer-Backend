@@ -29,7 +29,7 @@ class OAuthService:
         session['oauth_state'] = state
         
         # Build redirect URI
-        redirect_uri = url_for('oauth.google_callback', _external=True)
+        redirect_uri = url_for('oauth.google_callback', _external=True, _scheme='https')
         
         # Build Google OAuth URL with YouTube scopes
         params = {
@@ -97,7 +97,7 @@ class OAuthService:
     def _exchange_code_for_tokens(code):
         """Exchange authorization code for access tokens."""
         oauth_config = current_app.config.google_oauth_config
-        redirect_uri = url_for('oauth.google_callback', _external=True)
+        redirect_uri = url_for('oauth.google_callback', _external=True, _scheme='https')
         token_data = {
             'client_id': oauth_config.get('client_id'),
             'client_secret': oauth_config.get('client_secret'),
