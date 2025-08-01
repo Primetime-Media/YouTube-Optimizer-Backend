@@ -25,7 +25,7 @@ def test_endpoint():
         'server_status': 'healthy',
         'oauth_config': {
             'client_secret_file': config.get('CLIENT_SECRET_FILE'),
-            'has_oauth_config': bool(config.google_oauth_config.get('client_id')),
+            'has_oauth_config': bool(getattr(config, 'google_oauth_config', {}).get('client_id')),
             'frontend_url': config.get('FRONTEND_URL'),
             'youtube_scopes_count': len(config.get('YOUTUBE_SCOPES', [])),
             'session_configured': bool(config.get('SECRET_KEY'))
