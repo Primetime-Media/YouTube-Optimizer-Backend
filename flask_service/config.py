@@ -19,42 +19,44 @@ class Config:
     GOOGLE_CLIENT_ID = None
     GOOGLE_CLIENT_SECRET = None
     
-    @property
-    def google_oauth_config(self):
+    def __init__(self):
+        """Initialize config and load OAuth credentials."""
+        self.google_oauth_config = self._load_oauth_config()
+    
+    def _load_oauth_config(self):
         """Load Google OAuth config from JSON file."""
-        if not hasattr(self, '_oauth_config'):
-            import json
-            import os.path
-            try:
-                # Get absolute path to client secret file
-                if not os.path.isabs(self.CLIENT_SECRET_FILE):
-                    # If relative path, make it relative to the current working directory
-                    client_secret_path = os.path.join(os.getcwd(), self.CLIENT_SECRET_FILE)
-                else:
-                    client_secret_path = self.CLIENT_SECRET_FILE
-                
-                print(f"Trying to load OAuth config from: {client_secret_path}")
-                
-                with open(client_secret_path, 'r') as f:
-                    credentials = json.load(f)
-                    web_config = credentials.get('web', {})
-                    self._oauth_config = {
-                        'client_id': web_config.get('client_id'),
-                        'client_secret': web_config.get('client_secret'),
-                        'auth_uri': web_config.get('auth_uri', self.GOOGLE_AUTH_URL),
-                        'token_uri': web_config.get('token_uri', self.GOOGLE_TOKEN_URL)
-                    }
-                    print(f"OAuth config loaded successfully. Client ID: {self._oauth_config['client_id'][:10]}...")
-            except Exception as e:
-                print(f"Error loading OAuth config: {e}")
-                print(f"Falling back to environment variables")
-                self._oauth_config = {
-                    'client_id': os.getenv('GOOGLE_CLIENT_ID'),
-                    'client_secret': os.getenv('GOOGLE_CLIENT_SECRET'),
-                    'auth_uri': self.GOOGLE_AUTH_URL,
-                    'token_uri': self.GOOGLE_TOKEN_URL
+        import json
+        import os.path
+        try:
+            # Get absolute path to client secret file
+            if not os.path.isabs(self.CLIENT_SECRET_FILE):
+                # If relative path, make it relative to the current working directory
+                client_secret_path = os.path.join(os.getcwd(), self.CLIENT_SECRET_FILE)
+            else:
+                client_secret_path = self.CLIENT_SECRET_FILE
+            
+            print(f"Trying to load OAuth config from: {client_secret_path}")
+            
+            with open(client_secret_path, 'r') as f:
+                credentials = json.load(f)
+                web_config = credentials.get('web', {})
+                oauth_config = {
+                    'client_id': web_config.get('client_id'),
+                    'client_secret': web_config.get('client_secret'),
+                    'auth_uri': web_config.get('auth_uri', self.GOOGLE_AUTH_URL),
+                    'token_uri': web_config.get('token_uri', self.GOOGLE_TOKEN_URL)
                 }
-        return self._oauth_config
+                print(f"OAuth config loaded successfully. Client ID: {oauth_config['client_id'][:10]}...")
+                return oauth_config
+        except Exception as e:
+            print(f"Error loading OAuth config: {e}")
+            print(f"Falling back to environment variables")
+            return {
+                'client_id': os.getenv('GOOGLE_CLIENT_ID'),
+                'client_secret': os.getenv('GOOGLE_CLIENT_SECRET'),
+                'auth_uri': self.GOOGLE_AUTH_URL,
+                'token_uri': self.GOOGLE_TOKEN_URL
+            }
     
     # Session Configuration
     SESSION_COOKIE_SECURE = os.getenv('SESSION_COOKIE_SECURE', 'False').lower() == 'true'
