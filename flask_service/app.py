@@ -12,6 +12,9 @@ def create_app():
     config = get_config()
     app.config.from_object(config)
     
+    # Add instance attributes to Flask config
+    app.config.google_oauth_config = config.google_oauth_config
+    
     # Configure CORS
     CORS(app, supports_credentials=True, origins=[
         config.FRONTEND_URL,
