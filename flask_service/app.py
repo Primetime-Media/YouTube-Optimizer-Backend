@@ -19,7 +19,9 @@ def create_app():
     CORS(app, supports_credentials=True, origins=[
         config.FRONTEND_URL,
         'http://localhost:3000',  # Development fallback
-        'http://127.0.0.1:3000'   # Alternative localhost
+        'http://127.0.0.1:3000',  # Alternative localhost
+        'https://www.primetime.media',  # Production frontend
+        'https://primetime.media'  # Production frontend (without www)
     ])
     
     # Configure logging
@@ -41,6 +43,23 @@ def create_app():
         logger.info(f"YouTube scopes enabled: {len(config.YOUTUBE_SCOPES)} scopes")
     except Exception as e:
         logger.error(f"Error loading OAuth config: {e}")
+    
+    # Add root route
+    @app.route('/')
+    def root():
+        """Root endpoint."""
+        return {
+            "service": "youtube-optimizer-flask-oauth",
+            "version": "2.0.0", 
+            "status": "running",
+            "endpoints": {
+                "health": "/health",
+                "test": "/test",
+                "oauth_start": "/auth/google",
+                "oauth_callback": "/auth/google/callback",
+                "auth_status": "/auth/status"
+            }
+        }
     
     # Register blueprints
     app.register_blueprint(health_bp)
