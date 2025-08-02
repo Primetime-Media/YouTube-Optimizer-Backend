@@ -18,8 +18,8 @@ class AuthService:
         auth_info = auth_data.get('auth', {})
         metadata = auth_data.get('metadata', {})
         
-        # Extract 30-day limit flag (defaults to True for safety)
-        limit_to_30_days = auth_data.get('limit_to_30_days', True)
+        # Extract 30-day limit flag (defaults to False for now)
+        limit_to_30_days = auth_data.get('limit_to_30_days', False)
         
         # Validate required fields
         required_user_fields = ['google_id', 'email', 'name']

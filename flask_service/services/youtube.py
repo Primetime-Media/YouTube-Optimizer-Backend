@@ -181,7 +181,7 @@ def _store_channel_data(cursor, user_id, channel_info):
 
 def _store_video_data(cursor, channel_db_id, videos):
     """
-    Store video data in database.
+    Store video data in database, filtering out shorts.
     """
     stored_count = 0
     
@@ -190,6 +190,14 @@ def _store_video_data(cursor, channel_db_id, videos):
             snippet = video.get('snippet', {})
             statistics = video.get('statistics', {})
             content_details = video.get('contentDetails', {})
+            
+            # Filter out shorts (videos under 60 seconds)
+            duration_str = content_details.get('duration', '')
+            duration_seconds = parse_duration_to_seconds(duration_str)
+            
+            if duration_seconds < 60:  # Skip shorts
+                logger.info(f"Skipping short video {video.get('id', 'unknown')}: {duration_seconds}s")
+                continue
             
             cursor.execute("""
                 INSERT INTO youtube_videos (
