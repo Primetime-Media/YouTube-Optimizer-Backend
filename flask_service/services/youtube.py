@@ -195,14 +195,15 @@ def _store_video_data(cursor, channel_db_id, videos):
                 INSERT INTO youtube_videos (
                     channel_id, video_id, title, description,
                     published_at, view_count, like_count,
-                    comment_count, duration_seconds
+                    comment_count, duration
                 ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (video_id) DO UPDATE SET
                     title = EXCLUDED.title,
                     description = EXCLUDED.description,
                     view_count = EXCLUDED.view_count,
                     like_count = EXCLUDED.like_count,
-                    comment_count = EXCLUDED.comment_count
+                    comment_count = EXCLUDED.comment_count,
+                    duration = EXCLUDED.duration
             """, (
                 channel_db_id,
                 video['id'],
@@ -212,7 +213,7 @@ def _store_video_data(cursor, channel_db_id, videos):
                 int(statistics.get('viewCount', 0)),
                 int(statistics.get('likeCount', 0)),
                 int(statistics.get('commentCount', 0)),
-                parse_duration_to_seconds(content_details.get('duration', ''))
+                content_details.get('duration', '')  # Store as ISO 8601 string like FastAPI
             ))
             
             stored_count += 1
