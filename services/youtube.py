@@ -13,6 +13,28 @@ from datetime import timezone # Import timezone
 
 logger = logging.getLogger(__name__)
 
+def parse_duration_to_seconds(duration_str):
+    """
+    Parse ISO 8601 duration format to total seconds
+    Example: PT4M13S -> 253 seconds, PT1H2M10S -> 3730 seconds
+    """
+    import re
+    if not duration_str:
+        return 0
+    
+    # Parse ISO 8601 duration format
+    pattern = r'PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?'
+    match = re.match(pattern, duration_str)
+    
+    if not match:
+        return 0
+    
+    hours = int(match.group(1) or 0)
+    minutes = int(match.group(2) or 0) 
+    seconds = int(match.group(3) or 0)
+    
+    return hours * 3600 + minutes * 60 + seconds
+
 def build_youtube_client(credentials):
     """
     Build a YouTube API client with user credentials to maximize use of their quota.
@@ -538,7 +560,7 @@ def fetch_videos(credentials, max_results=50):
     """Fetch the user's uploaded videos with additional data."""
     try:
 
-        logger.info(f"Fetching videos for user {credentials.user_id} with max_results: {max_results}")
+        logger.info(f"Fetching videos with max_results: {max_results}")
         
         # Build the YouTube API client using our helper that ensures user quota
         youtube = build_youtube_client(credentials)
@@ -635,6 +657,19 @@ def fetch_videos(credentials, max_results=50):
                      video['snippet']['categoryName'] = 'Unknown'
             
             all_videos.extend(video_items) # Extend with modified items
+
+        # Filter out shorts and videos under 6 minutes
+        filtered_videos = []
+        for video in all_videos:
+            duration_str = video.get('contentDetails', {}).get('duration', '')
+            duration_seconds = parse_duration_to_seconds(duration_str)
+            
+            # Skip shorts (under 60 seconds) and videos under 6 minutes (360 seconds)
+            if duration_seconds >= 360:  # 6 minutes = 360 seconds
+                filtered_videos.append(video)
+
+        all_videos = filtered_videos
+        logger.info(f"After filtering: {len(all_videos)} videos remain (removed shorts and videos under 6 minutes)")
 
         # Fetch transcripts for all videos to complete the data
         logger.info(f"Fetching transcripts for {len(all_videos)} videos")
@@ -833,7 +868,9 @@ def store_youtube_data(user_id, channel_info, videos, credentials):
                 for i, video in enumerate(videos):
                     # Extract video ID
                     video_id = video['id']
-                    
+
+                    logger.info(f"Processing video with ID: {video_id} and video statistics: {video['statistics']}")
+
                     # Extract thumbnails with null safety
                     thumbnails = video['snippet'].get('thumbnails', {})
 
@@ -1194,7 +1231,7 @@ def download_caption_transcript(youtube, caption_id: str, language: str = None) 
         # Parse the SRT content into a structured format
         transcript = parse_srt_content(caption_content)
 
-        print(f"transcript found:,{transcript}")
+        #print(f"transcript found:,{transcript}")
         return {
             'caption_id': caption_id,
             'segments': transcript,
@@ -2303,5 +2340,4 @@ async def fetch_and_store_youtube_data(user_id, max_videos=10000):
         else:
             logger.error(f"YouTube API error for user {user_id}: {e}")
     except Exception as e:
-        logger.error(f"Unhandled error during timeseries data fetch for {video_id}: {e}", exc_info=True)
-        return {'error': f'An unexpected error occurred: {str(e)}', 'video_id': video_id}
+        logger.error(f"Error fetching and storing YouTube data for user {user_id}: {e}", exc_info=True)

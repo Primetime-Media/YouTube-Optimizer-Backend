@@ -5,6 +5,7 @@ from config import get_config
 from routes.health import health_bp
 from routes.auth import auth_bp
 from routes.oauth import oauth_bp
+from routes.stripe_routes import stripe_bp
 
 def create_app():
     """Flask application factory."""
@@ -57,7 +58,9 @@ def create_app():
                 "test": "/test",
                 "oauth_start": "/auth/google",
                 "oauth_callback": "/auth/google/callback",
-                "auth_status": "/auth/status"
+                "auth_status": "/auth/status",
+                "payment_setup": "/stripe/payment-setup",
+                "payment_status": "/stripe/payment-status"
             }
         }
     
@@ -65,5 +68,6 @@ def create_app():
     app.register_blueprint(health_bp)
     app.register_blueprint(auth_bp)
     app.register_blueprint(oauth_bp)
+    app.register_blueprint(stripe_bp, url_prefix='/stripe')
     
     return app

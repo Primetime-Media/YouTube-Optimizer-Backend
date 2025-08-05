@@ -124,9 +124,9 @@ def _fetch_videos(youtube_client, channel_info, max_videos=1000):
             if not video_ids:
                 break
                 
-            # Get detailed video information
+            # Get detailed video information (include status part for comprehensive data)
             videos_response = youtube_client.videos().list(
-                part='snippet,statistics,contentDetails',
+                part='snippet,statistics,contentDetails,status',
                 id=','.join(video_ids)
             ).execute()
             
@@ -145,35 +145,122 @@ def _fetch_videos(youtube_client, channel_info, max_videos=1000):
 
 def _store_channel_data(cursor, user_id, channel_info):
     """
-    Store channel data in database.
+    Store channel data in database using FastAPI-compatible comprehensive schema.
     """
     snippet = channel_info.get('snippet', {})
     statistics = channel_info.get('statistics', {})
     content_details = channel_info.get('contentDetails', {})
     
+    # Parse thumbnails like FastAPI does
+    thumbnails = snippet.get('thumbnails', {})
+    
+    # Extract enhanced channel data (minimal version, can be expanded)
+    banner_url = None
+    privacy_status = None
+    is_linked = False
+    long_uploads_status = None
+    is_monetization_enabled = False
+    
+    # Topic details
+    topic_ids = []
+    topic_categories = []
+    
+    # Channel standing info (defaults)
+    overall_good_standing = True
+    community_guidelines_good_standing = True
+    copyright_strikes_good_standing = True
+    content_id_claims_good_standing = True
+    
+    # Raw JSON data storage
+    branding_settings = None
+    audit_details = None
+    topic_details = None
+    status_details = None
+    
+    # Use the exact same INSERT statement as FastAPI
     cursor.execute("""
         INSERT INTO youtube_channels (
-            user_id, channel_id, title, description, 
-            published_at, view_count, subscriber_count, 
-            video_count, uploads_playlist_id
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            user_id, channel_id, kind, etag, title, description, 
+            custom_url, published_at, view_count, subscriber_count, 
+            hidden_subscriber_count, video_count, 
+            thumbnail_url_default, thumbnail_url_medium, thumbnail_url_high,
+            uploads_playlist_id,
+            
+            -- Enhanced channel optimization fields
+            banner_url, privacy_status, is_linked, long_uploads_status,
+            is_monetization_enabled, topic_ids, topic_categories,
+            overall_good_standing, community_guidelines_good_standing,
+            copyright_strikes_good_standing, content_id_claims_good_standing,
+            branding_settings, audit_details, topic_details, status_details
+        ) VALUES (
+            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+        )
         ON CONFLICT (channel_id) DO UPDATE SET
+            kind = EXCLUDED.kind,
+            etag = EXCLUDED.etag,
             title = EXCLUDED.title,
             description = EXCLUDED.description,
+            custom_url = EXCLUDED.custom_url,
+            published_at = EXCLUDED.published_at,
             view_count = EXCLUDED.view_count,
             subscriber_count = EXCLUDED.subscriber_count,
-            video_count = EXCLUDED.video_count
+            hidden_subscriber_count = EXCLUDED.hidden_subscriber_count,
+            video_count = EXCLUDED.video_count,
+            thumbnail_url_default = EXCLUDED.thumbnail_url_default,
+            thumbnail_url_medium = EXCLUDED.thumbnail_url_medium,
+            thumbnail_url_high = EXCLUDED.thumbnail_url_high,
+            uploads_playlist_id = EXCLUDED.uploads_playlist_id,
+            banner_url = EXCLUDED.banner_url,
+            privacy_status = EXCLUDED.privacy_status,
+            is_linked = EXCLUDED.is_linked,
+            long_uploads_status = EXCLUDED.long_uploads_status,
+            is_monetization_enabled = EXCLUDED.is_monetization_enabled,
+            topic_ids = EXCLUDED.topic_ids,
+            topic_categories = EXCLUDED.topic_categories,
+            overall_good_standing = EXCLUDED.overall_good_standing,
+            community_guidelines_good_standing = EXCLUDED.community_guidelines_good_standing,
+            copyright_strikes_good_standing = EXCLUDED.copyright_strikes_good_standing,
+            content_id_claims_good_standing = EXCLUDED.content_id_claims_good_standing,
+            branding_settings = EXCLUDED.branding_settings,
+            audit_details = EXCLUDED.audit_details,
+            topic_details = EXCLUDED.topic_details,
+            status_details = EXCLUDED.status_details,
+            updated_at = CURRENT_TIMESTAMP
         RETURNING id
     """, (
         user_id,
         channel_info['id'],
+        channel_info.get('kind', 'youtube#channel'),
+        channel_info.get('etag', ''),
         snippet.get('title', ''),
         snippet.get('description', ''),
+        snippet.get('customUrl'),
         snippet.get('publishedAt'),
         int(statistics.get('viewCount', 0)),
         int(statistics.get('subscriberCount', 0)),
+        statistics.get('hiddenSubscriberCount', False),
         int(statistics.get('videoCount', 0)),
-        content_details.get('relatedPlaylists', {}).get('uploads')
+        thumbnails.get('default', {}).get('url'),
+        thumbnails.get('medium', {}).get('url'),
+        thumbnails.get('high', {}).get('url'),
+        content_details.get('relatedPlaylists', {}).get('uploads'),
+        # Enhanced fields
+        banner_url,
+        privacy_status,
+        is_linked,
+        long_uploads_status,
+        is_monetization_enabled,
+        topic_ids,
+        topic_categories,
+        overall_good_standing,
+        community_guidelines_good_standing,
+        copyright_strikes_good_standing,
+        content_id_claims_good_standing,
+        branding_settings,
+        audit_details,
+        topic_details,
+        status_details
     ))
     
     result = cursor.fetchone()
@@ -181,7 +268,7 @@ def _store_channel_data(cursor, user_id, channel_info):
 
 def _store_video_data(cursor, channel_db_id, videos):
     """
-    Store video data in database, filtering out shorts.
+    Store video data in database using FastAPI-compatible comprehensive schema, filtering out shorts.
     """
     stored_count = 0
     
@@ -190,38 +277,146 @@ def _store_video_data(cursor, channel_db_id, videos):
             snippet = video.get('snippet', {})
             statistics = video.get('statistics', {})
             content_details = video.get('contentDetails', {})
+            status = video.get('status', {})
             
-            # Filter out shorts (videos under 60 seconds)
+            # Filter out shorts (videos up to 3 minutes as of Oct 2024)
             duration_str = content_details.get('duration', '')
             duration_seconds = parse_duration_to_seconds(duration_str)
             
-            if duration_seconds < 60:  # Skip shorts
-                logger.info(f"Skipping short video {video.get('id', 'unknown')}: {duration_seconds}s")
+            if duration_seconds <= 180:  # Skip shorts (YouTube Shorts max is now 3 minutes)
+                logger.info(f"Skipping potential short video {video.get('id', 'unknown')}: {duration_seconds}s (≤3min)")
                 continue
             
+            # Parse thumbnails like FastAPI does
+            thumbnails = snippet.get('thumbnails', {})
+            
+            # Enhanced video fields (defaults)
+            privacy_status = status.get('privacyStatus', 'public')
+            upload_status = status.get('uploadStatus', 'processed')
+            license = status.get('license', 'youtube')
+            embeddable = status.get('embeddable', True)
+            public_stats_viewable = status.get('publicStatsViewable', True)
+            
+            # Content details
+            definition = content_details.get('definition', 'hd')
+            dimension = content_details.get('dimension', '2d')
+            has_custom_thumbnail = content_details.get('hasCustomThumbnail', False)
+            projection = content_details.get('projection', 'rectangular')
+            
+            # Category
+            category_id = snippet.get('categoryId', '22')  # Default to People & Blogs
+            category_name = ''  # Could be looked up from category_id
+            
+            # Topic details
+            topic_ids = []
+            topic_categories = []
+            
+            # Raw JSON data storage
+            import json
+            content_details_json = json.dumps(content_details) if content_details else None
+            status_details_json = json.dumps(status) if status else None
+            topic_details_json = None
+            
+            # Use the exact same INSERT statement as FastAPI
             cursor.execute("""
                 INSERT INTO youtube_videos (
-                    channel_id, video_id, title, description,
-                    published_at, view_count, like_count,
-                    comment_count, duration
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    channel_id, video_id, kind, etag, playlist_item_id,
+                    title, description, published_at, channel_title,
+                    playlist_id, position, tags,
+                    thumbnail_url_default, thumbnail_url_medium, 
+                    thumbnail_url_high, thumbnail_url_standard, 
+                    thumbnail_url_maxres,
+                    view_count, like_count, comment_count, duration,
+                    transcript, has_captions, caption_language,
+                    
+                    -- Enhanced video fields
+                    privacy_status, upload_status, license, embeddable, 
+                    public_stats_viewable, definition, dimension, 
+                    has_custom_thumbnail, projection, category_id, category_name,
+                    topic_ids, topic_categories, 
+                    content_details, status_details, topic_details
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 
+                    %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                )
                 ON CONFLICT (video_id) DO UPDATE SET
+                    kind = EXCLUDED.kind,
+                    etag = EXCLUDED.etag,
                     title = EXCLUDED.title,
                     description = EXCLUDED.description,
+                    channel_title = EXCLUDED.channel_title,
+                    playlist_id = EXCLUDED.playlist_id,
+                    position = EXCLUDED.position,
+                    tags = EXCLUDED.tags,
+                    thumbnail_url_default = EXCLUDED.thumbnail_url_default,
+                    thumbnail_url_medium = EXCLUDED.thumbnail_url_medium,
+                    thumbnail_url_high = EXCLUDED.thumbnail_url_high,
+                    thumbnail_url_standard = EXCLUDED.thumbnail_url_standard,
+                    thumbnail_url_maxres = EXCLUDED.thumbnail_url_maxres,
                     view_count = EXCLUDED.view_count,
                     like_count = EXCLUDED.like_count,
                     comment_count = EXCLUDED.comment_count,
-                    duration = EXCLUDED.duration
+                    duration = EXCLUDED.duration,
+                    privacy_status = EXCLUDED.privacy_status,
+                    upload_status = EXCLUDED.upload_status,
+                    license = EXCLUDED.license,
+                    embeddable = EXCLUDED.embeddable,
+                    public_stats_viewable = EXCLUDED.public_stats_viewable,
+                    definition = EXCLUDED.definition,
+                    dimension = EXCLUDED.dimension,
+                    has_custom_thumbnail = EXCLUDED.has_custom_thumbnail,
+                    projection = EXCLUDED.projection,
+                    category_id = EXCLUDED.category_id,
+                    category_name = EXCLUDED.category_name,
+                    topic_ids = EXCLUDED.topic_ids,
+                    topic_categories = EXCLUDED.topic_categories,
+                    content_details = EXCLUDED.content_details,
+                    status_details = EXCLUDED.status_details,
+                    topic_details = EXCLUDED.topic_details,
+                    updated_at = CURRENT_TIMESTAMP
             """, (
                 channel_db_id,
                 video['id'],
+                video.get('kind', 'youtube#video'),
+                video.get('etag', ''),
+                None,  # playlist_item_id - not available in this context
                 snippet.get('title', ''),
                 snippet.get('description', ''),
                 snippet.get('publishedAt'),
+                snippet.get('channelTitle', ''),
+                None,  # playlist_id - not available in this context
+                None,  # position - not available in this context
+                snippet.get('tags', []),
+                thumbnails.get('default', {}).get('url'),
+                thumbnails.get('medium', {}).get('url'),
+                thumbnails.get('high', {}).get('url'),
+                thumbnails.get('standard', {}).get('url'),
+                thumbnails.get('maxres', {}).get('url'),
                 int(statistics.get('viewCount', 0)),
                 int(statistics.get('likeCount', 0)),
                 int(statistics.get('commentCount', 0)),
-                content_details.get('duration', '')  # Store as ISO 8601 string like FastAPI
+                content_details.get('duration', ''),
+                None,  # transcript - will be fetched separately
+                False,  # has_captions - will be updated when transcript is fetched
+                None,  # caption_language - will be updated when transcript is fetched
+                # Enhanced fields
+                privacy_status,
+                upload_status,
+                license,
+                embeddable,
+                public_stats_viewable,
+                definition,
+                dimension,
+                has_custom_thumbnail,
+                projection,
+                category_id,
+                category_name,
+                topic_ids,
+                topic_categories,
+                content_details_json,
+                status_details_json,
+                topic_details_json
             ))
             
             stored_count += 1

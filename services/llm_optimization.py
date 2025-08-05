@@ -1533,14 +1533,18 @@ def get_channel_optimization(
             - Avoid placeholder text - the description should be ready to publish as-is
             
             For the KEYWORDS:
-            - Include 5-7 highly relevant keywords totaling 50-75 characters.
-            - Focus on the main topic and popular related terms.
-            - Use quotes for multi-word keywords, e.g., 'Home Yoga'
-            - Include misspellings of important terms if relevant.
-            - Focus on specific, niche keywords rather than broad ones
-            - If recent videos data is provided, extract high-value keywords from it to capture the channel's full scope.
-            - Format properly with quotes and spacing (e.g. "keyword1" "keyword phrase" "keyword3")
-            - Start with the most important keywords
+            - Include 10-15 highly relevant long-tail keywords, each containing 3-7 words
+            - Focus on specific, niche long-tail phrases rather than broad single-word terms
+            - Each keyword should be descriptive and target specific search intents
+            - Format as space-separated keywords with double quotes escaped for YouTube API compatibility
+            - Example format: \"home yoga for beginners\" \"quick morning routine\" \"healthy lifestyle meal prep\" \"fitness workout tips\"
+            - Include misspellings of important terms if relevant
+            - Target long-tail search queries that your audience would actually type
+            - If recent videos data is provided, extract high-value long-tail keywords from video titles and descriptions
+            - Keep total length under 500 characters for YouTube API compatibility
+            - Start with the most important and highest-volume long-tail keywords
+            - Aim for keywords that balance search volume with low competition
+            - Each keyword should be actionable and specific to the channel's niche
             
             {json_emphasis}
             

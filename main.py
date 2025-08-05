@@ -653,7 +653,7 @@ async def auth_callback(request: Request, response: Response, background_tasks: 
         background_tasks.add_task(
             fetch_and_store_youtube_data,
             user_id=user_id,
-            max_videos=10000  # Limit to 10000 most recent videos to save quota
+            max_videos=1000  # Limit to 10000 most recent videos to save quota
         )
 
         # Encode user info as JSON to pass to frontend

@@ -193,8 +193,10 @@ async def process_monthly_optimizations():
                 SELECT s.id, s.channel_id, s.auto_apply, c.user_id
                 FROM channel_optimization_schedules s
                 JOIN youtube_channels c ON c.id = s.channel_id
+                LEFT JOIN channel_optimizations co ON co.channel_id = s.channel_id AND co.status = 'completed'
                 WHERE s.is_active = TRUE AND 
-                      (s.next_run IS NULL OR s.next_run <= NOW())
+                      (s.next_run IS NULL OR s.next_run <= NOW()) AND
+                      co.id IS NULL
             """)
             
             schedules = cursor.fetchall()

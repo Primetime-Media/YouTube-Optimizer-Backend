@@ -34,20 +34,12 @@ def google_callback():
         # Handle OAuth callback
         user_info, tokens = OAuthService.handle_oauth_callback(code, state, error, error_description)
         
-        # Create API payload and process through existing auth service
-        try:
-            api_payload = OAuthService.create_api_payload()
-            result = AuthService.process_user_authentication(api_payload)
-            
-            logger.info(f"User authentication processed successfully: {result}")
-            
-            frontend_url = current_app.config.get('FRONTEND_URL', 'http://localhost:3000')
-            return redirect(f"{frontend_url}?auth=success&youtube=enabled")
-            
-        except Exception as e:
-            logger.error(f"Error processing user authentication: {e}")
-            frontend_url = current_app.config.get('FRONTEND_URL', 'http://localhost:3000')
-            return redirect(f"{frontend_url}?auth=failed&reason=processing_error")
+        # OAuth successful - redirect to payment setup instead of processing auth immediately
+        logger.info(f"OAuth successful for user: {user_info.get('email')}")
+        logger.info("Redirecting to payment method collection")
+        
+        # Redirect to Stripe payment setup
+        return redirect('/stripe/payment-setup')
         
     except ValueError as e:
         logger.error(f"OAuth callback error: {e}")

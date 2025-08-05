@@ -9,7 +9,7 @@ class Config:
     DATABASE_URL = os.getenv('DATABASE_URL')
     SECRET_KEY = os.getenv('SECRET_KEY', 'dev-key-change-in-production')
     HOST = os.getenv('FLASK_HOST', '0.0.0.0')
-    PORT = int(os.getenv('FLASK_PORT', 5002))
+    PORT = int(os.getenv('FLASK_PORT', 5001))
     
     # OAuth Configuration
     CLIENT_SECRET_FILE = os.getenv('CLIENT_SECRET_FILE', '../client_secret_941974948417-la4udombfq14du8vea6b8jqmo6d8nbv8.apps.googleusercontent.com.json')
@@ -78,6 +78,11 @@ class Config:
         'https://www.googleapis.com/auth/yt-analytics-monetary.readonly',
         'https://www.googleapis.com/auth/youtube'
     ]
+    
+    # Stripe Configuration
+    STRIPE_PUBLIC_KEY = os.getenv('STRIPE_PUBLIC_KEY')
+    STRIPE_SECRET_KEY = os.getenv('STRIPE_SECRET_KEY')
+    STRIPE_WEBHOOK_SECRET = os.getenv('STRIPE_WEBHOOK_SECRET')
 
 def get_config():
     """Get configuration object."""
