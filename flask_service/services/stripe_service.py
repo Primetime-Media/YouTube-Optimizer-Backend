@@ -55,6 +55,18 @@ def create_checkout_session(customer_id: str) -> Dict:
             cancel_url=f"{scheme}://localhost:5001/stripe/checkout-cancel",
             metadata={
                 'purpose': 'youtube_optimizer_signup'
+            },
+            # Custom messaging to clarify no charging
+            custom_text={
+                'submit': {
+                    'message': 'You will not be charged now. We\'re securely saving your payment method for future billing when you use our optimization services.'
+                }
+            },
+            # Additional setup options
+            payment_method_options={
+                'card': {
+                    'setup_future_usage': 'off_session'
+                }
             }
         )
         
