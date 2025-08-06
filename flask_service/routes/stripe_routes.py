@@ -172,7 +172,7 @@ def payment_success():
             
             # Redirect to frontend with success
             frontend_url = current_app.config.get('FRONTEND_URL', 'http://localhost:3000')
-            return redirect(f"{frontend_url}?auth=success&payment=validated&youtube=enabled")
+            return redirect(f"{frontend_url}?auth=success")
             
         except Exception as e:
             logger.error(f"Error processing user authentication after payment: {e}")
@@ -234,7 +234,7 @@ def checkout_success():
             
             # Redirect to frontend with success
             frontend_url = current_app.config.get('FRONTEND_URL', 'http://localhost:3000')
-            return redirect(f"{frontend_url}?auth=success&payment=validated&youtube=enabled")
+            return redirect(f"{frontend_url}?auth=success")
             
         except Exception as e:
             logger.error(f"Error processing user authentication after payment: {e}")
