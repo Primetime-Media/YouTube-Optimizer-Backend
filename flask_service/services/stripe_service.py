@@ -61,12 +61,6 @@ def create_checkout_session(customer_id: str) -> Dict:
                 'submit': {
                     'message': 'You will not be charged now. We\'re securely saving your payment method for future billing when you use our optimization services.'
                 }
-            },
-            # Additional setup options
-            payment_method_options={
-                'card': {
-                    'setup_future_usage': 'off_session'
-                }
             }
         )
         
