@@ -291,3 +291,58 @@ def payment_status():
     except Exception as e:
         logger.error(f"Error getting payment status: {e}")
         return jsonify({'error': 'Failed to get payment status'}), 500
+
+@stripe_bp.route('/webhook', methods=['POST'])
+def stripe_webhook():
+    """Handle Stripe webhook events."""
+    import stripe
+    from services.stripe_service import initialize_stripe
+    
+    payload = request.get_data()
+    sig_header = request.headers.get('Stripe-Signature')
+    
+    try:
+        initialize_stripe()
+        # Verify webhook signature if STRIPE_WEBHOOK_SECRET is configured
+        webhook_secret = current_app.config.get('STRIPE_WEBHOOK_SECRET')
+        if webhook_secret:
+            event = stripe.Webhook.construct_event(payload, sig_header, webhook_secret)
+        else:
+            # If no webhook secret configured, just parse the event
+            import json
+            event = json.loads(payload)
+        
+    except ValueError as e:
+        logger.error(f"Invalid webhook payload: {e}")
+        return 'Invalid payload', 400
+    except stripe.error.SignatureVerificationError as e:
+        logger.error(f"Invalid webhook signature: {e}")
+        return 'Invalid signature', 400
+    except Exception as e:
+        logger.error(f"Webhook processing error: {e}")
+        return 'Webhook error', 400
+    
+    # Handle the event
+    event_type = event.get('type')
+    logger.info(f"Received Stripe webhook: {event_type}")
+    
+    if event_type == 'setup_intent.succeeded':
+        setup_intent = event['data']['object']
+        logger.info(f"Setup intent succeeded: {setup_intent['id']}")
+        
+    elif event_type == 'setup_intent.setup_failed':
+        setup_intent = event['data']['object']
+        logger.warning(f"Setup intent failed: {setup_intent['id']}")
+        
+    elif event_type == 'payment_method.attached':
+        payment_method = event['data']['object']
+        logger.info(f"Payment method attached: {payment_method['id']}")
+        
+    elif event_type == 'customer.created':
+        customer = event['data']['object']
+        logger.info(f"Customer created: {customer['id']}")
+        
+    else:
+        logger.info(f"Unhandled webhook event type: {event_type}")
+    
+    return 'Success', 200
