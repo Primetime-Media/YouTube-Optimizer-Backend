@@ -43,16 +43,26 @@ def create_checkout_session(customer_id: str) -> Dict:
     try:
         from flask import current_app, url_for
         
-        # Get the base URL for callbacks
-        base_url = current_app.config.get('FRONTEND_URL', 'http://localhost:3000')
-        scheme = 'http' if current_app.config['DEBUG'] else 'https'
+        # Get the service URL for callbacks
+        # For production: use Cloud Run URL, for development: use localhost
+        debug_mode = current_app.config['DEBUG']
+        logger.info(f"DEBUG mode: {debug_mode}")
+        
+        if debug_mode:
+            service_url = "http://localhost:5001"
+            logger.info("Using localhost URLs for development")
+        else:
+            service_url = "https://youtube-optimizer-auth-941974948417.us-central1.run.app"
+            logger.info("Using Cloud Run URLs for production")
+        
+        logger.info(f"Service URL set to: {service_url}")
         
         checkout_session = stripe.checkout.Session.create(
             customer=customer_id,
             payment_method_types=['card'],
             mode='setup',  # Setup mode for saving payment methods without charging
-            success_url=f"{scheme}://localhost:5001/stripe/checkout-success?session_id={{CHECKOUT_SESSION_ID}}",
-            cancel_url=f"{scheme}://localhost:5001/stripe/checkout-cancel",
+            success_url=f"{service_url}/stripe/checkout-success?session_id={{CHECKOUT_SESSION_ID}}",
+            cancel_url=f"{service_url}/stripe/checkout-cancel",
             metadata={
                 'purpose': 'youtube_optimizer_signup'
             },
