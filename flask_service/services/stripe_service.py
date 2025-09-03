@@ -11,6 +11,33 @@ def initialize_stripe():
     if not stripe.api_key:
         raise ValueError("Stripe secret key not configured")
 
+def find_customer_by_email(user_email: str) -> Optional[Dict]:
+    """Find existing Stripe customer by email."""
+    initialize_stripe()
+    
+    try:
+        customers = stripe.Customer.list(
+            email=user_email,
+            limit=1
+        )
+        
+        if customers.data:
+            customer = customers.data[0]
+            logger.info(f"Found existing Stripe customer: {customer.id} for {user_email}")
+            return {
+                'customer_id': customer.id,
+                'email': customer.email,
+                'name': customer.name,
+                'existing': True
+            }
+        
+        logger.info(f"No existing Stripe customer found for {user_email}")
+        return None
+        
+    except stripe.error.StripeError as e:
+        logger.error(f"Stripe customer search failed: {e}")
+        raise ValueError(f"Failed to search for customer: {str(e)}")
+
 def create_customer(user_email: str, user_name: str, google_id: str) -> Dict:
     """Create a Stripe customer for the user."""
     initialize_stripe()
@@ -29,12 +56,23 @@ def create_customer(user_email: str, user_name: str, google_id: str) -> Dict:
         return {
             'customer_id': customer.id,
             'email': customer.email,
-            'name': customer.name
+            'name': customer.name,
+            'existing': False
         }
         
     except stripe.error.StripeError as e:
         logger.error(f"Stripe customer creation failed: {e}")
         raise ValueError(f"Failed to create customer: {str(e)}")
+
+def get_or_create_customer(user_email: str, user_name: str, google_id: str) -> Dict:
+    """Get existing customer or create new one."""
+    # First try to find existing customer
+    existing_customer = find_customer_by_email(user_email)
+    if existing_customer:
+        return existing_customer
+    
+    # If not found, create new customer
+    return create_customer(user_email, user_name, google_id)
 
 def create_checkout_session(customer_id: str) -> Dict:
     """Create a Stripe Checkout Session for collecting payment method without charging."""
@@ -183,8 +221,8 @@ def create_checkout_session_from_session() -> str:
     if not all([user_email, user_name, google_id]):
         raise ValueError("Incomplete user data in session")
     
-    # Create or retrieve customer
-    customer_info = create_customer(user_email, user_name, google_id)
+    # Get or create customer
+    customer_info = get_or_create_customer(user_email, user_name, google_id)
     customer_id = customer_info['customer_id']
     
     # Create checkout session
@@ -255,8 +293,8 @@ def process_payment_setup_from_session() -> Tuple[str, str]:
     if not all([user_email, user_name, google_id]):
         raise ValueError("Incomplete user data in session")
     
-    # Create or retrieve customer
-    customer_info = create_customer(user_email, user_name, google_id)
+    # Get or create customer
+    customer_info = get_or_create_customer(user_email, user_name, google_id)
     customer_id = customer_info['customer_id']
     
     # Create setup intent
