@@ -1,27 +1,147 @@
 import os
 import psycopg2
 from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
+from psycopg2_pool import ThreadSafeConnectionPool
 from dotenv import load_dotenv
 import logging
+import threading
+import atexit
 
 load_dotenv()
 
 # Import config here to avoid circular imports
 from config import get_settings
 
+# Export the context manager for easy importing
+__all__ = ['get_connection', 'return_connection', 'DatabaseConnection', 'close_connection_pool']
+
 # Initialize logging
 logger = logging.getLogger(__name__)
 
+# Global connection pool
+_connection_pool = None
+_pool_lock = threading.Lock()
+
+def get_connection_pool():
+    """Get or create the connection pool."""
+    global _connection_pool
+    
+    if _connection_pool is None:
+        with _pool_lock:
+            if _connection_pool is None:
+                try:
+                    settings = get_settings()
+                    logger.info(f"Creating connection pool for database at {settings.database_url}")
+                    
+                    # Create connection pool with configuration
+                    _connection_pool = ThreadSafeConnectionPool(
+                        minconn=1,      # Minimum connections in pool
+                        maxconn=100,    # High limit - handles unlimited concurrent users
+                        idle_timeout=30,  # Close idle connections quickly (30 seconds)
+                        dsn=settings.database_url
+                    )
+                    
+                    # Register cleanup function
+                    atexit.register(close_connection_pool)
+                    
+                    logger.info("Connection pool created successfully")
+                except Exception as e:
+                    logger.error(f"Error creating connection pool: {e}")
+                    raise
+    
+    return _connection_pool
+
 def get_connection():
-    """Create a connection to the PostgreSQL database."""
+    """Get a connection from the pool."""
     try:
-        settings = get_settings()
-        print(f"Connecting to database at {settings.database_url}")
-        conn = psycopg2.connect(settings.database_url)
+        pool = get_connection_pool()
+        conn = pool.getconn()
         return conn
     except Exception as e:
-        logger.error(f"Error connecting to database: {e}")
+        logger.error(f"Error getting connection from pool: {e}")
         raise
+
+def return_connection(conn):
+    """Return a connection to the pool."""
+    try:
+        if conn and not conn.closed:
+            pool = get_connection_pool()
+            pool.putconn(conn)
+        else:
+            logger.warning("Attempted to return closed or invalid connection")
+    except Exception as e:
+        logger.error(f"Error returning connection to pool: {e}")
+
+def close_connection_pool():
+    """Close the connection pool and all connections."""
+    global _connection_pool
+    
+    if _connection_pool:
+        try:
+            _connection_pool.clear()
+            logger.info("Connection pool closed successfully")
+        except Exception as e:
+            logger.error(f"Error closing connection pool: {e}")
+        finally:
+            _connection_pool = None
+
+def get_pool_status():
+    """Get current connection pool status for monitoring."""
+    global _connection_pool
+    
+    if _connection_pool:
+        return {
+            'min_connections': _connection_pool.minconn,
+            'max_connections': _connection_pool.maxconn,
+            'connections_in_use': len(_connection_pool.connections_in_use),
+            'idle_connections': len(_connection_pool.idle_connections),
+            'total_connections': len(_connection_pool.connections_in_use) + len(_connection_pool.idle_connections),
+            'idle_timeout': _connection_pool.idle_timeout
+        }
+    return None
+
+def cleanup_idle_connections():
+    """Manually cleanup idle connections if needed."""
+    global _connection_pool
+    
+    if _connection_pool:
+        try:
+            # The pool automatically handles idle connection cleanup
+            # This function is for manual cleanup if needed
+            status = get_pool_status()
+            if status:
+                logger.info(f"Pool status: {status['connections_in_use']} in use, {status['idle_connections']} idle")
+        except Exception as e:
+            logger.error(f"Error during cleanup: {e}")
+
+class DatabaseConnection:
+    """
+    Context manager for database connections.
+    
+    This class provides automatic connection management with the connection pool.
+    Connections are automatically returned to the pool when the context exits.
+    
+    Example usage:
+        from utils.db import DatabaseConnection
+        
+        with DatabaseConnection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT * FROM users")
+                results = cursor.fetchall()
+        # Connection is automatically returned to pool
+    """
+    
+    def __init__(self):
+        self.conn = None
+    
+    def __enter__(self):
+        self.conn = get_connection()
+        return self.conn
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.conn:
+            return_connection(self.conn)
+            self.conn = None
 
 def create_timeseries_table(conn):
     """Create the table for storing timeseries analytics data."""
@@ -56,12 +176,13 @@ def create_timeseries_table(conn):
 
 def init_db():
     """Initialize the database with required tables."""
-    conn = get_connection()
-    conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
-    
-    #delete_all_tables_except_users()
-
+    conn = None
     try:
+        conn = get_connection()
+        conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
+        
+        #delete_all_tables_except_users()
+
         with conn.cursor() as cursor:
 
             # Create users table
@@ -312,7 +433,8 @@ def init_db():
         logger.error(f"Error initializing database: {e}")
         raise
     finally:
-        conn.close()
+        if conn:
+            return_connection(conn)
         
 def init_scheduler_tables(cursor):
     """Initialize tables for scheduler functionality"""
@@ -394,8 +516,8 @@ def delete_all_tables_except_users():
         raise # Re-raise the exception
     finally:
         if conn:
-            conn.close()
-            logger.info("Database connection closed.")
+            return_connection(conn)
+            logger.info("Database connection returned to pool.")
 
 if __name__ == "__main__":
     pass
