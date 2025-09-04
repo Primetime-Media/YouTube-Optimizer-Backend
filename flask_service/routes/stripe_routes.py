@@ -3,7 +3,9 @@ from flask import Blueprint, request, jsonify, redirect, current_app, session, r
 from services.stripe_service import (
     create_checkout_session_from_session,
     process_checkout_session_success,
-    get_customer_payment_methods
+    get_customer_payment_methods,
+    find_customer_by_email,
+    get_or_create_customer
 )
 from services.auth_service import AuthService
 
@@ -107,8 +109,36 @@ def payment_setup():
         if session.get('payment_method_validated'):
             logger.info("Payment method already validated, redirecting to success")
             return redirect('/stripe/checkout-success')
-        
-        # Create Stripe Checkout Session
+
+        # Check if user email exists in Stripe customers
+        user_email = user_data.get('email')
+        existing_customer = find_customer_by_email(user_email)
+        if existing_customer:
+            logger.info(f"Found existing customer for {user_email}: {existing_customer['customer_id']}")
+            
+            # Check if customer has payment methods
+            try:
+                payment_methods = get_customer_payment_methods(existing_customer['customer_id'])
+                if payment_methods['payment_methods']:
+                    logger.info(f"Customer {existing_customer['customer_id']} already has payment methods")
+                    # Customer exists and has payment methods, redirect to frontend
+                    session['stripe_customer_id'] = existing_customer['customer_id']
+                    session['payment_method_validated'] = True
+                    frontend_url = current_app.config.get('FRONTEND_URL', 'http://localhost:3000')
+                    print(frontend_url)
+                    return redirect(f"{frontend_url}?auth=success&existing_customer=true")
+                else:
+                    logger.info(f"Customer {existing_customer['customer_id']} exists but has no payment methods")
+                    # Customer exists but no payment methods, proceed to add payment method
+                    session['stripe_customer_id'] = existing_customer['customer_id']
+            except Exception as e:
+                logger.error(f"Error checking payment methods for existing customer: {e}")
+                # If we can't check payment methods, proceed to add payment method
+                session['stripe_customer_id'] = existing_customer['customer_id']
+        else:
+            logger.info(f"No existing customer found for {user_email}, will create new customer")
+
+        # Create Stripe Checkout Session to add payment method
         checkout_url = create_checkout_session_from_session()
         
         logger.info(f"Stripe Checkout initiated for user: {user_data.get('email')}")
