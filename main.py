@@ -1021,7 +1021,6 @@ async def optimize_video_comprehensive(video_id: str):
             # Get the user's credentials to fetch the transcript if needed
             user_id = None
             try:
-                # Try to get the user ID from the database
                 cursor.execute("""
                     SELECT c.user_id
                     FROM youtube_videos v
@@ -1037,30 +1036,24 @@ async def optimize_video_comprehensive(video_id: str):
             transcript = stored_transcript
             has_captions = stored_has_captions
             
-            # If we don't have a transcript stored, try to fetch it on demand
+            # If we don’t have transcript stored, fetch on demand
             if not transcript and user_id:
                 try:
                     credentials = get_user_credentials(user_id)
-                    
                     if credentials:
-                        # Fetch transcript directly from YouTube
                         transcript_data = fetch_video_transcript(credentials, video_id)
                         transcript = transcript_data.get("transcript")
                         has_captions = transcript_data.get("has_captions", False)
-                        
                         logging.info(f"Fetched transcript on demand for video {video_id}")
                 except Exception as e:
                     logging.error(f"Error fetching transcript on demand: {e}")
             
-            # Safely check transcript length
-            transcript_length = 0
-            if transcript is not None:
-                transcript_length = len(transcript)
+            transcript_length = len(transcript) if transcript else 0
             logging.info(f"Video {video_id} has captions: {has_captions}, transcript length: {transcript_length}")
         
         conn.close()
 
-        # Get comprehensive optimization with all available data including transcript
+        # Call optimization pipeline
         logging.info(f"Generating comprehensive optimization for video {video_id}")
         result = get_comprehensive_optimization(
             original_title=original_title,
@@ -1069,8 +1062,17 @@ async def optimize_video_comprehensive(video_id: str):
             transcript=transcript,
             has_captions=has_captions
         )
-        
-        # Normalize result to ensure all fields are the correct type
+
+        # Normalize LLM result
+        if isinstance(result, list):
+            if len(result) > 0 and isinstance(result[0], dict):
+                result = result[0]
+            else:
+                raise ValueError(f"Unexpected result format: {result}")
+        elif not isinstance(result, dict):
+            raise ValueError(f"Expected dict, got {type(result)}: {result}")
+
+        # Normalize output fields
         normalized_result = {
             "original_title": str(result.get("original_title", "")),
             "optimized_title": str(result.get("optimized_title", "")),
@@ -1078,32 +1080,41 @@ async def optimize_video_comprehensive(video_id: str):
             "optimized_description": str(result.get("optimized_description", "")),
             "original_tags": [str(tag) for tag in result.get("original_tags", []) if tag],
             "optimized_tags": [str(tag) for tag in result.get("optimized_tags", []) if tag],
-            "optimization_notes": str(result.get("optimization_notes", ""))
+            "optimization_notes": str(result.get("optimization_notes", "")),
         }
-        
-        # Ensure we have valid lists
-        if not normalized_result["original_tags"]:
-            normalized_result["original_tags"] = []
-        if not normalized_result["optimized_tags"]:
-            normalized_result["optimized_tags"] = []
-        
-        # Store the transcript in the database for future use if we fetched it on demand
-        if transcript and not stored_transcript and user_id:
-            try:
-                store_conn = get_db_connection()
-                with store_conn.cursor() as store_cursor:
-                    store_cursor.execute("""
-                        UPDATE youtube_videos
-                        SET transcript = %s, has_captions = %s
-                        WHERE video_id = %s
-                    """, (transcript, has_captions, video_id))
-                    store_conn.commit()
-                    logging.info(f"Stored transcript for video {video_id} for future use")
-            except Exception as store_e:
-                logging.error(f"Error storing transcript: {store_e}")
-            finally:
-                store_conn.close()
-            
+
+        # Ensure valid list fields
+        normalized_result["original_tags"] = normalized_result["original_tags"] or []
+        normalized_result["optimized_tags"] = normalized_result["optimized_tags"] or []
+
+        # Persist results in DB
+        try:
+            update_conn = get_db_connection()
+            with update_conn.cursor() as update_cursor:
+                update_cursor.execute("""
+                    UPDATE youtube_videos
+                    SET transcript = COALESCE(%s, transcript),
+                        has_captions = %s,
+                        optimized_title = %s,
+                        optimized_description = %s,
+                        optimized_tags = %s
+                    WHERE video_id = %s
+                """, (
+                    transcript,
+                    has_captions,
+                    normalized_result["optimized_title"],
+                    normalized_result["optimized_description"],
+                    normalized_result["optimized_tags"],
+                    video_id
+                ))
+                update_conn.commit()
+                logging.info(f"Updated optimizations in DB for video {video_id}")
+
+        except Exception as store_e:
+            logging.error(f"Error storing optimization results: {store_e}")
+        finally:
+            update_conn.close()
+
         return ComprehensiveOptimizationResponse(**normalized_result)
 
     except HTTPException:
@@ -1111,7 +1122,6 @@ async def optimize_video_comprehensive(video_id: str):
     except Exception as e:
         logging.error(f"Error generating comprehensive optimization: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error optimizing video: {str(e)}")
-
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8080, reload=True)

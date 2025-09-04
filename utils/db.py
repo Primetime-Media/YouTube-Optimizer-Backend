@@ -222,10 +222,16 @@ def init_db():
                     status_details JSONB,        -- Status information as JSON
                     topic_details JSONB,         -- Topic details as JSON
                     
+                    -- Optimization results
+                    optimized_title VARCHAR(255),
+                    optimized_description TEXT,
+                    optimized_tags TEXT[],
+                    
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
             """)
+
             
             # Create channel optimizations table
             cursor.execute("""
