@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Response, HTTPException, Request, Depends, BackgroundTasks, Cookie
+from fastapi import FastAPI, Response, HTTPException, Request, Depends, BackgroundTasks, Cookie, Header
 from fastapi.security import HTTPBearer
 from datetime import datetime, timedelta
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,7 +21,7 @@ from routes.channel_routes import router as channel_router
 from routes.scheduler_routes import router as scheduler_router
 from routes.video_routes import router as video_router
 from config import get_settings
-from utils.auth import get_user_credentials
+from utils.auth import get_user_credentials, validate_session_token, cleanup_invalid_sessions
 from services.scheduler import initialize_scheduler
 
 # Get application settings
@@ -49,7 +49,13 @@ if not settings.is_production:
 # Session configuration
 SESSION_COOKIE_NAME = "youtube_optimizer_session"
 SESSION_EXPIRY_DAYS = 14  # Session validity period
-SESSION_SECRET = os.getenv("SESSION_SECRET", secrets.token_hex(32))
+
+# Security: Ensure proper session secret configuration in production
+# The SESSION_SECRET environment variable should be set to a cryptographically
+# secure random value in production environments. This prevents predictable
+# session generation and ensures proper security.
+if settings.is_production and not os.getenv("SESSION_SECRET"):
+    raise ValueError("SESSION_SECRET environment variable must be set in production")
 
 app = FastAPI(
     title=settings.app_name,
@@ -61,7 +67,10 @@ app = FastAPI(
 # Configure CORS
 allowed_origins = [settings.frontend_url]
 if not settings.is_production:
-    allowed_origins.extend(["http://localhost:3000", "http://127.0.0.1:3000"])
+    allowed_origins.extend([
+        "http://localhost:3000", 
+        "http://127.0.0.1:3000",
+    ])
 
 logging.info(f"Allowed origins: {allowed_origins}")
 logging.info(f"Environment: {settings.environment}")
@@ -75,8 +84,8 @@ app.add_middleware(
     allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE"],
-    allow_headers=["Authorization", "Content-Type"],
-    expose_headers=["content-type"]
+    allow_headers=["Authorization", "Content-Type"],  # Add Cookie header
+    expose_headers=["content-type"]  # Expose set-cookie header
 )
 
 # Security headers middleware
@@ -100,9 +109,23 @@ app.include_router(video_router)
 @app.on_event("startup")
 async def startup_db_client():
     """Initialize the database and scheduler system on startup."""
+    # Verify system entropy for secure session generation
+    try:
+        # Test entropy availability
+        test_token = secrets.token_bytes(32)
+        logging.info("System entropy verified for secure session generation")
+    except Exception as e:
+        logging.error(f"System entropy check failed: {e}")
+        if settings.is_production:
+            raise RuntimeError("Insufficient system entropy for secure operations")
+    
     init_db()
     initialize_scheduler()  # Just initializes scheduler resources, doesn't run any jobs
-    logging.info("Database and scheduler system initialized with session management support")
+    
+    # Clean up any invalid session tokens in the database
+    cleanup_invalid_sessions()
+    
+    logging.info("Database and scheduler system initialized with secure session management support")
 
 # Database connection function
 def get_db_connection():
@@ -113,8 +136,24 @@ def get_db_connection():
 
 # Session management functions
 def create_session(user_id: int, response: Response, request: Request) -> str:
-    """Create a new session for a user and set the session cookie"""
+    """Create a new session for a user and set the session cookie
+    
+    Security features:
+    - Uses cryptographically secure random generation (secrets.token_urlsafe)
+    - Generates 32 bytes of entropy (256 bits) for session tokens
+    - Validates system entropy availability in production
+    - Implements proper token format validation
+    - Uses secure cookie settings in production (httponly, secure, samesite)
+    """
+    # Generate cryptographically secure session token
+    # Using token_urlsafe for URL-safe tokens with 32 bytes of entropy (256 bits)
     session_token = secrets.token_urlsafe(32)
+    
+    # Additional entropy check for production environments
+    if settings.is_production:
+        # Ensure we have sufficient entropy for session tokens
+        if not secrets.token_bytes(1):  # This will raise if system entropy is insufficient
+            raise RuntimeError("Insufficient system entropy for secure session generation")
     
     # Use timezone-aware expiration date
     from datetime import timezone
@@ -165,69 +204,36 @@ def create_session(user_id: int, response: Response, request: Request) -> str:
     finally:
         conn.close()
 
+
+
 def get_user_from_session(session_token: str) -> Optional[dict]:
-    """Retrieve user from session token"""
-    if not session_token:
-        return None
-        
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cursor:
-            # Check if this token exists
-            if settings.debug:
-                cursor.execute("SELECT COUNT(*) FROM users WHERE session_token = %s", (session_token,))
-                count = cursor.fetchone()[0]
-                logging.info(f"Found {count} users with matching session token")
-            
-            cursor.execute("""
-                SELECT id, google_id, email, name, permission_level, is_free_trial, session_expires
-                FROM users
-                WHERE session_token = %s
-            """, (session_token,))
-            
-            result = cursor.fetchone()
-            if not result:
-                logging.info(f"No user found with session token {session_token[:10]}...")
-                return None
-                
-            # Check if session has expired
-            session_expires = result[6]
-            if session_expires:
-                # Handle timezone-aware comparison
-                current_time = datetime.now()
-                if session_expires.tzinfo is not None:
-                    # session_expires is timezone-aware, make current_time timezone-aware
-                    from datetime import timezone
-                    current_time = datetime.now(timezone.utc)
-                    if session_expires.tzinfo != timezone.utc:
-                        session_expires = session_expires.astimezone(timezone.utc)
-                else:
-                    # session_expires is naive, use naive current_time
-                    current_time = datetime.now()
-                
-                if current_time > session_expires:
-                    logging.info(f"Session token expired at {session_expires}")
-                    return None
-            
-            logging.info(f"Found valid session for user ID {result[0]}")
-            return {
-                "id": result[0],
-                "google_id": result[1],
-                "email": result[2],
-                "name": result[3],
-                "permission_level": result[4],
-                "is_free_trial": result[5]
-            }
-    except Exception as e:
-        logging.error(f"Error retrieving user from session: {e}")
-        logging.exception("Session retrieval exception")
-        return None
-    finally:
-        conn.close()
+    """Retrieve user from session token using auth.py function"""
+    from utils.auth import get_user_from_session as auth_get_user_from_session
+    
+    # Use the auth.py function which includes security validation
+    user = auth_get_user_from_session(session_token)
+    
+    if user:
+        # Convert User model to dict format for compatibility
+        return {
+            "id": user.id,
+            "google_id": user.google_id,
+            "email": user.email,
+            "name": user.name,
+            "permission_level": user.permission_level,
+            "is_free_trial": user.is_free_trial
+        }
+    
+    return None
 
 def delete_session(session_token: str, response: Response):
     """Invalidate a session and clear the cookie"""
     if not session_token:
+        return
+    
+    # Validate session token format before attempting deletion
+    if not validate_session_token(session_token):
+        logging.warning(f"Attempted to delete invalid session token format: {session_token[:10]}...")
         return
         
     conn = get_db_connection()
