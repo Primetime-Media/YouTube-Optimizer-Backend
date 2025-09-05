@@ -28,10 +28,14 @@ from services.scheduler import initialize_scheduler
 settings = get_settings()
 client_secrets_file = settings.client_secret_file
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+# Configure logging with automatic folder creation
+from utils.logging_config import setup_logging
+logger = setup_logging(
+    log_level="INFO",
+    log_dir="logs",
+    console_output=True,
+    max_file_size=10 * 1024 * 1024,  # 10MB
+    backup_count=5
 )
 
 # Suppress googleapiclient.discovery_cache warnings

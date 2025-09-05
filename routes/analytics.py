@@ -1,6 +1,8 @@
-from fastapi import APIRouter, HTTPException, BackgroundTasks
+from fastapi import APIRouter, HTTPException, BackgroundTasks, Query
 from typing import Dict, List, Optional
 import logging
+import re
+from datetime import datetime
 from config import get_settings
 from services.youtube import (
     fetch_video_analytics, 
@@ -20,25 +22,142 @@ router = APIRouter(
 
 logger = logging.getLogger(__name__)
 
+# Valid YouTube Analytics API metrics and dimensions
+VALID_METRICS = {
+    "views", "estimatedMinutesWatched", "averageViewDuration",
+    "likes", "dislikes", "shares", "comments", 
+    "subscribersGained", "subscribersLost", "estimatedRevenue",
+    "estimatedAdRevenue", "cpm", "impressions", "impressionBasedCpm",
+    "annotationClicks", "annotationClickThroughRate", "annotationClosableImpressions",
+    "cardClicks", "cardClickRate", "cardImpressions", "cardTeaserClicks",
+    "cardTeaserClickRate", "cardTeaserImpressions", "conversions", "conversionRate",
+    "costPerConversion", "costPerView", "earnings", "grossRevenue", "monetizedPlaybacks",
+    "playbackBasedCpm", "redViews", "redViewsPercentage", "revenuePerMille",
+    "subscribersGainedFromRed", "subscribersLostFromRed", "uniqueViewers",
+    "viewsPerUniqueViewer", "averageViewPercentage", "relativeRetentionPerformance"
+}
+
+VALID_DIMENSIONS = {
+    "day", "month", "year", "country", "province", "continent",
+    "ageGroup", "gender", "deviceType", "operatingSystem", "browser",
+    "subscribedStatus", "youtubeProduct", "insightTrafficSourceType",
+    "insightTrafficSourceDetail", "sharingService", "liveOrOnDemand",
+    "subscribedStatus", "youtubeProduct", "creatorContentType",
+    "uploaderType", "uploaderTypeCode", "video", "playlist", "channel"
+}
+
+def validate_video_id(video_id: str) -> bool:
+    """Validate YouTube video ID format"""
+    return bool(re.match(r'^[a-zA-Z0-9_-]{11}$', video_id))
+
+def validate_date_format(date_str: str) -> bool:
+    """Validate date format YYYY-MM-DD"""
+    try:
+        datetime.strptime(date_str, '%Y-%m-%d')
+        return True
+    except ValueError:
+        return False
+
+def validate_user_owns_video(user_id: int, video_id: str) -> bool:
+    """Check if user owns the video"""
+    conn = get_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT 1 FROM youtube_videos v
+                JOIN youtube_channels c ON v.channel_id = c.id
+                WHERE v.video_id = %s AND c.user_id = %s
+            """, (video_id, user_id))
+            return cursor.fetchone() is not None
+    except Exception as e:
+        logger.error(f"Error validating user ownership for video {video_id}: {e}")
+        return False
+    finally:
+        conn.close()
+
 @router.get("/video/{video_id}")
 async def get_video_analytics(
     video_id: str,
-    user_id: int,
-    metrics: Optional[List[str]] = None,
-    dimensions: Optional[List[str]] = None,
-    start_date: Optional[str] = None,
-    end_date: Optional[str] = None
+    user_id: int = Query(..., description="Database user ID (must be positive integer)"),
+    metrics: Optional[str] = Query(None, description="Comma-separated list of metrics (e.g., 'views,likes,comments')"),
+    dimensions: Optional[str] = Query(None, description="Comma-separated list of dimensions (e.g., 'day,country')"),
+    start_date: Optional[str] = Query(None, description="Start date in YYYY-MM-DD format"),
+    end_date: Optional[str] = Query(None, description="End date in YYYY-MM-DD format")
 ):
     """
     Get analytics data for a specific YouTube video.
     
-    - video_id: YouTube video ID
+    - video_id: YouTube video ID (11 characters, alphanumeric with hyphens/underscores)
+    - user_id: Database user ID (must be positive integer)
     - metrics: Optional list of metrics to retrieve (e.g., views,likes,comments)
     - dimensions: Optional list of dimensions to group by (e.g., day,country)
     - start_date: Optional start date in YYYY-MM-DD format 
     - end_date: Optional end date in YYYY-MM-DD format
     """
     try:
+        # Debug logging for parameters
+        logger.info(f"Received parameters - video_id: {video_id}, user_id: {user_id}, metrics: {metrics}, dimensions: {dimensions}")
+        
+        # Input validation
+        if not validate_video_id(video_id):
+            raise HTTPException(
+                status_code=400, 
+                detail="Invalid video_id format. Must be 11 characters, alphanumeric with hyphens/underscores."
+            )
+        
+        if user_id <= 0:
+            raise HTTPException(
+                status_code=400, 
+                detail="Invalid user_id. Must be a positive integer."
+            )
+        
+        if start_date and not validate_date_format(start_date):
+            raise HTTPException(
+                status_code=400, 
+                detail="start_date must be in YYYY-MM-DD format"
+            )
+        
+        if end_date and not validate_date_format(end_date):
+            raise HTTPException(
+                status_code=400, 
+                detail="end_date must be in YYYY-MM-DD format"
+            )
+        
+        # Process and validate metrics
+        metrics_list = None
+        if metrics:
+            # Split comma-separated string into list
+            metrics_list = [m.strip() for m in metrics.split(',') if m.strip()]
+            
+            if metrics_list:
+                invalid_metrics = set(metrics_list) - VALID_METRICS
+                if invalid_metrics:
+                    raise HTTPException(
+                        status_code=400, 
+                        detail=f"Invalid metrics: {', '.join(invalid_metrics)}. Valid metrics: {', '.join(sorted(VALID_METRICS))}"
+                    )
+        
+        # Process and validate dimensions
+        dimensions_list = None
+        if dimensions:
+            # Split comma-separated string into list
+            dimensions_list = [d.strip() for d in dimensions.split(',') if d.strip()]
+            
+            if dimensions_list:
+                invalid_dimensions = set(dimensions_list) - VALID_DIMENSIONS
+                if invalid_dimensions:
+                    raise HTTPException(
+                        status_code=400, 
+                        detail=f"Invalid dimensions: {', '.join(invalid_dimensions)}. Valid dimensions: {', '.join(sorted(VALID_DIMENSIONS))}"
+                    )
+        
+        # Check if user owns the video
+        if not validate_user_owns_video(user_id, video_id):
+            raise HTTPException(
+                status_code=403, 
+                detail="You don't have permission to access this video's analytics"
+            )
+        
         # Get user credentials from database
         credentials = get_user_credentials(user_id)
         
@@ -49,8 +168,8 @@ async def get_video_analytics(
             )
         
         # Set default metrics if not provided
-        if not metrics:
-            metrics = [
+        if not metrics_list:
+            metrics_list = [
                 "views", "estimatedMinutesWatched", "averageViewDuration", 
                 "likes", "dislikes", "shares", "comments", 
                 "subscribersGained", "subscribersLost",
@@ -59,18 +178,26 @@ async def get_video_analytics(
         analytics_data = fetch_video_analytics(
             credentials,
             video_id,
-            metrics,
-            dimensions,
+            metrics_list,
+            dimensions_list,
             start_date,
             end_date
         )
+        
+        # Check if the response contains an error
+        if isinstance(analytics_data, dict) and 'error' in analytics_data:
+            status_code = analytics_data.get('status_code', 500)
+            raise HTTPException(status_code=status_code, detail=analytics_data['error'])
+        
         logger.info(f"Successfully fetched analytics data for video {video_id}")
-        logger.info(f"Analytics data for video {video_id}: {analytics_data}")
         return analytics_data
         
+    except HTTPException:
+        # Re-raise HTTPExceptions directly
+        raise
     except Exception as e:
         logger.error(f"Error getting video analytics: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
 
 @router.get("/video/{video_id}/timeseries")
 async def get_video_timeseries(
@@ -108,20 +235,20 @@ async def get_video_timeseries(
             logger.info(f"Returning cached timeseries data for video {video_id}")
             return db_data
         
-        # --- Derive user_id from video_id ---
+        # --- Derive user_id from video_id using optimized single query ---
         conn = get_connection()
         derived_user_id = None
         try:
             with conn.cursor() as cursor:
-                # Find channel_id from youtube_videos using youtube_video_id
+                # Single optimized query to get user_id from video_id
                 cursor.execute("""
-                    SELECT channel_id
-                    FROM youtube_videos
-                    WHERE video_id = %s
+                    SELECT c.user_id 
+                    FROM youtube_videos v
+                    JOIN youtube_channels c ON v.channel_id = c.id
+                    WHERE v.video_id = %s
                 """, (video_id,))
-                video_result = cursor.fetchone()
-                if not video_result:
-                    # If video not in our DB, we can't get user, maybe return cached error or 404
+                result = cursor.fetchone()
+                if not result:
                     logger.warning(f"Video {video_id} not found in database for timeseries fetch.")
                     # Return the cache error if it exists
                     if db_data.get('error'):
@@ -130,23 +257,10 @@ async def get_video_timeseries(
                         # Or raise 404 if no cache error either
                         raise HTTPException(status_code=404, detail=f"Video {video_id} not found in database.")
 
-                channel_id = video_result[0]
-
-                # Find user_id from youtube_channels using channel_id
-                cursor.execute("""
-                    SELECT user_id
-                    FROM youtube_channels
-                    WHERE id = %s
-                """, (channel_id,))
-                channel_result = cursor.fetchone()
-                if not channel_result:
-                     # This implies data inconsistency if video exists but channel doesn't
-                     logger.error(f"Channel {channel_id} for video {video_id} not found in database.")
-                     raise HTTPException(status_code=500, detail="Internal data inconsistency: Channel not found.")
-
-                derived_user_id = channel_result[0]
+                derived_user_id = result[0]
         finally:
-            conn.close()
+            if conn and not conn.closed:
+                conn.close()
 
         if derived_user_id is None:
              # Should have been caught above, but as a safeguard
@@ -159,14 +273,11 @@ async def get_video_timeseries(
         if not credentials or not credentials_dict:
             # This might happen if the derived user has no valid credentials stored
             logger.warning(f"No valid credentials found for derived user_id {derived_user_id} for video {video_id}.")
-            # Depending on desired behavior, either return the cache error or raise 401/specific error
-            if db_data.get('error'):
-                 return db_data
-            else:
-                raise HTTPException(
-                        status_code=401,
-                        detail="Could not retrieve valid credentials for the video owner."
-                )
+            # Always raise HTTP exception for consistency
+            raise HTTPException(
+                status_code=401,
+                detail="Could not retrieve valid credentials for the video owner."
+            )
         
         # Fetch data directly using the fetch_and_store function
         logger.info(f"Fetching fresh data from YouTube API for video {video_id}")
@@ -176,6 +287,11 @@ async def get_video_timeseries(
             credentials_dict,
             interval
         )
+        
+        # Check if the response contains an error
+        if isinstance(analytics_data, dict) and 'error' in analytics_data:
+            status_code = analytics_data.get('status_code', 500)
+            raise HTTPException(status_code=status_code, detail=analytics_data['error'])
         
         return analytics_data
             
@@ -207,6 +323,26 @@ async def refresh_video_analytics(
             logger.warning(f"Interval '{interval}' is not supported by YouTube API, using 'day' instead")
             interval = 'day'
             
+        # Input validation
+        if not validate_video_id(video_id):
+            raise HTTPException(
+                status_code=400, 
+                detail="Invalid video_id format. Must be 11 characters, alphanumeric with hyphens/underscores."
+            )
+        
+        if user_id <= 0:
+            raise HTTPException(
+                status_code=400, 
+                detail="Invalid user_id. Must be a positive integer."
+            )
+        
+        # Check if user owns the video
+        if not validate_user_owns_video(user_id, video_id):
+            raise HTTPException(
+                status_code=403, 
+                detail="You don't have permission to access this video's analytics"
+            )
+        
         # Get user credentials from database
         credentials = get_user_credentials(user_id)
         credentials_dict = get_credentials_dict(user_id)
@@ -240,6 +376,11 @@ async def refresh_video_analytics(
                 credentials_dict,
                 interval
             )
+            
+            # Check if the result contains an error
+            if isinstance(result, dict) and 'error' in result:
+                status_code = result.get('status_code', 500)
+                raise HTTPException(status_code=status_code, detail=result['error'])
             
             return {
                 "video_id": video_id,
