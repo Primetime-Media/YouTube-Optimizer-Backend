@@ -4,6 +4,9 @@ from dotenv import load_dotenv
 import os
 import uvicorn
 import logging
+import secrets
+
+# Local imports
 from utils.db import init_db
 from routes.analytics import router as analytics_router
 from routes.auth_routes import router as auth_router
@@ -14,47 +17,51 @@ from routes.video_routes import router as video_router
 from config import get_settings
 from utils.auth import cleanup_invalid_sessions
 from services.scheduler import initialize_scheduler
-import secrets
+from utils.logging_config import setup_logging
 
-# Get application settings
+# Load environment variables from .env file
+load_dotenv()
+
+# Load application settings
 settings = get_settings()
 
-# Configure logging with automatic folder creation
-from utils.logging_config import setup_logging
+# Configure logging with rotation and console output
 logger = setup_logging(
     log_level="INFO",
     log_dir="logs",
     console_output=True,
-    max_file_size=10 * 1024 * 1024,  # 10MB
-    backup_count=5
+    max_file_size=10 * 1024 * 1024,  # 10MB per log file
+    backup_count=5,  # Keep last 5 log files
 )
 
-# Suppress googleapiclient.discovery_cache warnings
-logging.getLogger('googleapiclient.discovery_cache').setLevel(logging.ERROR)
+# Suppress noisy googleapiclient warnings
+logging.getLogger("googleapiclient.discovery_cache").setLevel(logging.ERROR)
 
-load_dotenv()
-
-# Security: Ensure proper session secret configuration in production
-# The SESSION_SECRET environment variable should be set to a cryptographically
-# secure random value in production environments. This prevents predictable
-# session generation and ensures proper security.
+# Security: Ensure session secret is properly configured in production
 if settings.is_production and not os.getenv("SESSION_SECRET"):
     raise ValueError("SESSION_SECRET environment variable must be set in production")
 
+# Initialize FastAPI application
 app = FastAPI(
     title=settings.app_name,
     debug=settings.debug,
+    # Hide docs in production for security
     docs_url="/docs" if not settings.is_production else None,
-    redoc_url="/redoc" if not settings.is_production else None
+    redoc_url="/redoc" if not settings.is_production else None,
 )
 
-# Configure CORS
+# -------------------------------
+#  CORS CONFIGURATION
+# -------------------------------
+# Allow only trusted domains (frontend URL in prod, localhost in dev)
 allowed_origins = [settings.frontend_url]
 if not settings.is_production:
-    allowed_origins.extend([
-        "http://localhost:3000", 
-        "http://127.0.0.1:3000",
-    ])
+    allowed_origins.extend(
+        [
+            "http://localhost:3000",
+            "http://127.0.0.1:3000",
+        ]
+    )
 
 logging.info(f"Allowed origins: {allowed_origins}")
 logging.info(f"Environment: {settings.environment}")
@@ -64,62 +71,94 @@ logging.info(f"Is production: {settings.is_production}")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins,
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE"],
-    allow_headers=["Authorization", "Content-Type"],  # Add Cookie header
-    expose_headers=["content-type"]  # Expose set-cookie header
+    allow_origins=allowed_origins,  #  Only allow listed domains
+    allow_credentials=True,  #  Needed for cookies/session auth
+    allow_methods=[
+        "GET",
+        "POST",
+        "PUT",
+        "DELETE",
+        "OPTIONS",
+    ],  #  Restrict to required methods
+    allow_headers=[
+        "Authorization",
+        "Content-Type",
+        "Cookie",
+    ],  #  Restrict headers to necessary ones
+    expose_headers=["set-cookie"],  # Allow frontend to read set-cookie header
 )
 
-# Security headers middleware
+
+# -------------------------------
+#  SECURITY HEADERS
+# -------------------------------
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
+    """
+    Middleware to inject common security headers into every response.
+    """
     response = await call_next(request)
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["X-XSS-Protection"] = "1; mode=block"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    # Enforce HTTPS in production
     if settings.is_production:
-        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+        response.headers["Strict-Transport-Security"] = (
+            "max-age=31536000; includeSubDomains"
+        )
+        # Optional: uncomment for stronger XSS/CSRF protection
+        # response.headers["Content-Security-Policy"] = "default-src 'self'"
     return response
 
-# Include routers
-app.include_router(analytics_router) 
+
+# -------------------------------
+#  ROUTERS
+# -------------------------------
+# Register API routers
+app.include_router(analytics_router)
 app.include_router(auth_router)
 app.include_router(channel_router)
 app.include_router(health_router)
 app.include_router(scheduler_router)
 app.include_router(video_router)
 
+
+# -------------------------------
+#   STARTUP TASKS
+# -------------------------------
 @app.on_event("startup")
 async def startup_db_client():
-    """Initialize the database and scheduler system on startup."""
-    # Verify system entropy for secure session generation
+    """
+    Initialize database, scheduler, and session cleanup on startup.
+    """
+    # Verify system entropy for cryptographic security
     try:
-        # Test entropy availability
-        test_token = secrets.token_bytes(32)
+        secrets.token_bytes(32)  # Ensure OS entropy is available
         logging.info("System entropy verified for secure session generation")
     except Exception as e:
         logging.error(f"System entropy check failed: {e}")
         if settings.is_production:
             raise RuntimeError("Insufficient system entropy for secure operations")
-    
+
+    # Initialize database
     init_db()
-    initialize_scheduler()  # Just initializes scheduler resources, doesn't run any jobs
-    
-    # Clean up any invalid session tokens in the database
+
+    # Initialize scheduler resources (does not start jobs)
+    initialize_scheduler()
+
+    # Clean up invalid/expired session tokens
     cleanup_invalid_sessions()
-    
-    logging.info("Database and scheduler system initialized with secure session management support")
+
+    logging.info(
+        " Database and scheduler system initialized with secure session management support"
+    )
 
 
-
-
-
-
-
-
-
-
+# -------------------------------
+#   MAIN ENTRY POINT
+# -------------------------------
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8080, reload=True)
+    uvicorn.run(
+        "main:app", host="0.0.0.0", port=8080, reload=not settings.is_production
+    )
