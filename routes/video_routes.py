@@ -10,7 +10,7 @@ from services.video import (
     get_video_optimizations
 )
 from services.optimizer import apply_optimization_to_youtube_video, get_optimization_status
-from services.llm_optimization import should_optimize_video, enhanced_should_optimize_video
+from services.llm_optimization import should_optimize_video, enhanced_should_optimize_video, get_comprehensive_optimization
 from services.youtube import fetch_video_timeseries_data, fetch_and_store_youtube_analytics
 from services.competitor_analysis import get_competitor_analysis
 from utils.auth import get_user_credentials, get_user_from_session, User
@@ -750,3 +750,467 @@ async def queue_videos_for_optimization(
         if conn:
             conn.close()
             logger.debug("Database connection closed for batch queue-optimization.")
+
+# Additional YouTube-related endpoints moved from main.py
+
+@router.post("/{video_id}/fetch-transcript")
+async def fetch_and_store_transcript(video_id: str, user_id: int):
+    """Fetch and store transcript for a specific video."""
+    try:
+        # First check if we already have the transcript
+        conn = get_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    SELECT transcript, has_captions
+                    FROM youtube_videos
+                    WHERE video_id = %s
+                """, (video_id,))
+                
+                result = cursor.fetchone()
+                if not result:
+                    raise HTTPException(status_code=404, detail="Video not found")
+                    
+                existing_transcript, has_captions = result
+                
+                # If transcript already exists, return it
+                if existing_transcript:
+                    return {
+                        "video_id": video_id,
+                        "has_transcript": True,
+                        "transcript_length": len(existing_transcript),
+                        "has_captions": has_captions,
+                        "message": "Transcript already exists for this video"
+                    }
+        finally:
+            conn.close()
+        
+        credentials = get_user_credentials(user_id)
+        
+        if not credentials:
+            raise HTTPException(
+                status_code=401,
+                detail="No valid credentials found. Please log in again."
+            )
+            
+        # Fetch transcript
+        from services.youtube import fetch_video_transcript
+        transcript_data = fetch_video_transcript(credentials, video_id)
+        transcript = transcript_data.get("transcript")
+        has_captions = transcript_data.get("has_captions", False)
+        
+        if not transcript:
+            return {
+                "video_id": video_id,
+                "has_transcript": False,
+                "error": transcript_data.get("error", "No transcript available for this video"),
+                "has_captions": has_captions
+            }
+            
+        # Store in database
+        conn = get_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    UPDATE youtube_videos
+                    SET transcript = %s, has_captions = %s
+                    WHERE video_id = %s
+                """, (transcript, has_captions, video_id))
+                conn.commit()
+        finally:
+            conn.close()
+            
+        return {
+            "video_id": video_id,
+            "has_transcript": True,
+            "transcript_length": len(transcript),
+            "has_captions": has_captions,
+            "message": "Successfully fetched and stored transcript"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Error fetching transcript: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error fetching transcript: {str(e)}")
+
+@router.get("/youtube-data/{user_id}")
+async def get_youtube_data(user_id: int, _: dict = Depends(get_user_from_session)):
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        
+        # Get all channel data for the user
+        cursor.execute("""
+            SELECT c.id, c.channel_id, c.kind, c.etag, c.title, c.description, 
+                   c.custom_url, c.published_at, c.view_count, c.subscriber_count,
+                   c.hidden_subscriber_count, c.video_count, c.thumbnail_url_default,
+                   c.thumbnail_url_medium, c.thumbnail_url_high, c.uploads_playlist_id,
+                   c.banner_url, c.privacy_status, c.is_linked, c.long_uploads_status,
+       c.is_monetization_enabled, c.topic_ids, c.topic_categories,
+       c.overall_good_standing, c.community_guidelines_good_standing,
+       c.copyright_strikes_good_standing, c.content_id_claims_good_standing,
+       c.branding_settings, c.audit_details, c.topic_details, c.status_details,
+       c.created_at, c.updated_at
+            FROM youtube_channels c
+            WHERE c.user_id = %s
+            ORDER BY c.title
+        """, (user_id,))
+            
+        channels = []
+        for channel_data in cursor.fetchall():
+            channel = {
+                "id": channel_data[0],
+                "channel_id": channel_data[1],
+                "kind": channel_data[2],
+                "etag": channel_data[3],
+                "title": channel_data[4],
+                "description": channel_data[5],
+                "custom_url": channel_data[6],
+                "published_at": channel_data[7],
+                "view_count": channel_data[8],
+                "subscriber_count": channel_data[9],
+                "hidden_subscriber_count": channel_data[10],
+                "video_count": channel_data[11],
+                "thumbnails": {
+                    "default": channel_data[12],
+                    "medium": channel_data[13],
+                    "high": channel_data[14]
+                },
+                "uploads_playlist_id": channel_data[15],
+                "optimization": {
+                    "banner_url": channel_data[16],
+                    "privacy_status": channel_data[17],
+                    "is_linked": channel_data[18],
+                    "long_uploads_status": channel_data[19],
+                    "is_monetization_enabled": channel_data[20],
+                    "topic_ids": channel_data[21],
+                    "topic_categories": channel_data[22],
+                    "channel_standing": {
+                        "overall_good_standing": channel_data[23],
+                        "community_guidelines_good_standing": channel_data[24],
+                        "copyright_strikes_good_standing": channel_data[25],
+                        "content_id_claims_good_standing": channel_data[26]
+                    }
+                },
+                "raw_data": {
+                    "branding_settings": channel_data[27],
+                    "audit_details": channel_data[28],
+                    "topic_details": channel_data[29],
+                    "status_details": channel_data[30]
+                },
+                "created_at": channel_data[31],
+                "updated_at": channel_data[32]
+            }
+            
+            # Get videos data - join with youtube_channels to filter by user_id
+            cursor.execute("""
+                SELECT v.id, v.video_id, v.kind, v.etag, v.playlist_item_id, v.title, 
+                       v.description, v.published_at, v.channel_title, v.tags, v.playlist_id,
+                       v.position, v.thumbnail_url_default, v.thumbnail_url_medium, 
+                       v.thumbnail_url_high, v.thumbnail_url_standard, v.thumbnail_url_maxres,
+                       v.view_count, v.like_count, v.comment_count, v.duration, 
+                       v.is_optimized, v.created_at, v.updated_at, v.queued_for_optimization, v.optimizations_completed
+                FROM youtube_videos v
+                JOIN youtube_channels c ON v.channel_id = c.id
+                WHERE c.user_id = %s
+                ORDER BY v.published_at DESC
+            """, (user_id,))
+            
+            videos_data = cursor.fetchall()
+            
+            videos = []
+            for video in videos_data:
+                videos.append({
+                    "id": video[0],
+                    "video_id": video[1],
+                    "kind": video[2],
+                    "etag": video[3],
+                    "playlist_item_id": video[4],
+                    "title": video[5],
+                    "description": video[6],
+                    "published_at": video[7],
+                    "channel_title": video[8],
+                    "tags": video[9],
+                    "playlist_id": video[10],
+                    "position": video[11],
+                    "thumbnails": {
+                        "default": video[12],
+                        "medium": video[13],
+                        "high": video[14],
+                        "standard": video[15],
+                        "maxres": video[16]
+                    },
+                    "view_count": video[17],
+                    "like_count": video[18],
+                    "comment_count": video[19],
+                    "duration": video[20],
+                    "is_optimized": video[21],
+                    "created_at": video[22],
+                    "updated_at": video[23],
+                    "queued_for_optimization": video[24],
+                    "optimizations_completed": video[25]
+                })
+        
+        conn.close()
+        
+        return {
+            "status": "success",
+            "data": {
+                "channel": channel,
+                "videos": videos,
+                "video_count": len(videos)
+            }
+        }
+        
+    except Exception as e:
+        logging.error(f"Error fetching YouTube data: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error fetching YouTube data: {str(e)}")
+
+@router.post("/refresh-youtube-data/{user_id}")
+async def refresh_youtube_data(user_id: int, background_tasks: BackgroundTasks):
+    try:
+        # Check if user exists
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT id FROM users WHERE id = %s", (user_id,))
+        result = cursor.fetchone()
+        
+        if not result:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        # We need credentials for this user
+        # In a real app, you'd store refresh tokens securely and use them here
+        # For now, we'll return a message that they need to log in again
+        
+        return {
+            "status": "error", 
+            "message": "For security reasons, please log in again to refresh your YouTube data"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Error refreshing YouTube data: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error refreshing YouTube data: {str(e)}")
+
+class VideoOptimizationStatus(BaseModel):
+    is_optimized: bool
+
+@router.put("/{video_id}/optimization-status")
+async def update_video_optimization_status(video_id: str, status: VideoOptimizationStatus):
+    """Update the optimization status of a video."""
+    try:
+        conn = get_connection()
+        
+        with conn.cursor() as cursor:
+            # Update the is_optimized field for the video
+            cursor.execute("""
+                UPDATE youtube_videos
+                SET is_optimized = %s, updated_at = NOW()
+                WHERE video_id = %s
+                RETURNING id
+            """, (status.is_optimized, video_id))
+            
+            result = cursor.fetchone()
+            if not result:
+                raise HTTPException(status_code=404, detail="Video not found")
+            
+            conn.commit()
+        
+        conn.close()
+        
+        return {
+            "status": "success",
+            "message": f"Video optimization status updated to {status.is_optimized}",
+            "video_id": video_id
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Error updating video optimization status: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error updating video status: {str(e)}")
+
+@router.get("/optimized-videos/{user_id}")
+async def get_optimized_videos(user_id: int):
+    """Get all optimized videos for a user."""
+    try:
+        conn = get_connection()
+        
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT v.id, v.video_id, v.title, v.thumbnail_url_medium, 
+                       v.view_count, v.like_count, v.published_at
+                FROM youtube_videos v
+                JOIN youtube_channels c ON v.channel_id = c.id
+                WHERE c.user_id = %s AND v.is_optimized = TRUE
+                ORDER BY v.published_at DESC
+            """, (user_id,))
+            
+            videos_data = cursor.fetchall()
+            
+            videos = []
+            for video in videos_data:
+                videos.append({
+                    "id": video[0],
+                    "video_id": video[1],
+                    "title": video[2],
+                    "thumbnail": video[3],
+                    "view_count": video[4],
+                    "like_count": video[5],
+                    "published_at": video[6]
+                })
+        
+        conn.close()
+        
+        return {
+            "status": "success",
+            "data": {
+                "videos": videos,
+                "count": len(videos)
+            }
+        }
+        
+    except Exception as e:
+        logging.error(f"Error fetching optimized videos: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error fetching optimized videos: {str(e)}")
+
+class ComprehensiveOptimizationResponse(BaseModel):
+    original_title: str
+    optimized_title: str
+    original_description: str
+    optimized_description: str
+    original_tags: list[str] = []
+    optimized_tags: list[str] = []
+    optimization_notes: str
+
+@router.post("/{video_id}/optimize-all", response_model=ComprehensiveOptimizationResponse)
+async def optimize_video_comprehensive(video_id: str):
+    """Generate comprehensive optimizations (title, description, tags) for a video using Claude 3.7."""
+    try:
+        conn = get_connection()
+        
+        # Get video data including transcript
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT title, description, tags, transcript, has_captions
+                FROM youtube_videos
+                WHERE video_id = %s
+            """, (video_id,))
+            
+            video_data = cursor.fetchone()
+            if not video_data:
+                raise HTTPException(status_code=404, detail="Video not found")
+            
+            original_title = video_data[0]
+            original_description = video_data[1] or ""
+            original_tags = video_data[2] or []
+            stored_transcript = video_data[3]  # May be None
+            stored_has_captions = video_data[4] or False
+            
+            # Get the user's credentials to fetch the transcript if needed
+            user_id = None
+            try:
+                cursor.execute("""
+                    SELECT c.user_id
+                    FROM youtube_videos v
+                    JOIN youtube_channels c ON v.channel_id = c.id
+                    WHERE v.video_id = %s
+                """, (video_id,))
+                user_result = cursor.fetchone()
+                if user_result:
+                    user_id = user_result[0]
+            except Exception as e:
+                logging.warning(f"Error getting user_id for video {video_id}: {e}")
+            
+            transcript = stored_transcript
+            has_captions = stored_has_captions
+            
+            # If we don't have transcript stored, fetch on demand
+            if not transcript and user_id:
+                try:
+                    credentials = get_user_credentials(user_id)
+                    if credentials:
+                        from services.youtube import fetch_video_transcript
+                        transcript_data = fetch_video_transcript(credentials, video_id)
+                        transcript = transcript_data.get("transcript")
+                        has_captions = transcript_data.get("has_captions", False)
+                        logging.info(f"Fetched transcript on demand for video {video_id}")
+                except Exception as e:
+                    logging.error(f"Error fetching transcript on demand: {e}")
+            
+            transcript_length = len(transcript) if transcript else 0
+            logging.info(f"Video {video_id} has captions: {has_captions}, transcript length: {transcript_length}")
+        
+        conn.close()
+
+        # Call optimization pipeline
+        logging.info(f"Generating comprehensive optimization for video {video_id}")
+        result = get_comprehensive_optimization(
+            original_title=original_title,
+            original_description=original_description,
+            original_tags=original_tags,
+            transcript=transcript,
+            has_captions=has_captions
+        )
+
+        # Normalize LLM result
+        if isinstance(result, list):
+            if len(result) > 0 and isinstance(result[0], dict):
+                result = result[0]
+            else:
+                raise ValueError(f"Unexpected result format: {result}")
+        elif not isinstance(result, dict):
+            raise ValueError(f"Expected dict, got {type(result)}: {result}")
+
+        # Normalize output fields
+        normalized_result = {
+            "original_title": str(result.get("original_title", "")),
+            "optimized_title": str(result.get("optimized_title", "")),
+            "original_description": str(result.get("original_description", "")),
+            "optimized_description": str(result.get("optimized_description", "")),
+            "original_tags": [str(tag) for tag in result.get("original_tags", []) if tag],
+            "optimized_tags": [str(tag) for tag in result.get("optimized_tags", []) if tag],
+            "optimization_notes": str(result.get("optimization_notes", "")),
+        }
+
+        # Ensure valid list fields
+        normalized_result["original_tags"] = normalized_result["original_tags"] or []
+        normalized_result["optimized_tags"] = normalized_result["optimized_tags"] or []
+
+        # Persist results in DB
+        try:
+            update_conn = get_connection()
+            with update_conn.cursor() as update_cursor:
+                update_cursor.execute("""
+                    UPDATE youtube_videos
+                    SET transcript = COALESCE(%s, transcript),
+                        has_captions = %s,
+                        optimized_title = %s,
+                        optimized_description = %s,
+                        optimized_tags = %s
+                    WHERE video_id = %s
+                """, (
+                    transcript,
+                    has_captions,
+                    normalized_result["optimized_title"],
+                    normalized_result["optimized_description"],
+                    normalized_result["optimized_tags"],
+                    video_id
+                ))
+                update_conn.commit()
+                logging.info(f"Updated optimizations in DB for video {video_id}")
+
+        except Exception as store_e:
+            logging.error(f"Error storing optimization results: {store_e}")
+        finally:
+            update_conn.close()
+
+        return ComprehensiveOptimizationResponse(**normalized_result)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Error generating comprehensive optimization: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error optimizing video: {str(e)}")
