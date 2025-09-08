@@ -72,6 +72,22 @@ async def optimize_video(youtube_video_id: str, background_tasks: BackgroundTask
         video = get_video_data(youtube_video_id)
         if not video:
             raise HTTPException(status_code=404, detail="Video not found")
+        
+        # Get user_id from the video's channel
+        conn = get_connection()
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT c.user_id
+                FROM youtube_videos v
+                JOIN youtube_channels c ON v.channel_id = c.id
+                WHERE v.video_id = %s
+            """, (youtube_video_id,))
+            
+            user_result = cursor.fetchone()
+            if not user_result:
+                raise HTTPException(status_code=404, detail="Video channel not found")
+            
+            user_id = user_result[0]
             
         # Create a new optimization record for this request
         optimization_id = create_optimization(video["id"])
@@ -79,7 +95,7 @@ async def optimize_video(youtube_video_id: str, background_tasks: BackgroundTask
             raise HTTPException(status_code=500, detail="Failed to create optimization record")
             
         # Run the optimization in the background with the pre-created optimization ID
-        background_tasks.add_task(generate_video_optimization, video, optimization_id)
+        background_tasks.add_task(generate_video_optimization, video, user_id, optimization_id)
         
         # Return the job ID and status for tracking
         return {

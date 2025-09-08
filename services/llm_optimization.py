@@ -959,11 +959,23 @@ def get_comprehensive_optimization(
                     if isinstance(item, dict) and "query" in item:
                         query_text = item["query"]
                         value = item.get("value", 50)  # Get interest value or default to 50
+                        
+                        # Ensure value is an integer
+                        try:
+                            value = int(value) if value is not None else 50
+                        except (ValueError, TypeError):
+                            value = 50
 
                         # Add to results if not already in list or update score if higher
                         existing_item = next((k for k in extracted_keywords if k["query"] == query_text), None)
                         if existing_item:
-                            existing_item["interest_score"] = max(existing_item["interest_score"], value)
+                            # Ensure existing interest_score is also an integer
+                            existing_score = existing_item["interest_score"]
+                            try:
+                                existing_score = int(existing_score) if existing_score is not None else 0
+                            except (ValueError, TypeError):
+                                existing_score = 0
+                            existing_item["interest_score"] = max(existing_score, value)
                         else:
                             extracted_keywords.append({
                                 "query": query_text,

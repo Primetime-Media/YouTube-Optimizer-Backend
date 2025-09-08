@@ -33,7 +33,7 @@ load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_API_KEY = os.getenv("GOOGLE_API_KEY")
 
 class SceneTime(BaseModel):
     timestamp_seconds: float = Field(..., description="The timestamp in seconds (e.g., 123.45) into the video for the suggested thumbnail frame.")
@@ -1375,9 +1375,10 @@ def optimize_thumbnail_with_openai(
 
 
 # --- Sieve API related constants and functions ---
-SIEVE_API_KEY = os.getenv("SIEVE_API_KEY", "YOUR_SIEVE_API_KEY_HERE") # Replace with your key or set env var
-if SIEVE_API_KEY == "YOUR_SIEVE_API_KEY_HERE":
-    logging.error("SIEVE_API_KEY is not set in environment variables")
+SIEVE_API_KEY = os.getenv("SIEVE_API_KEY")
+ # Replace with your key or set env var
+# if SIEVE_API_KEY == "YOUR_SIEVE_API_KEY_HERE":
+#     logging.error("SIEVE_API_KEY is not set in environment variables")
 
 BASE_URL = "https://mango.sievedata.com/v2"
 PUSH_ENDPOINT = f"{BASE_URL}/push"

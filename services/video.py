@@ -205,7 +205,8 @@ def generate_video_optimization(
     update_optimization_progress(optimization_id, 25)
     
     try:
-        if True:
+        thumbnail_optimization_result = None
+        try:
             # TODO: PARALLELIZE THUMBNAIL OPTIMIZATION AND COMPREHENSIVE OPTIMIZATION
             thumbnail_optimization_result = do_thumbnail_optimization(
                 video_id=video.get("video_id"),
@@ -217,6 +218,9 @@ def generate_video_optimization(
                 category_name=category_name,
                 user_id=user_id
             )
+        except Exception as e:
+            logger.warning(f"Thumbnail optimization failed for video {video.get('video_id')}: {str(e)}")
+            thumbnail_optimization_result = None
 
         # Call the optimization function with all data
         result = get_comprehensive_optimization(
@@ -227,12 +231,12 @@ def generate_video_optimization(
             has_captions=has_captions,
             like_count=like_count,
             comment_count=comment_count,
-            optimization_decision_data=optimization_decision_data,
-            analytics_data=analytics_data,
-            competitor_analytics_data=competitor_analytics_data,
+            optimization_decision_data=optimization_decision_data or {},
+            analytics_data=analytics_data or {},
+            competitor_analytics_data=competitor_analytics_data or {},
             category_name=category_name,
             user_id=user_id,
-            prev_optimizations=prev_optimizations
+            prev_optimizations=prev_optimizations or []
         )
 
         if not result:
@@ -246,7 +250,7 @@ def generate_video_optimization(
             'original_tags': tags
         })
 
-        if thumbnail_optimization_result:
+        if thumbnail_optimization_result and isinstance(thumbnail_optimization_result, dict):
             best_optimization.update({"thumbnail_optimization_file": thumbnail_optimization_result.get("optimized_thumbnail", {}).get("optimized_thumbnail")})
 
         # Update progress - LLM processing complete
