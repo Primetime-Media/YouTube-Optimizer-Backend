@@ -825,6 +825,490 @@ def select_best_combined_optimizations(all_results: List[Dict], max_results: int
     scored_results.sort(key=lambda x: x['combined_score'], reverse=True)
     return scored_results[:max_results]
 
+def _extract_keywords_from_trend_data(trend_data: Dict) -> List[Dict]:
+    """Extract keywords from trending data with interest scores."""
+    try:
+        extracted_keywords = []
+        if not trend_data or not isinstance(trend_data, dict):
+            return []
+
+        # Extract from related_queries with scores
+        related_queries = trend_data.get("related_queries", {})
+        if related_queries and isinstance(related_queries, dict):
+            for keyword, queries_data in related_queries.items():
+                # Extract from top queries
+                top_queries = queries_data.get("top", [])
+                if isinstance(top_queries, list):
+                    for query_item in top_queries:
+                        if isinstance(query_item, dict) and "query" in query_item:
+                            query_text = query_item["query"]
+                            # Extract value if available (represents interest)
+                            value = query_item.get("value", 0)
+                            if isinstance(value, str):
+                                try:
+                                    value = int(value.replace("%", "").strip())
+                                except (ValueError, TypeError):
+                                    value = 50
+
+                            # Add to results if not already in list
+                            if not any(k["query"] == query_text for k in extracted_keywords):
+                                extracted_keywords.append({
+                                    "query": query_text,
+                                    "interest_score": value
+                                })
+
+                # Extract from rising queries (typically high interest)
+                rising_queries = queries_data.get("rising", [])
+                if isinstance(rising_queries, list):
+                    for query_item in rising_queries:
+                        if isinstance(query_item, dict) and "query" in query_item:
+                            query_text = query_item["query"]
+                            # Extract value - for rising queries this is often higher
+                            value = query_item.get("value", 0)
+                            if isinstance(value, str) and "+" in value:
+                                # Handle values like "+130%"
+                                try:
+                                    value = int(value.replace("%", "").replace("+", "").strip())
+                                    # Scale rising values to prioritize them (they show growth)
+                                    value = min(100, 75 + value // 5)  # Cap at 100, but prioritize rising terms
+                                except (ValueError, TypeError):
+                                    value = 80  # Default high value for rising queries
+
+                            # Add to results if not already in list or update score if higher
+                            existing_item = next((k for k in extracted_keywords if k["query"] == query_text), None)
+                            if existing_item:
+                                existing_item["interest_score"] = max(existing_item["interest_score"], value)
+                            else:
+                                extracted_keywords.append({
+                                    "query": query_text,
+                                    "interest_score": value
+                                })
+
+        # Extract from average interest data
+        avg_interest = trend_data.get("average_interest_by_query", [])
+        if isinstance(avg_interest, list):
+            for item in avg_interest:
+                if isinstance(item, dict) and "query" in item:
+                    query_text = item["query"]
+                    value = item.get("value", 50)  # Get interest value or default to 50
+                    
+                    # Ensure value is an integer
+                    try:
+                        value = int(value) if value is not None else 50
+                    except (ValueError, TypeError):
+                        value = 50
+
+                    # Add to results if not already in list or update score if higher
+                    existing_item = next((k for k in extracted_keywords if k["query"] == query_text), None)
+                    if existing_item:
+                        # Ensure existing interest_score is also an integer
+                        existing_score = existing_item["interest_score"]
+                        try:
+                            existing_score = int(existing_score) if existing_score is not None else 0
+                        except (ValueError, TypeError):
+                            existing_score = 0
+                        existing_item["interest_score"] = max(existing_score, value)
+                    else:
+                        extracted_keywords.append({
+                            "query": query_text,
+                            "interest_score": value
+                        })
+    except Exception as e:
+        logger.error(f"Error while extracting keywords from trend data: {e}")
+        extracted_keywords = []
+                
+    return extracted_keywords
+
+
+def _process_keywords_and_trends(
+    original_title: str,
+    original_description: str,
+    original_tags: Optional[List[str]],
+    transcript: str,
+    translated_title: str,
+    translated_description: str,
+    translated_transcript: str,
+    competitor_analytics_data: Dict,
+    category_name: str
+) -> Tuple[List[str], List[str], List[Dict]]:
+    """Process keywords and get trending data."""
+    # Extract video keywords from video data (use translated content for better keyword extraction)
+    video_keywords = extract_keywords_with_llm(
+        translated_title,
+        translated_description,
+        translated_transcript,
+        original_tags,
+        min_keywords=3,
+        max_keywords=5
+    )
+
+    # Get trending keywords based on the extracted keywords using SerpAPI/Google Trends
+    trending_data = get_trending_data_with_serpapi(
+        keywords=video_keywords,
+        max_keywords_per_batch=5,
+        timeframe="now 7-d",
+    )
+    
+    # Get complete competitor video keywords using SerpAPI/Google Trends
+    competitor_trending_data = get_trending_data_with_serpapi(
+        keywords=competitor_analytics_data.get('competitor_keywords', {}).get('keywords', []),
+        max_keywords_per_batch=5,
+        timeframe="now 7-d",
+    )
+    
+    # Extract keywords from both data sources
+    trending_keywords_data = _extract_keywords_from_trend_data(trending_data)
+    competitor_trending_keywords_data = _extract_keywords_from_trend_data(competitor_trending_data)
+
+    trending_keywords = [item["query"] for item in trending_keywords_data]
+    competitor_trending_keywords = [item["query"] for item in competitor_trending_keywords_data]
+    
+    logger.info(f"Extracted {len(trending_keywords)} trending keywords: {trending_keywords[:10]}")
+    logger.info(f"Extracted {len(competitor_trending_keywords)} competitor trending keywords: {competitor_trending_keywords[:10]}")
+
+    return trending_keywords, competitor_trending_keywords, trending_keywords_data + competitor_trending_keywords_data
+
+
+def _optimize_hashtags(
+    combined_trend_keywords_data: List[Dict],
+    original_title: str,
+    original_description: str,
+    original_tags: Optional[List[str]],
+    transcript: str,
+    category_name: str,
+    video_keywords: List[str],
+    trending_keywords: List[str],
+    competitor_analytics_data: Dict,
+    user_id: Optional[int]
+) -> List[str]:
+    """Process and select optimal hashtags."""
+    optimized_hashtags = []
+    try:
+        # Filter out generic keywords using LLM
+        if combined_trend_keywords_data:
+            video_data = {
+                "title": original_title,
+                "description": original_description,
+                "tags": original_tags,
+                "transcript": transcript,
+                "category_name": category_name,
+            }
+
+            keyword_strings = [item["query"] for item in combined_trend_keywords_data]
+            filtered_keyword_strings = filter_generic_keywords_with_llm(keywords=keyword_strings, video_data=video_data)
+            
+            # Only keep keyword data for non-generic keywords
+            combined_trend_keywords_data = [
+                item for item in combined_trend_keywords_data 
+                if item["query"] in filtered_keyword_strings
+            ]
+            logger.info(f"After generic keyword filtering: {len(combined_trend_keywords_data)} keywords remain")
+        
+        # Select hashtags using transparent scoring system for explainable decisions
+        hashtag_scoring_details = None
+        if False and combined_trend_keywords_data:
+            # Extract just the keywords for transparent scoring
+            all_trend_keywords = [item["query"] for item in combined_trend_keywords_data]
+            competitor_keywords = competitor_analytics_data.get('competitor_keywords', {}).get('keywords', [])
+            
+            # Use transparent scoring system
+            hashtag_selection = select_top_hashtags_with_scoring(
+                all_hashtags=all_trend_keywords,
+                video_keywords=video_keywords,
+                trending_keywords=trending_keywords,
+                competitor_keywords=competitor_keywords,
+                max_hashtags=10,
+                min_score=2.0
+            )
+            
+            optimized_hashtags = hashtag_selection["selected_hashtags"]
+            hashtag_scoring_details = hashtag_selection["scoring_details"]
+            
+            logger.info(f"Selected {len(optimized_hashtags)} hashtags using transparent scoring")
+            logger.info(f"Average score: {hashtag_selection['selection_criteria']['avg_score']}")
+            
+        elif user_id:
+            # Fallback to original method if transparent scoring fails
+            optimized_hashtags = select_final_hashtags(
+                trend_keywords_data=combined_trend_keywords_data,
+                user_id=user_id,
+                num_final_hashtags=10
+            )
+            logger.info(f"Selected {len(optimized_hashtags)} optimized hashtags using fallback method")
+        else:
+            if not combined_trend_keywords_data:
+                logger.warning("No trend keywords available for hashtag optimization")
+            if not user_id:
+                logger.warning("No user_id provided for hashtag optimization")
+    except Exception as e:
+        logger.error(f"Error during hashtag optimization: {e}")
+
+    return optimized_hashtags
+
+
+def _build_optimization_prompt(
+    original_title: str,
+    original_description: str,
+    tags_str: str,
+    translated_transcript: str,
+    original_language: str,
+    trending_keywords: List[str],
+    optimized_hashtags: List[str],
+    category_name: str,
+    like_count: int,
+    comment_count: int,
+    optimization_decision_data: Dict,
+    maintain_full_original_description: bool,
+    attempt: int
+) -> str:
+    """Build the optimization prompt."""
+    # Create sections to add to the prompt
+    trending_keywords_prompt_section = ""
+    if trending_keywords:
+        trending_keywords_str = ", ".join(trending_keywords)
+        trending_keywords_prompt_section = f"""
+        TRENDING KEYWORDS TO CONSIDER (based on video content and Google Trends):
+        {trending_keywords_str}
+        Incorporate these trending keywords naturally if they fit the content's core topic and optimization goals.
+        """
+        logger.info(f"Adding trending keywords to prompt: {trending_keywords_str}")
+    else:
+        logger.info("No trending keywords to add to prompt or Pytrends unavailable.")
+    
+    # Add optimized hashtags section if available
+    optimized_hashtags_prompt_section = ""
+    if optimized_hashtags:
+        # Format the hashtags with the # symbol for visibility
+        formatted_hashtags = [f"#{tag}" for tag in optimized_hashtags]
+        hashtags_str = ", ".join(formatted_hashtags)
+        optimized_hashtags_prompt_section = f"""
+        OPTIMIZED HASHTAGS (selected based on trend interest, relevance, and competition analysis):
+        {hashtags_str}
+
+        Consider these OPTIMIZED HASHTAGS when crafting the new TITLE, DESCRIPTION, and TAGS:
+        - TITLE: If natural and concise, consider incorporating 1-2 of the most impactful hashtags directly into the title.
+        - DESCRIPTION: Strategically weave relevant hashtags from this list into the description, especially in the first few lines and near relevant calls-to-action. Aim for 3-5 well-placed hashtags.
+        - TAGS: Ensure that the final list of video tags includes these optimized hashtags, as they are pre-vetted for performance.
+        These hashtags have been carefully selected. Prioritize their use where appropriate.
+        """
+        logger.info(f"Adding optimized hashtags to prompt: {hashtags_str}")
+
+    json_emphasis = ""
+    if attempt > 0:
+        json_emphasis = """
+        EXTREMELY IMPORTANT: Format your response as VALID JSON.
+        Do not include ANY control characters in strings that would break JSON parsing.
+        Make sure all quotes are properly escaped and all values are valid JSON.
+        """
+
+    # Format transcript for prompt inclusion (use translated version if available)
+    transcript_section = ""
+    if translated_transcript and len(translated_transcript) > 0:
+        if len(translated_transcript) > 2000:
+            transcript_text = translated_transcript[:1500] + "... [transcript truncated]"
+        else:
+            transcript_text = translated_transcript
+
+        transcript_section = f"""
+        VIDEO TRANSCRIPT:
+        {transcript_text}
+        """
+
+    # Language context for optimization
+    language_context = ""
+    if original_language != "en":
+        language_context = f"""
+        LANGUAGE CONTEXT:
+        - Original content language: {original_language}
+        - Content has been translated to English for optimization analysis
+        - Consider creating multilingual hashtags and metadata when appropriate
+        """
+
+    # NEW DESCRIPTION INSTRUCTIONS FOR OPTIMIZATION
+    if maintain_full_original_description:
+        description_instructions_section = f"""
+        For the DESCRIPTION:
+            - Write a keyword-rich 2-3 line description that captures the essence of the video.
+            - Do not include any hashtags, links, timestamps, or calls-to-action in the description.
+            - Avoid any placeholders - the description should be ready to publish as-is
+            - This MUST be purely a keyword-rich description of the video content.
+        """
+    else:
+        description_instructions_section = f"""
+        For the DESCRIPTION:
+            - Front-load important keywords and OPTIMIZED HASHTAGS in the first 2-3 sentences.
+            - Include a clear call-to-action (subscribe, like, comment)
+            - Add timestamps for longer videos (if applicable)
+            - Incorporate relevant OPTIMIZED HASHTAGS (3-5 is optimal) throughout the description, especially near related content or calls-to-action.
+            - Keep it engaging but concise
+            - EXTREMELY IMPORTANT: DO NOT include placeholder text like "[Link to Playlist]" or "[Social Media Links]" - ONLY include actual, real URLs that appear in the original description
+            - If you don't have actual URLs or links, do not mention them at all
+            - Avoid any placeholders - the description should be ready to publish as-is
+        """
+
+    prompt = f"""
+    I need comprehensive optimization for the following YouTube video:
+
+    ORIGINAL TITLE: {original_title}
+
+    ORIGINAL DESCRIPTION:
+    {original_description if original_description else "No description provided"}
+
+    ORIGINAL TAGS: {tags_str}
+    
+    {transcript_section}
+    
+    {language_context}
+    
+    {trending_keywords_prompt_section}
+    
+    {optimized_hashtags_prompt_section}
+
+    ADDITIONAL CONTEXT & GOALS:
+    - Video Category: {category_name if category_name else 'Unknown'}
+    - Current Likes: {like_count}
+    - Current Comments: {comment_count}
+    - Reason for Optimization: {optimization_decision_data.get('reasons', 'N/A') if optimization_decision_data else 'N/A'}
+
+    Use this context to inform your suggestions:
+    1.  Tailor keywords and tone to the VIDEO CATEGORY.
+    2.  Consider the CURRENT ENGAGEMENT metrics when crafting calls-to-action and assessing the need for change in the description.
+    3.  Directly address the REASON FOR OPTIMIZATION in your final 'optimization_notes', explaining how your suggestions tackle the identified issues.
+
+    Please provide optimized versions of the title, description, and tags, following these guidelines:
+
+    For the TITLE:
+    - Between 40-60 characters for optimal performance
+    - Include high-value keywords for searchability
+    - Create curiosity and emotional appeal 
+    - Maintain the original meaning and intent
+    - Use strategic capitalization, symbols, or emojis if appropriate
+    - Consider including 1-2 of the most relevant OPTIMIZED HASHTAGS if they fit naturally and enhance discoverability.
+
+    {description_instructions_section}
+
+    For the TAGS:
+    - Focus on trending tags that are relevant to the content.
+    - Crucially, ensure the provided OPTIMIZED HASHTAGS are included in your list of tags.
+    - Each tag should not contain any whitespace or punctuation; they should be single words or joined phrases (e.g., tag, thisisatag).
+    - Include exact and phrase match keywords.
+    - Focus on specific, niche tags rather than broad ones.
+    - Start with most important keywords.
+    - Include misspellings of important terms if relevant.
+    - 10-15 well-chosen tags is ideal (including the OPTIMIZED HASHTAGS).
+    
+    {json_emphasis}
+
+    Please provide THREE distinct optimization variations. Return your response as a JSON list containing three objects, each following this format. I5 MUST BE PARSEABLE BY PYTHON json.loads():
+    [
+      {{
+          "optimized_title": "Variation 1 optimized title here",
+          "optimized_description": "Variation 1 optimized description here",
+          "optimized_tags": ["v1_tag1", "v1_tag2", ...],
+          "optimization_notes": "Explanation for Variation 1 changes",
+          "optimization_score": <score between 0.0 and 1.0>
+      }},
+      {{
+          "optimized_title": "Variation 2 optimized title here",
+          "optimized_description": "Variation 2 optimized description here",
+          "optimized_tags": ["v2_tag1", "v2_tag2", ...],
+          "optimization_notes": "Explanation for Variation 2 changes",
+          "optimization_score": <score between 0.0 and 1.0>
+      }},
+      {{
+          "optimized_title": "Variation 3 optimized title here",
+          "optimized_description": "Variation 3 optimized description here",
+          "optimized_tags": ["v3_tag1", "v3_tag2", ...],
+          "optimization_notes": "Explanation for Variation 3 changes",
+          "optimization_score": <score between 0.0 and 1.0>
+      }}
+    ]
+
+    """
+
+    return prompt
+
+
+def _process_optimization_response(
+    generated_optimizations: Dict,
+    translated_transcript: str,
+    original_title: str,
+    original_description: str,
+    optimized_hashtags: List[str],
+    original_language: str,
+    category_name: str,
+    prev_optimizations: List[Dict]
+) -> List[Dict]:
+    """Process and enhance the optimization response."""
+    if not generated_optimizations.get('optimizations'):
+        return []
+
+    # Extract chapters from transcript for longer videos
+    extracted_chapters = []
+    if translated_transcript and len(translated_transcript) > 500:  # Only for substantial content
+        extracted_chapters = extract_chapters_from_transcript(
+            translated_transcript, 
+            original_title, 
+            max_chapters=6
+        )
+    
+    # Apply CTA preservation, chapter integration, and multilingual enhancements to each optimization variation
+    optimizations = generated_optimizations['optimizations']
+    for optimization in optimizations:
+        # Apply CTA preservation
+        if 'optimized_description' in optimization:
+            # Remove all hashtags from original description
+            original_description_no_hashtags = remove_hashtags_from_description(original_description)
+
+            # Add 5 top hashtags to the top of the description
+            if optimized_hashtags:
+                formatted_top_hashtags = [f"#{tag}" for tag in optimized_hashtags][:5]
+                top_hashtags_str = " ".join(formatted_top_hashtags)
+
+                formatted_bottom_hashtags = [f"#{tag}" for tag in optimized_hashtags][5:7]
+                bottom_hashtags_str = " ".join(formatted_bottom_hashtags)
+                language_hashtag = f"#idioma: {original_language}"
+
+                bottom_line = f"{bottom_hashtags_str} {language_hashtag}"
+
+                if len(prev_optimizations) == 0:
+                    new_description = f"""{top_hashtags_str}\n\n{optimization['optimized_description']}\n\n{original_description_no_hashtags}\n\n{bottom_line}"""
+                else: # Only add the hashtags lines if this is not the first optimization
+                    new_description = f"""{top_hashtags_str}\n\n{original_description_no_hashtags}\n\n{bottom_line}"""
+
+                optimization['optimized_description'] = new_description
+
+            # Add chapters if extracted
+            if False and extracted_chapters:
+                chapters_formatted = format_chapters_for_description(extracted_chapters)
+                optimization['optimized_description'] = f"{optimization['optimized_description']}\n\n{chapters_formatted}"
+            
+            # Add language metadata if non-English (done earlier)
+            if False and original_language != "en":
+                optimization['optimized_description'] = add_language_metadata(
+                    optimization['optimized_description'], 
+                    original_language
+                )
+        
+        # Create multilingual hashtags if needed
+        if original_language != "en" and 'optimized_tags' in optimization:
+            english_tags = optimization['optimized_tags']
+            video_context = f"{original_title} - {category_name if category_name else 'Video'}"
+            
+            multilingual_tags = create_multilingual_hashtags(
+                english_tags, 
+                original_language, 
+                video_context
+            )
+            optimization['optimized_tags'] = multilingual_tags
+            
+            # Add language info to optimization notes
+            if 'optimization_notes' in optimization:
+                optimization['optimization_notes'] += f"\n\nLanguage: Enhanced for {original_language} audience with multilingual hashtags."
+
+    return optimizations
+
+
 def get_comprehensive_optimization(
     original_title: str,
     original_description: str = "",
@@ -900,233 +1384,22 @@ def get_comprehensive_optimization(
                 translated_description = desc_translation["translated_text"]
 
     tags_str = ", ".join(original_tags) if original_tags else "No tags available"
-
     retry_errors = []
 
-    # Extract video keywords from video data (use translated content for better keyword extraction)
-    video_keywords = extract_keywords_with_llm(
-        translated_title,
-        translated_description,
-        translated_transcript,
-        original_tags,
-        min_keywords=3,
-        max_keywords=5
+    # Process keywords and get trending data
+    trending_keywords, competitor_trending_keywords, combined_trend_keywords_data = _process_keywords_and_trends(
+        original_title, original_description, original_tags, transcript,
+        translated_title, translated_description, translated_transcript,
+        competitor_analytics_data, category_name
     )
 
-    # Get trending keywords based on the extracted keywords using SerpAPI/Google Trends
-    trending_data = get_trending_data_with_serpapi(
-        keywords=video_keywords,
-        max_keywords_per_batch=5,
-        timeframe="now 7-d",
+    # Optimize hashtags
+    optimized_hashtags = _optimize_hashtags(
+        combined_trend_keywords_data, original_title, original_description,
+        original_tags, transcript, category_name, trending_keywords,
+        trending_keywords, competitor_analytics_data, user_id
     )
-    
-    # Get complete competitor video keywords using SerpAPI/Google Trends
-    competitor_trending_data = get_trending_data_with_serpapi(
-        keywords=competitor_analytics_data.get('competitor_keywords', {}).get('keywords', []),
-        max_keywords_per_batch=5,
-        timeframe="now 7-d",
-    )
-    
-    # Function to extract keywords from trending data
-    def extract_keywords_from_trend_data(trend_data):
-        try:
-            extracted_keywords = []
-            if not trend_data or not isinstance(trend_data, dict):
-                return []
 
-            # Extract from related_queries with scores
-            related_queries = trend_data.get("related_queries", {})
-            if related_queries and isinstance(related_queries, dict):
-                for keyword, queries_data in related_queries.items():
-                    # Extract from top queries
-                    top_queries = queries_data.get("top", [])
-                    if isinstance(top_queries, list):
-                        for query_item in top_queries:
-                            if isinstance(query_item, dict) and "query" in query_item:
-                                query_text = query_item["query"]
-                                # Extract value if available (represents interest)
-                                value = query_item.get("value", 0)
-                                if isinstance(value, str):
-                                    try:
-                                        value = int(value.replace("%", "").strip())
-                                    except (ValueError, TypeError):
-                                        value = 50
-
-                                # Add to results if not already in list
-                                if not any(k["query"] == query_text for k in extracted_keywords):
-                                    extracted_keywords.append({
-                                        "query": query_text,
-                                        "interest_score": value
-                                    })
-
-                    # Extract from rising queries (typically high interest)
-                    rising_queries = queries_data.get("rising", [])
-                    if isinstance(rising_queries, list):
-                        for query_item in rising_queries:
-                            if isinstance(query_item, dict) and "query" in query_item:
-                                query_text = query_item["query"]
-                                # Extract value - for rising queries this is often higher
-                                value = query_item.get("value", 0)
-                                if isinstance(value, str) and "+" in value:
-                                    # Handle values like "+130%"
-                                    try:
-                                        value = int(value.replace("%", "").replace("+", "").strip())
-                                        # Scale rising values to prioritize them (they show growth)
-                                        value = min(100, 75 + value // 5)  # Cap at 100, but prioritize rising terms
-                                    except (ValueError, TypeError):
-                                        value = 80  # Default high value for rising queries
-
-                                # Add to results if not already in list or update score if higher
-                                existing_item = next((k for k in extracted_keywords if k["query"] == query_text), None)
-                                if existing_item:
-                                    existing_item["interest_score"] = max(existing_item["interest_score"], value)
-                                else:
-                                    extracted_keywords.append({
-                                        "query": query_text,
-                                        "interest_score": value
-                                    })
-
-        
-            # Extract from average interest data
-            avg_interest = trend_data.get("average_interest_by_query", [])
-            if isinstance(avg_interest, list):
-                for item in avg_interest:
-                    if isinstance(item, dict) and "query" in item:
-                        query_text = item["query"]
-                        value = item.get("value", 50)  # Get interest value or default to 50
-                        
-                        # Ensure value is an integer
-                        try:
-                            value = int(value) if value is not None else 50
-                        except (ValueError, TypeError):
-                            value = 50
-
-                        # Add to results if not already in list or update score if higher
-                        existing_item = next((k for k in extracted_keywords if k["query"] == query_text), None)
-                        if existing_item:
-                            # Ensure existing interest_score is also an integer
-                            existing_score = existing_item["interest_score"]
-                            try:
-                                existing_score = int(existing_score) if existing_score is not None else 0
-                            except (ValueError, TypeError):
-                                existing_score = 0
-                            existing_item["interest_score"] = max(existing_score, value)
-                        else:
-                            extracted_keywords.append({
-                                "query": query_text,
-                                "interest_score": value
-                            })
-        except Exception as e:
-            logger.error(f"Error while extracting keywords from trend data: {e}")
-            extracted_keywords = []
-                    
-        return extracted_keywords
-    
-    # Extract keywords from both data sources
-    trending_keywords_data = extract_keywords_from_trend_data(trending_data)
-    competitor_trending_keywords_data = extract_keywords_from_trend_data(competitor_trending_data)
-
-    trending_keywords = [item["query"] for item in trending_keywords_data]
-    competitor_trending_keywords = [item["query"] for item in competitor_trending_keywords_data]
-    
-    logger.info(f"Extracted {len(trending_keywords)} trending keywords: {trending_keywords[:10]}")
-    logger.info(f"Extracted {len(competitor_trending_keywords)} competitor trending keywords: {competitor_trending_keywords[:10]}")
-
-    # Process and select optimal hashtags from hero keywords (video) and trend keywords (combined)
-    optimized_hashtags = []
-    try:
-        combined_trend_keywords_data = trending_keywords_data + competitor_trending_keywords_data
-        
-        # Filter out generic keywords using LLM
-        if combined_trend_keywords_data:
-            video_data = {
-                "title": original_title,
-                "description": original_description,
-                "tags": original_tags,
-                "transcript": transcript,
-                "category_name": category_name,
-            }
-
-            keyword_strings = [item["query"] for item in combined_trend_keywords_data]
-            filtered_keyword_strings = filter_generic_keywords_with_llm(keywords=keyword_strings, video_data=video_data)
-            
-            # Only keep keyword data for non-generic keywords
-            combined_trend_keywords_data = [
-                item for item in combined_trend_keywords_data 
-                if item["query"] in filtered_keyword_strings
-            ]
-            logger.info(f"After generic keyword filtering: {len(combined_trend_keywords_data)} keywords remain")
-        
-        # Select hashtags using transparent scoring system for explainable decisions
-        hashtag_scoring_details = None
-        if False and combined_trend_keywords_data:
-            # Extract just the keywords for transparent scoring
-            all_trend_keywords = [item["query"] for item in combined_trend_keywords_data]
-            competitor_keywords = competitor_analytics_data.get('competitor_keywords', {}).get('keywords', [])
-            
-            # Use transparent scoring system
-            hashtag_selection = select_top_hashtags_with_scoring(
-                all_hashtags=all_trend_keywords,
-                video_keywords=video_keywords,
-                trending_keywords=trending_keywords,
-                competitor_keywords=competitor_keywords,
-                max_hashtags=10,
-                min_score=2.0
-            )
-            
-            optimized_hashtags = hashtag_selection["selected_hashtags"]
-            hashtag_scoring_details = hashtag_selection["scoring_details"]
-            
-            logger.info(f"Selected {len(optimized_hashtags)} hashtags using transparent scoring")
-            logger.info(f"Average score: {hashtag_selection['selection_criteria']['avg_score']}")
-            
-        elif user_id:
-            # Fallback to original method if transparent scoring fails
-            optimized_hashtags = select_final_hashtags(
-                trend_keywords_data=combined_trend_keywords_data,
-                user_id=user_id,
-                num_final_hashtags=10
-            )
-            logger.info(f"Selected {len(optimized_hashtags)} optimized hashtags using fallback method")
-        else:
-            if not combined_trend_keywords_data:
-                logger.warning("No trend keywords available for hashtag optimization")
-            if not user_id:
-                logger.warning("No user_id provided for hashtag optimization")
-    except Exception as e:
-        logger.error(f"Error during hashtag optimization: {e}")
-
-    # Create sections to add to the prompt
-    trending_keywords_prompt_section = ""
-    if trending_keywords:
-        trending_keywords_str = ", ".join(trending_keywords)
-        trending_keywords_prompt_section = f"""
-        TRENDING KEYWORDS TO CONSIDER (based on video content and Google Trends):
-        {trending_keywords_str}
-        Incorporate these trending keywords naturally if they fit the content's core topic and optimization goals.
-        """
-        logger.info(f"Adding trending keywords to prompt: {trending_keywords_str}")
-    else:
-        logger.info("No trending keywords to add to prompt or Pytrends unavailable.")
-    
-    # Add optimized hashtags section if available
-    optimized_hashtags_prompt_section = ""
-    if optimized_hashtags:
-        # Format the hashtags with the # symbol for visibility
-        formatted_hashtags = [f"#{tag}" for tag in optimized_hashtags]
-        hashtags_str = ", ".join(formatted_hashtags)
-        optimized_hashtags_prompt_section = f"""
-        OPTIMIZED HASHTAGS (selected based on trend interest, relevance, and competition analysis):
-        {hashtags_str}
-
-        Consider these OPTIMIZED HASHTAGS when crafting the new TITLE, DESCRIPTION, and TAGS:
-        - TITLE: If natural and concise, consider incorporating 1-2 of the most impactful hashtags directly into the title.
-        - DESCRIPTION: Strategically weave relevant hashtags from this list into the description, especially in the first few lines and near relevant calls-to-action. Aim for 3-5 well-placed hashtags.
-        - TAGS: Ensure that the final list of video tags includes these optimized hashtags, as they are pre-vetted for performance.
-        These hashtags have been carefully selected. Prioritize their use where appropriate.
-        """
-        logger.info(f"Adding optimized hashtags to prompt: {hashtags_str}")
-    
     # Try multiple times with slightly different prompts
     for attempt in range(max_retries):
         try:
@@ -1141,138 +1414,13 @@ def get_comprehensive_optimization(
             
             IMPORTANT: Your response MUST be valid JSON with properly escaped characters."""
 
-            json_emphasis = ""
-            if attempt > 0:
-                json_emphasis = """
-                EXTREMELY IMPORTANT: Format your response as VALID JSON.
-                Do not include ANY control characters in strings that would break JSON parsing.
-                Make sure all quotes are properly escaped and all values are valid JSON.
-                """
-
-            # Format transcript for prompt inclusion (use translated version if available)
-            transcript_section = ""
-            if translated_transcript and len(translated_transcript) > 0:
-                if len(translated_transcript) > 2000:
-                    transcript_text = translated_transcript[:1500] + "... [transcript truncated]"
-                else:
-                    transcript_text = translated_transcript
-
-                transcript_section = f"""
-                VIDEO TRANSCRIPT:
-                {transcript_text}
-                """
-
-            # Language context for optimization
-            language_context = ""
-            if original_language != "en":
-                language_context = f"""
-                LANGUAGE CONTEXT:
-                - Original content language: {original_language}
-                - Content has been translated to English for optimization analysis
-                - Consider creating multilingual hashtags and metadata when appropriate
-                """
-
-            # NEW DESCRIPTION INSTRUCTIONS FOR OPTIMIZATION
-            if maintain_full_original_description:
-                description_instructions_section = f"""
-                For the DESCRIPTION:
-                    - Write a keyword-rich 2-3 line description that captures the essence of the video.
-                    - Do not include any hashtags, links, timestamps, or calls-to-action in the description.
-                    - Avoid any placeholders - the description should be ready to publish as-is
-                    - This MUST be purely a keyword-rich description of the video content.
-                """
-            else:
-                description_instructions_section = f"""
-                For the DESCRIPTION:
-                    - Front-load important keywords and OPTIMIZED HASHTAGS in the first 2-3 sentences.
-                    - Include a clear call-to-action (subscribe, like, comment)
-                    - Add timestamps for longer videos (if applicable)
-                    - Incorporate relevant OPTIMIZED HASHTAGS (3-5 is optimal) throughout the description, especially near related content or calls-to-action.
-                    - Keep it engaging but concise
-                    - EXTREMELY IMPORTANT: DO NOT include placeholder text like "[Link to Playlist]" or "[Social Media Links]" - ONLY include actual, real URLs that appear in the original description
-                    - If you don't have actual URLs or links, do not mention them at all
-                    - Avoid any placeholders - the description should be ready to publish as-is
-                """
-
-            prompt = f"""
-            I need comprehensive optimization for the following YouTube video:
-
-            ORIGINAL TITLE: {original_title}
-
-            ORIGINAL DESCRIPTION:
-            {original_description if original_description else "No description provided"}
-
-            ORIGINAL TAGS: {tags_str}
-            
-            {transcript_section}
-            
-            {language_context}
-            
-            {trending_keywords_prompt_section}
-            
-            {optimized_hashtags_prompt_section}
-
-            ADDITIONAL CONTEXT & GOALS:
-            - Video Category: {category_name if category_name else 'Unknown'}
-            - Current Likes: {like_count}
-            - Current Comments: {comment_count}
-            - Reason for Optimization: {optimization_decision_data.get('reasons', 'N/A') if optimization_decision_data else 'N/A'}
-
-            Use this context to inform your suggestions:
-            1.  Tailor keywords and tone to the VIDEO CATEGORY.
-            2.  Consider the CURRENT ENGAGEMENT metrics when crafting calls-to-action and assessing the need for change in the description.
-            3.  Directly address the REASON FOR OPTIMIZATION in your final 'optimization_notes', explaining how your suggestions tackle the identified issues.
-
-            Please provide optimized versions of the title, description, and tags, following these guidelines:
-
-            For the TITLE:
-            - Between 40-60 characters for optimal performance
-            - Include high-value keywords for searchability
-            - Create curiosity and emotional appeal 
-            - Maintain the original meaning and intent
-            - Use strategic capitalization, symbols, or emojis if appropriate
-            - Consider including 1-2 of the most relevant OPTIMIZED HASHTAGS if they fit naturally and enhance discoverability.
-
-            {description_instructions_section}
-
-            For the TAGS:
-            - Focus on trending tags that are relevant to the content.
-            - Crucially, ensure the provided OPTIMIZED HASHTAGS are included in your list of tags.
-            - Each tag should not contain any whitespace or punctuation; they should be single words or joined phrases (e.g., tag, thisisatag).
-            - Include exact and phrase match keywords.
-            - Focus on specific, niche tags rather than broad ones.
-            - Start with most important keywords.
-            - Include misspellings of important terms if relevant.
-            - 10-15 well-chosen tags is ideal (including the OPTIMIZED HASHTAGS).
-            
-            {json_emphasis}
-
-            Please provide THREE distinct optimization variations. Return your response as a JSON list containing three objects, each following this format. I5 MUST BE PARSEABLE BY PYTHON json.loads():
-            [
-              {{
-                  "optimized_title": "Variation 1 optimized title here",
-                  "optimized_description": "Variation 1 optimized description here",
-                  "optimized_tags": ["v1_tag1", "v1_tag2", ...],
-                  "optimization_notes": "Explanation for Variation 1 changes",
-                  "optimization_score": <score between 0.0 and 1.0>
-              }},
-              {{
-                  "optimized_title": "Variation 2 optimized title here",
-                  "optimized_description": "Variation 2 optimized description here",
-                  "optimized_tags": ["v2_tag1", "v2_tag2", ...],
-                  "optimization_notes": "Explanation for Variation 2 changes",
-                  "optimization_score": <score between 0.0 and 1.0>
-              }},
-              {{
-                  "optimized_title": "Variation 3 optimized title here",
-                  "optimized_description": "Variation 3 optimized description here",
-                  "optimized_tags": ["v3_tag1", "v3_tag2", ...],
-                  "optimization_notes": "Explanation for Variation 3 changes",
-                  "optimization_score": <score between 0.0 and 1.0>
-              }}
-            ]
-
-            """
+            # Build the optimization prompt
+            prompt = _build_optimization_prompt(
+                original_title, original_description, tags_str, translated_transcript,
+                original_language, trending_keywords, optimized_hashtags, category_name,
+                like_count, comment_count, optimization_decision_data,
+                maintain_full_original_description, attempt
+            )
 
             tools = [
                 {
@@ -1337,75 +1485,13 @@ def get_comprehensive_optimization(
             for content in response.content:
                 if content.type == "tool_use" and content.name == "provide_comprehensive_video_optimizations":
                     generated_optimizations = content.input
-                    if generated_optimizations.get('optimizations'):
-                        # Extract chapters from transcript for longer videos
-                        extracted_chapters = []
-                        if translated_transcript and len(translated_transcript) > 500:  # Only for substantial content
-                            extracted_chapters = extract_chapters_from_transcript(
-                                translated_transcript, 
-                                original_title, 
-                                max_chapters=6
-                            )
-                        
-                        # Apply CTA preservation, chapter integration, and multilingual enhancements to each optimization variation
-                        optimizations = generated_optimizations['optimizations']
-                        for optimization in optimizations:
-                            # Apply CTA preservation
-                            if 'optimized_description' in optimization:
-                                #optimization['optimized_description'] = preserve_ctas_in_optimization(
-                                 #   original_description,
-                                  #  optimization['optimized_description']
-                                #)
-
-                                # Remove all hashtags from original description
-                                original_description_no_hashtags = remove_hashtags_from_description(original_description)
-
-                                # Add 5 top hashtags to the top of the description
-                                if optimized_hashtags:
-                                    formatted_top_hashtags = [f"#{tag}" for tag in optimized_hashtags][:5]
-                                    top_hashtags_str = " ".join(formatted_top_hashtags)
-
-                                    formatted_bottom_hashtags = [f"#{tag}" for tag in optimized_hashtags][5:7]
-                                    bottom_hashtags_str = " ".join(formatted_bottom_hashtags)
-                                    language_hashtag = f"#idioma: {original_language}"
-
-                                    bottom_line = f"{bottom_hashtags_str} {language_hashtag}"
-
-                                    if len(prev_optimizations) == 0:
-                                        new_description = f"""{top_hashtags_str}\n\n{optimization['optimized_description']}\n\n{original_description_no_hashtags}\n\n{bottom_line}"""
-                                    else: # Only add the hashtags lines if this is not the first optimization
-                                        new_description = f"""{top_hashtags_str}\n\n{original_description_no_hashtags}\n\n{bottom_line}"""
-
-                                    optimization['optimized_description'] = new_description
-
-                                # Add chapters if extracted
-                                if False and extracted_chapters:
-                                    chapters_formatted = format_chapters_for_description(extracted_chapters)
-                                    optimization['optimized_description'] = f"{optimization['optimized_description']}\n\n{chapters_formatted}"
-                                
-                                # Add language metadata if non-English (done earlier)
-                                if False and original_language != "en":
-                                    optimization['optimized_description'] = add_language_metadata(
-                                        optimization['optimized_description'], 
-                                        original_language
-                                    )
-                            
-                            # Create multilingual hashtags if needed
-                            if original_language != "en" and 'optimized_tags' in optimization:
-                                english_tags = optimization['optimized_tags']
-                                video_context = f"{original_title} - {category_name if category_name else 'Video'}"
-                                
-                                multilingual_tags = create_multilingual_hashtags(
-                                    english_tags, 
-                                    original_language, 
-                                    video_context
-                                )
-                                optimization['optimized_tags'] = multilingual_tags
-                                
-                                # Add language info to optimization notes
-                                if 'optimization_notes' in optimization:
-                                    optimization['optimization_notes'] += f"\n\nLanguage: Enhanced for {original_language} audience with multilingual hashtags."
-                        
+                    if generated_optimizations:
+                        # Process and enhance the optimization response
+                        optimizations = _process_optimization_response(
+                            generated_optimizations, translated_transcript, original_title,
+                            original_description, optimized_hashtags, original_language,
+                            category_name, prev_optimizations
+                        )
                         return optimizations
 
         except Exception as e:
