@@ -1803,47 +1803,98 @@ def format_analytics_response(response: Dict, metrics: List[str], dimensions: Li
     Returns:
         dict: Formatted analytics data
     """
-    # Initialize the result
-    result = {
-        'data': [],
-        'totals': {}
-    }
-    
-    # Process column headers
-    column_headers = response.get('columnHeaders', [])
-    header_names = [header['name'] for header in column_headers]
-    
-    # Extract total values (usually provided for all metrics)
-    if 'rows' in response and len(response['rows']) > 0:
-        # For responses with dimension rows
-        data_rows = response.get('rows', [])
+    try:
+        if not response or not isinstance(response, dict):
+            logger.warning("Invalid response provided to format_analytics_response")
+            return {'data': [], 'totals': {}}
         
-        # Process each row of data
-        for row in data_rows:
-            row_data = {}
-            
-            # Map each value to its header
-            for i, value in enumerate(row):
-                header = header_names[i]
-                row_data[header] = value
-            
-            result['data'].append(row_data)
+        # Initialize the result
+        result = {
+            'data': [],
+            'totals': {}
+        }
         
-    # Extract totals from the response
-    if 'totals' in response and len(response['totals']) > 0:
-        total_row = response['totals'][0]
+        # Process column headers
+        column_headers = response.get('columnHeaders', [])
+        if not column_headers:
+            logger.warning("No column headers found in response")
+            return result
+            
+        header_names = []
+        for header in column_headers:
+            try:
+                if isinstance(header, dict) and 'name' in header:
+                    header_names.append(header['name'])
+                else:
+                    logger.warning(f"Invalid header format: {header}")
+                    header_names.append(f"unknown_{len(header_names)}")
+            except Exception as e:
+                logger.warning(f"Error processing header {header}: {e}")
+                header_names.append(f"unknown_{len(header_names)}")
         
-        # Map total values to their metric names
-        for i, total in enumerate(total_row):
-            metric_name = header_names[i]
+        # Extract total values (usually provided for all metrics)
+        if 'rows' in response and len(response['rows']) > 0:
+            # For responses with dimension rows
+            data_rows = response.get('rows', [])
             
-            # Skip dimension columns in totals
-            if dimensions and i < len(dimensions):
-                continue
+            # Process each row of data
+            for row_idx, row in enumerate(data_rows):
+                try:
+                    if not isinstance(row, (list, tuple)):
+                        logger.warning(f"Invalid row format at index {row_idx}: {row}")
+                        continue
+                        
+                    row_data = {}
+                    
+                    # Map each value to its header
+                    for i, value in enumerate(row):
+                        try:
+                            if i < len(header_names):
+                                header = header_names[i]
+                                row_data[header] = value
+                            else:
+                                logger.warning(f"Row {row_idx} has more values than headers")
+                                break
+                        except Exception as e:
+                            logger.warning(f"Error processing value {value} at index {i} in row {row_idx}: {e}")
+                            continue
+                    
+                    result['data'].append(row_data)
+                except Exception as e:
+                    logger.warning(f"Error processing row {row_idx}: {e}")
+                    continue
             
-            result['totals'][metric_name] = total
-    
-    return result
+        # Extract totals from the response
+        if 'totals' in response and len(response['totals']) > 0:
+            try:
+                total_row = response['totals'][0]
+                
+                # Map total values to their metric names
+                for i, total in enumerate(total_row):
+                    try:
+                        if i < len(header_names):
+                            metric_name = header_names[i]
+                            
+                            # Skip dimension columns in totals
+                            if dimensions and i < len(dimensions):
+                                continue
+                            
+                            result['totals'][metric_name] = total
+                        else:
+                            logger.warning(f"Total row has more values than headers")
+                            break
+                    except Exception as e:
+                        logger.warning(f"Error processing total value {total} at index {i}: {e}")
+                        continue
+            except Exception as e:
+                logger.warning(f"Error processing totals: {e}")
+        
+        logger.info(f"Successfully formatted analytics response with {len(result['data'])} data points")
+        return result
+        
+    except Exception as e:
+        logger.error(f"Error formatting analytics response: {e}")
+        return {'data': [], 'totals': {}}
 
 def fetch_channel_analytics(credentials, metrics: List[str], dimensions: List[str] = None, 
                            start_date: str = None, end_date: str = None) -> Dict[str, Any]:
@@ -2157,81 +2208,136 @@ def process_timeseries_data(rows, video_id: str, interval: str):
     """
     Process timeseries data rows from database into formatted response
     """
-    result_data = []
-    aggregated_data = {}
-    
-    for row in rows:
-        timestamp, views, minutes_watched, view_percentage = row
-        
-        # Create a day-based aggregation key
-        agg_key = timestamp.replace(hour=0, minute=0, second=0, microsecond=0)
-        
-        # Initialize or update the aggregation entry
-        if agg_key not in aggregated_data:
-            aggregated_data[agg_key] = {
-                'timestamp': agg_key.strftime('%Y-%m-%d %H:%M:%S'),
-                'date': agg_key.strftime('%Y-%m-%d'),  # Add date for easier frontend usage
-                'views': 0,
-                'minutes_watched': 0,
-                'view_percentage': 0,
-                'count': 0
+    try:
+        if not rows or not isinstance(rows, (list, tuple)):
+            logger.warning(f"No valid timeseries data provided for video {video_id}")
+            return {
+                'video_id': video_id,
+                'interval': interval,
+                'timeseries_data': [],
+                'time_range': {'start_timestamp': None, 'end_timestamp': None},
+                'summary': {
+                    'total_views': 0,
+                    'views_per_day': 0,
+                    'views_per_hour': 0,
+                    'views_per_minute': 0,
+                    'data_points': 0
+                }
             }
         
-        # Add to the aggregation values
-        aggregated_data[agg_key]['views'] += views
-        aggregated_data[agg_key]['minutes_watched'] += minutes_watched or 0
-        aggregated_data[agg_key]['view_percentage'] += view_percentage or 0
-        aggregated_data[agg_key]['count'] += 1
-    
-    # Calculate averages for the aggregated data
-    for agg_key, data in aggregated_data.items():
-        if data['count'] > 0:
-            data['view_percentage'] /= data['count']
-            data['minutes_watched'] /= data['count']
-        del data['count']  # Remove the count field
-        result_data.append(data)
-    
-    # Sort by timestamp
-    result_data.sort(key=lambda x: x['timestamp'])
-    
-    # Calculate summary metrics
-    total_views = sum(point.get('views', 0) for point in result_data)
-    total_datapoints = len(result_data)
-    
-    # Calculate the time range
-    if result_data:
-        start_timestamp = result_data[0]['timestamp']
-        end_timestamp = result_data[-1]['timestamp']
-    else:
-        start_timestamp = None
-        end_timestamp = None
-    
-    # For daily data, calculate daily, hourly, and per-minute rates
-    if total_datapoints > 0:
-        views_per_day = total_views / total_datapoints
-        views_per_hour = views_per_day / 24
-        views_per_minute = views_per_hour / 60
-    else:
-        views_per_day = 0
-        views_per_hour = 0
-        views_per_minute = 0
-    
-    return {
-        'video_id': video_id,
-        'interval': interval,
-        'timeseries_data': result_data,
-        'time_range': {
-            'start_timestamp': start_timestamp,
-            'end_timestamp': end_timestamp
-        },
-        'summary': {
-            'total_views': total_views,
-            'views_per_day': views_per_day,
-            'views_per_hour': views_per_hour,
-            'views_per_minute': views_per_minute,
-            'data_points': total_datapoints
+        result_data = []
+        aggregated_data = {}
+        
+        for row in rows:
+            try:
+                if not row or len(row) < 4:
+                    logger.warning(f"Invalid row data: {row}")
+                    continue
+                    
+                timestamp, views, minutes_watched, view_percentage = row
+                
+                # Validate timestamp
+                if not hasattr(timestamp, 'replace'):
+                    logger.warning(f"Invalid timestamp in row: {timestamp}")
+                    continue
+                
+                # Create a day-based aggregation key
+                agg_key = timestamp.replace(hour=0, minute=0, second=0, microsecond=0)
+                
+                # Initialize or update the aggregation entry
+                if agg_key not in aggregated_data:
+                    aggregated_data[agg_key] = {
+                        'timestamp': agg_key.strftime('%Y-%m-%d %H:%M:%S'),
+                        'date': agg_key.strftime('%Y-%m-%d'),  # Add date for easier frontend usage
+                        'views': 0,
+                        'minutes_watched': 0,
+                        'view_percentage': 0,
+                        'count': 0
+                    }
+                
+                # Add to the aggregation values with safe type conversion
+                aggregated_data[agg_key]['views'] += int(views) if views is not None else 0
+                aggregated_data[agg_key]['minutes_watched'] += float(minutes_watched) if minutes_watched is not None else 0
+                aggregated_data[agg_key]['view_percentage'] += float(view_percentage) if view_percentage is not None else 0
+                aggregated_data[agg_key]['count'] += 1
+                
+            except (ValueError, TypeError, AttributeError) as e:
+                logger.warning(f"Error processing row {row}: {e}")
+                continue
+            except Exception as e:
+                logger.warning(f"Unexpected error processing row {row}: {e}")
+                continue
+        
+        # Calculate averages for the aggregated data
+        for agg_key, data in aggregated_data.items():
+            try:
+                if data['count'] > 0:
+                    data['view_percentage'] /= data['count']
+                    data['minutes_watched'] /= data['count']
+                del data['count']  # Remove the count field
+                result_data.append(data)
+            except Exception as e:
+                logger.warning(f"Error processing aggregated data for {agg_key}: {e}")
+                continue
+        
+        # Sort by timestamp
+        result_data.sort(key=lambda x: x['timestamp'])
+        
+        # Calculate summary metrics
+        total_views = sum(point.get('views', 0) for point in result_data)
+        total_datapoints = len(result_data)
+        
+        # Calculate the time range
+        if result_data:
+            start_timestamp = result_data[0]['timestamp']
+            end_timestamp = result_data[-1]['timestamp']
+        else:
+            start_timestamp = None
+            end_timestamp = None
+        
+        # For daily data, calculate daily, hourly, and per-minute rates
+        if total_datapoints > 0:
+            views_per_day = total_views / total_datapoints
+            views_per_hour = views_per_day / 24
+            views_per_minute = views_per_hour / 60
+        else:
+            views_per_day = 0
+            views_per_hour = 0
+            views_per_minute = 0
+        
+        logger.info(f"Successfully processed {total_datapoints} data points for video {video_id}")
+        return {
+            'video_id': video_id,
+            'interval': interval,
+            'timeseries_data': result_data,
+            'time_range': {
+                'start_timestamp': start_timestamp,
+                'end_timestamp': end_timestamp
+            },
+            'summary': {
+                'total_views': total_views,
+                'views_per_day': views_per_day,
+                'views_per_hour': views_per_hour,
+                'views_per_minute': views_per_minute,
+                'data_points': total_datapoints
+            }
         }
-    }
+        
+    except Exception as e:
+        logger.error(f"Error processing timeseries data for video {video_id}: {e}")
+        return {
+            'video_id': video_id,
+            'interval': interval,
+            'timeseries_data': [],
+            'time_range': {'start_timestamp': None, 'end_timestamp': None},
+            'summary': {
+                'total_views': 0,
+                'views_per_day': 0,
+                'views_per_hour': 0,
+                'views_per_minute': 0,
+                'data_points': 0
+            }
+        }
 
 async def fetch_and_store_youtube_analytics(user_id, video_id, credentials_dict=None, interval='day'):
     """
