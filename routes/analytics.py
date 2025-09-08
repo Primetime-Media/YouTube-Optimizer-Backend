@@ -1,4 +1,5 @@
 from fastapi import APIRouter, HTTPException, BackgroundTasks, Query
+from typing import Optional
 import logging
 import re
 from datetime import datetime
