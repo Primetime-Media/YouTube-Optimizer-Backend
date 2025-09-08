@@ -1,23 +1,8 @@
 """
 Database Utilities Module
 
-This module provides comprehensive database connection management and utilities
-for the YouTube Optimizer platform. It handles PostgreSQL connection pooling,
-database initialization, and provides convenient database operation helpers.
-
-Key functionalities:
-- Thread-safe PostgreSQL connection pooling
-- Database schema initialization and migration
-- Connection lifecycle management
-- Database health monitoring and validation
-- Transaction management and error handling
-- Connection cleanup and resource management
-
-The module uses psycopg2 with connection pooling to ensure efficient database
-operations and proper resource management across the application.
-
-Author: YouTube Optimizer Team
-Version: 1.0.0
+PostgreSQL connection pooling, database initialization, and database operation helpers
+with thread-safe connection management and resource cleanup.
 """
 
 import os
@@ -41,35 +26,14 @@ __all__ = ['get_connection', 'return_connection', 'DatabaseConnection', 'close_c
 # Initialize logger for this module
 logger = logging.getLogger(__name__)
 
-# =============================================================================
-# GLOBAL CONNECTION POOL MANAGEMENT
-# =============================================================================
-
-# Global connection pool instance
+# Global connection pool management
 _connection_pool = None
-
-# Thread lock for pool creation (thread-safe singleton pattern)
 _pool_lock = threading.Lock()
 
 def get_connection_pool():
     """
-    Get or create the database connection pool using thread-safe singleton pattern.
-    
-    This function implements a thread-safe singleton pattern to ensure only one
-    connection pool is created per application instance. The pool is configured
-    with appropriate settings for high-concurrency applications.
-    
-    Pool Configuration:
-    - minconn=1: Minimum connections always available
-    - maxconn=100: Maximum connections for high concurrency
-    - idle_timeout=30: Close idle connections after 30 seconds
-    - dsn: Database connection string from settings
-    
-    Returns:
-        ThreadSafeConnectionPool: Configured PostgreSQL connection pool
-        
-    Raises:
-        Exception: If pool creation fails or database is unreachable
+    Get or create database connection pool using thread-safe singleton pattern.
+    Configured for high-concurrency applications with 1-100 connections.
     """
     global _connection_pool
     

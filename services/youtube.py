@@ -1,23 +1,8 @@
 """
 YouTube API Service Module
 
-This module provides comprehensive integration with the YouTube Data API v3 for the
-YouTube Optimizer platform. It handles all YouTube-related operations including
-data fetching, video management, channel operations, and API quota optimization.
-
-Key functionalities:
-- YouTube API client management with user-specific credentials
-- Channel and video data fetching and storage
-- Video metadata processing and normalization
-- API quota management and optimization
-- Error handling and retry logic for API calls
-- Data validation and sanitization
-
-The service is designed to work with user OAuth2 credentials to maximize API quota
-usage and ensure proper authorization for YouTube operations.
-
-Author: YouTube Optimizer Team
-Version: 1.0.0
+Comprehensive integration with YouTube Data API v3 for data fetching,
+video management, and API quota optimization using user OAuth2 credentials.
 """
 
 import os
@@ -36,29 +21,12 @@ from datetime import timezone  # Import timezone for UTC operations
 # Initialize logger for this module
 logger = logging.getLogger(__name__)
 
-# =============================================================================
-# UTILITY FUNCTIONS
-# =============================================================================
+# Utility Functions
 
 def parse_duration_to_seconds(duration_str):
     """
     Parse ISO 8601 duration format to total seconds.
-    
-    YouTube API returns video durations in ISO 8601 format (e.g., PT4M13S).
-    This function converts these duration strings to total seconds for easier
-    processing and storage in the database.
-    
-    Examples:
-        PT4M13S -> 253 seconds (4 minutes, 13 seconds)
-        PT1H2M10S -> 3730 seconds (1 hour, 2 minutes, 10 seconds)
-        PT30S -> 30 seconds
-        PT1H -> 3600 seconds (1 hour)
-    
-    Args:
-        duration_str (str): ISO 8601 duration string from YouTube API
-        
-    Returns:
-        int: Total duration in seconds, or 0 if parsing fails
+    Converts YouTube API duration strings (e.g., PT4M13S) to seconds for database storage.
     """
     try:
         if not duration_str:
@@ -88,31 +56,12 @@ def parse_duration_to_seconds(duration_str):
         logger.error(f"Unexpected error parsing duration '{duration_str}': {e}")
         return 0
 
-# =============================================================================
-# YOUTUBE API CLIENT MANAGEMENT
-# =============================================================================
+# YouTube API Client Management
 
 def build_youtube_client(credentials):
     """
-    Build a YouTube API client with user credentials to maximize quota usage.
-    
-    This function creates a YouTube Data API v3 client using the user's OAuth2
-    credentials. By using user credentials instead of application credentials,
-    we can leverage the user's individual API quota rather than the application's
-    shared quota, allowing for higher rate limits and better performance.
-    
-    The client is configured with specific parameters to ensure optimal quota usage
-    and proper error handling for YouTube API operations.
-    
-    Args:
-        credentials (google.oauth2.credentials.Credentials): User OAuth2 credentials
-            containing access token, refresh token, and other authentication data
-        
-    Returns:
-        googleapiclient.discovery.Resource: Configured YouTube API client
-        
-    Raises:
-        Exception: If client creation fails or credentials are invalid
+    Build YouTube API client with user credentials to maximize quota usage.
+    Uses user OAuth2 credentials instead of app credentials for higher rate limits.
     """
     try:
         logger.info("Building YouTube API client with user credentials")

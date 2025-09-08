@@ -1,24 +1,8 @@
 """
 LLM Optimization Service Module
 
-This module provides AI-powered content optimization using Anthropic's Claude AI
-for YouTube videos. It handles intelligent content analysis, optimization suggestions,
-and automated improvements for titles, descriptions, tags, and other video metadata.
-
-Key functionalities:
-- AI-powered title optimization using Claude
-- Description enhancement with SEO optimization
-- Tag generation and optimization
-- Chapter timestamp extraction from transcripts
-- Multilingual content support and hashtag generation
-- Google Trends integration for trending topics
-- Content quality scoring and validation
-
-The service integrates with Google Trends API and Anthropic's Claude to provide
-comprehensive content optimization that improves video discoverability and engagement.
-
-Author: YouTube Optimizer Team
-Version: 1.0.0
+AI-powered content optimization using Anthropic's Claude AI for YouTube videos.
+Handles title optimization, description enhancement, tag generation, and content analysis.
 """
 
 import os
@@ -40,28 +24,18 @@ load_dotenv()
 # Initialize logger for this module
 logger = logging.getLogger(__name__)
 
-# =============================================================================
-# ANTHROPIC CLIENT INITIALIZATION
-# =============================================================================
-
-# Initialize Anthropic Claude client for AI-powered content optimization
+# Initialize Anthropic Claude client for AI content optimization
 try:
     anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
     if not anthropic_api_key:
         logger.warning("ANTHROPIC_API_KEY is not set in environment variables")
-
     client = anthropic.Anthropic(api_key=anthropic_api_key)
     logger.info("Anthropic Claude client initialized successfully")
 except Exception as e:
     logger.error(f"Failed to initialize Anthropic client: {e}")
     client = None
 
-# =============================================================================
-# CONFIGURATION CONSTANTS
-# =============================================================================
-
-# Default list of generic keywords to filter out during optimization
-# These are common, low-value keywords that don't add SEO value
+# Generic keywords to filter out during optimization (low SEO value)
 DEFAULT_GENERIC_KEYWORDS = [
     "video", "videos", "youtube", "channel", "subscribe", "like", "comment",
     "shorts", "live", "stream", "gaming", "vlog", "tutorial", "howto", "review",

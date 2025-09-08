@@ -1,23 +1,8 @@
 """
 YouTube Optimizer - Flask Authentication Service
 
-This Flask application handles user authentication processing and initial data setup
-for the YouTube Optimizer platform. It serves as a lightweight, independent service
-that can be deployed separately from the main FastAPI optimization service.
-
-Key responsibilities:
-- Process user authentication data from the frontend
-- Store user credentials and metadata in PostgreSQL
-- Fetch and store initial YouTube channel and video data
-- Queue recent videos for optimization processing
-- Provide health check endpoints for service monitoring
-
-This service is designed for independent scaling and deployment, allowing the
-authentication layer to be scaled separately from the resource-intensive
-optimization processing.
-
-Author: YouTube Optimizer Team
-Version: 1.0.0
+Lightweight Flask service for user authentication and initial data setup.
+Handles OAuth processing, user storage, and video queueing for optimization.
 """
 
 from flask import Flask, request, jsonify
@@ -31,44 +16,21 @@ from utils.db import get_connection
 from services.youtube import fetch_and_store_youtube_data
 # Note: queue_videos_for_optimization is implemented locally in this file
 
-# =============================================================================
-# ENVIRONMENT AND LOGGING CONFIGURATION
-# =============================================================================
-
-# Load environment variables from .env file
-# This must be done before importing any modules that depend on environment variables
+# Load environment variables and configure logging
 load_dotenv()
-
-# Configure application logging with structured format
-# This ensures consistent log formatting across all components
 logging.basicConfig(
-    level=logging.INFO,  # Set to INFO for production, DEBUG for development
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'  # Structured log format
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 
 # Initialize Flask application
 app = Flask(__name__)
-
-# Create logger instance for this module
 logger = logging.getLogger(__name__)
 
-# =============================================================================
-# HEALTH CHECK ENDPOINT
-# =============================================================================
-
+# Health check endpoint for monitoring and load balancers
 @app.route('/health', methods=['GET'])
 def health_check():
-    """
-    Health check endpoint for service monitoring and load balancer health checks.
-    
-    This endpoint is used by:
-    - Load balancers to determine if the service is healthy
-    - Monitoring systems to check service availability
-    - Container orchestration platforms for health verification
-    
-    Returns:
-        JSON response with service status and identification
-    """
+    """Return service health status for monitoring systems."""
     return jsonify({
         "status": "healthy", 
         "service": "youtube-optimizer-flask"
