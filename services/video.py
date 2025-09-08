@@ -1,6 +1,5 @@
 import logging
 from typing import Dict, Optional, List
-from unicodedata import category
 
 from utils.db import get_connection
 from services.llm_optimization import get_comprehensive_optimization

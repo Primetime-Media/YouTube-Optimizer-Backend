@@ -11,9 +11,8 @@ import base64
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from config import get_settings
-from utils.auth import get_user_credentials, validate_session_token, cleanup_invalid_sessions
+from utils.auth import validate_session_token
 from services.youtube import fetch_and_store_youtube_data
-from utils.db import get_connection
 
 logger = logging.getLogger(__name__)
 

@@ -3,9 +3,9 @@ from google.oauth2.credentials import Credentials
 from google.oauth2 import service_account
 from google.auth.transport.requests import Request
 from utils.db import get_connection
-from typing import Dict, Optional, Union
+from typing import Dict, Optional
 import datetime
-from fastapi import Depends, Cookie, Request
+from fastapi import Cookie, Request
 from pydantic import BaseModel
 from config import get_settings
 

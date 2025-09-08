@@ -3,7 +3,7 @@ from dotenv import load_dotenv
 import os
 import logging
 import time
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 import pandas as pd
 from services.youtube import build_youtube_client
 from utils.auth import get_user_credentials

@@ -22,8 +22,8 @@ Version: 1.0.0
 
 from fastapi import APIRouter, HTTPException, BackgroundTasks, Depends
 from pydantic import BaseModel, Field
-from typing import Optional, List, Dict, Any
-from datetime import datetime, timedelta
+from typing import Optional, List
+from datetime import datetime
 
 # Service imports - organized by functionality
 from services.video import (

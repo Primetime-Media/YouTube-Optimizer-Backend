@@ -5,7 +5,6 @@ PostgreSQL connection pooling, database initialization, and database operation h
 with thread-safe connection management and resource cleanup.
 """
 
-import os
 import psycopg2
 from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 from psycopg2_pool import ThreadSafeConnectionPool

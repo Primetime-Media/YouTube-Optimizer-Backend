@@ -7,11 +7,8 @@ Handles OAuth processing, user storage, and video queueing for optimization.
 
 from flask import Flask, request, jsonify
 import logging
-import json
-import os
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
-from google.oauth2.credentials import Credentials
 from utils.db import get_connection
 from services.youtube import fetch_and_store_youtube_data
 # Note: queue_videos_for_optimization is implemented locally in this file

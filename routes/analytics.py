@@ -1,18 +1,14 @@
 from fastapi import APIRouter, HTTPException, BackgroundTasks, Query
-from typing import Dict, List, Optional
 import logging
 import re
 from datetime import datetime
-from config import get_settings
 from services.youtube import (
     fetch_video_analytics, 
-    fetch_granular_view_data, 
     fetch_video_timeseries_data,
     fetch_and_store_youtube_analytics
 )
 from utils.db import get_connection
 from utils.auth import get_user_credentials, get_credentials_dict
-from google.oauth2.credentials import Credentials
 
 router = APIRouter(
     prefix="/analytics",

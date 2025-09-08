@@ -5,7 +5,6 @@ Application configuration using Pydantic settings for environment variable loadi
 validation, and type-safe configuration management with database and OAuth settings.
 """
 
-import os
 from dotenv import load_dotenv
 from functools import lru_cache
 from pydantic_settings import BaseSettings

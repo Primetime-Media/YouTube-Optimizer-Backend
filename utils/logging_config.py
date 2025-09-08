@@ -1,7 +1,6 @@
 """
 Logging configuration utilities with automatic folder creation.
 """
-import os
 import logging
 from pathlib import Path
 from datetime import datetime

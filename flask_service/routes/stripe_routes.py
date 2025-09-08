@@ -1,11 +1,10 @@
 import logging
-from flask import Blueprint, request, jsonify, redirect, current_app, session, render_template_string
+from flask import Blueprint, request, jsonify, redirect, current_app, session
 from services.stripe_service import (
     create_checkout_session_from_session,
     process_checkout_session_success,
     get_customer_payment_methods,
     find_customer_by_email,
-    get_or_create_customer
 )
 from services.auth_service import AuthService
 

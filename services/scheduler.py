@@ -1,13 +1,10 @@
 import logging
-import asyncio
 from datetime import datetime, timedelta
 from utils.db import get_connection
 from services.channel import (
     get_channel_data,
     create_optimization,
-    generate_channel_optimization,
-    get_optimization_status,
-    apply_channel_optimization
+    generate_channel_optimization
 )
 from services.optimizer import apply_optimization_to_youtube_channel
 

@@ -1,4 +1,3 @@
-import os
 from datetime import datetime
 from flask import Blueprint, jsonify, current_app
 
