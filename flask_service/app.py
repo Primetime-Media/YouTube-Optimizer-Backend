@@ -1,3 +1,25 @@
+"""
+Flask Service Application Factory
+
+This module provides the Flask application factory for the YouTube Optimizer
+Flask authentication service. It configures the Flask app with CORS, logging,
+OAuth integration, and route blueprints.
+
+Key functionalities:
+- Flask application factory pattern
+- CORS configuration for frontend integration
+- OAuth and Google API integration
+- Route blueprint registration
+- Logging configuration
+- Environment-specific settings
+
+This service is designed to be deployed independently from the main FastAPI
+service, allowing for separate scaling and deployment of authentication features.
+
+Author: YouTube Optimizer Team
+Version: 1.0.0
+"""
+
 import logging
 from flask import Flask
 from flask_cors import CORS
@@ -8,7 +30,16 @@ from routes.oauth import oauth_bp
 from routes.stripe_routes import stripe_bp
 
 def create_app():
-    """Flask application factory."""
+    """
+    Flask application factory.
+    
+    Creates and configures a Flask application instance with all necessary
+    middleware, blueprints, and configurations for the YouTube Optimizer
+    authentication service.
+    
+    Returns:
+        Flask: Configured Flask application instance
+    """
     app = Flask(__name__)
     config = get_config()
     app.config.from_object(config)

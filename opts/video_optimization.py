@@ -1,52 +1,98 @@
+"""
+Video Optimization Testing Module
+
+This module provides testing utilities and performance validation for the
+YouTube Optimizer video optimization endpoints. It includes local testing
+functions for API endpoints and performance monitoring.
+
+Key functionalities:
+- Local API endpoint testing using FastAPI TestClient
+- Performance validation for video optimization endpoints
+- Endpoint response validation and error handling
+- Testing utilities for development and debugging
+
+This module is designed for development and testing purposes, allowing
+developers to validate API functionality without external dependencies.
+
+Author: YouTube Optimizer Team
+Version: 1.0.0
+"""
+
 import sys
 import os
 import asyncio
 
-# --- Path Manipulation ---
+# =============================================================================
+# PATH MANIPULATION FOR DIRECT SCRIPT EXECUTION
+# =============================================================================
+
 # Ensures 'backend' can be imported when running the script directly
+# This allows the module to be executed as a standalone script for testing
 current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(os.path.dirname(current_dir))
 backend_dir = os.path.dirname(current_dir)
+
+# Add necessary paths to sys.path for imports
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 if backend_dir not in sys.path:
     sys.path.insert(0, backend_dir)
-# --- End Path Manipulation ---
+
+# =============================================================================
+# FASTAPI TEST CLIENT SETUP
+# =============================================================================
 
 from fastapi.testclient import TestClient
-# Assuming your FastAPI app instance is named 'app' in 'backend/main.py'
-# Adjust the import path if your app instance is located elsewhere
+
+# Import FastAPI app and target functions for testing
+# This allows testing of API endpoints without running the full server
 try:
     from main import app
-    # --- Import the target function ---
+    # Import the target functions to be tested
     from routes.video_routes import get_channel_videos_performance, get_all_videos_performance
-    # --- ---
 except ImportError as e:
     print(f"Error importing FastAPI app or function: {e}")
     print("Make sure your FastAPI app instance and function are correctly defined.")
     sys.exit(1)
 
-# Create a TestClient instance pointing to your FastAPI app
+# Create a TestClient instance pointing to the FastAPI app
+# This provides a test interface for making HTTP requests to the API
 client = TestClient(app)
+
+# =============================================================================
+# TESTING FUNCTIONS
+# =============================================================================
 
 def test_performance_all_endpoint_locally():
     """
-    Calls the /video/performance/all endpoint using TestClient.
+    Test the /video/performance/all endpoint using FastAPI TestClient.
+    
+    This function tests the video performance endpoint locally without requiring
+    a running server. It validates the endpoint's response format, status codes,
+    and basic functionality.
+    
+    Test Parameters:
+    - interval: "30m" - 30-minute data interval
+    - limit: 1 - Limit results for testing (keeps response small)
+    - offset: 0 - Start from beginning of results
+    - refresh: True - Force data refresh (slower but tests full functionality)
     """
     print("--- Testing /video/performance/all Endpoint ---")
     endpoint_url = "/video/performance/all"
+    
+    # Test parameters - configured for testing with minimal data load
     params = {
-        "interval": "30m",
-        "limit": 1,  # Keep limit low for testing
-        "offset": 0,
-        "refresh": True # Set to True to test refresh logic (will be slower)
+        "interval": "30m",    # 30-minute data interval
+        "limit": 1,           # Keep limit low for testing
+        "offset": 0,          # Start from beginning
+        "refresh": True       # Set to True to test refresh logic (will be slower)
     }
 
     try:
-        # Make a GET request to the endpoint
+        # Make a GET request to the endpoint using TestClient
         response = client.get(endpoint_url, params=params)
 
-        # Print status code and response data
+        # Print status code and response data for validation
         print(f"Status Code: {response.status_code}")
 
         # Try to print JSON response, handle potential errors

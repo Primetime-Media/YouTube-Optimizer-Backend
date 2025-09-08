@@ -1,3 +1,25 @@
+"""
+Database Utilities Module
+
+This module provides comprehensive database connection management and utilities
+for the YouTube Optimizer platform. It handles PostgreSQL connection pooling,
+database initialization, and provides convenient database operation helpers.
+
+Key functionalities:
+- Thread-safe PostgreSQL connection pooling
+- Database schema initialization and migration
+- Connection lifecycle management
+- Database health monitoring and validation
+- Transaction management and error handling
+- Connection cleanup and resource management
+
+The module uses psycopg2 with connection pooling to ensure efficient database
+operations and proper resource management across the application.
+
+Author: YouTube Optimizer Team
+Version: 1.0.0
+"""
+
 import os
 import psycopg2
 from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
@@ -7,6 +29,7 @@ import logging
 import threading
 import atexit
 
+# Load environment variables
 load_dotenv()
 
 # Import config here to avoid circular imports
@@ -15,33 +38,58 @@ from config import get_settings
 # Export the context manager for easy importing
 __all__ = ['get_connection', 'return_connection', 'DatabaseConnection', 'close_connection_pool']
 
-# Initialize logging
+# Initialize logger for this module
 logger = logging.getLogger(__name__)
 
-# Global connection pool
+# =============================================================================
+# GLOBAL CONNECTION POOL MANAGEMENT
+# =============================================================================
+
+# Global connection pool instance
 _connection_pool = None
+
+# Thread lock for pool creation (thread-safe singleton pattern)
 _pool_lock = threading.Lock()
 
 def get_connection_pool():
-    """Get or create the connection pool."""
+    """
+    Get or create the database connection pool using thread-safe singleton pattern.
+    
+    This function implements a thread-safe singleton pattern to ensure only one
+    connection pool is created per application instance. The pool is configured
+    with appropriate settings for high-concurrency applications.
+    
+    Pool Configuration:
+    - minconn=1: Minimum connections always available
+    - maxconn=100: Maximum connections for high concurrency
+    - idle_timeout=30: Close idle connections after 30 seconds
+    - dsn: Database connection string from settings
+    
+    Returns:
+        ThreadSafeConnectionPool: Configured PostgreSQL connection pool
+        
+    Raises:
+        Exception: If pool creation fails or database is unreachable
+    """
     global _connection_pool
     
     if _connection_pool is None:
         with _pool_lock:
+            # Double-check locking pattern for thread safety
             if _connection_pool is None:
                 try:
                     settings = get_settings()
                     logger.info(f"Creating connection pool for database at {settings.database_url}")
                     
-                    # Create connection pool with configuration
+                    # Create connection pool with optimized configuration
                     _connection_pool = ThreadSafeConnectionPool(
-                        minconn=1,      # Minimum connections in pool
-                        maxconn=100,    # High limit - handles unlimited concurrent users
+                        minconn=1,        # Minimum connections in pool
+                        maxconn=100,      # High limit - handles unlimited concurrent users
                         idle_timeout=30,  # Close idle connections quickly (30 seconds)
                         dsn=settings.database_url
                     )
                     
-                    # Register cleanup function
+                    # Register cleanup function to close pool on application exit
                     atexit.register(close_connection_pool)
                     
                     logger.info("Connection pool created successfully")

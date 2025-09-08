@@ -1,15 +1,60 @@
+"""
+User Model for Flask Service
+
+This module provides the UserModel class for handling user-related database
+operations in the Flask authentication service. It manages user data storage,
+authentication information, and video queueing for optimization.
+
+Key functionalities:
+- User data storage and updates
+- OAuth credential management
+- Video queueing for optimization
+- Database transaction handling
+- Error handling and logging
+
+The model uses PostgreSQL for data persistence and handles both new user
+creation and existing user updates through upsert operations.
+
+Author: YouTube Optimizer Team
+Version: 1.0.0
+"""
+
 import logging
 from datetime import datetime, timezone, timedelta
 from utils.db import get_connection
 
+# Initialize logger for this module
 logger = logging.getLogger(__name__)
 
 class UserModel:
-    """User model for database operations."""
+    """
+    User model for database operations.
+    
+    This class provides static methods for handling user-related database
+    operations including data storage, updates, and video queueing for
+    optimization processing.
+    """
     
     @staticmethod
     def store_user_data(user_data, auth_info, metadata):
-        """Store user authentication data in the database."""
+        """
+        Store user authentication data in the database.
+        
+        This method handles the complete user data storage process, including
+        OAuth credentials, user profile information, and permission settings.
+        It uses PostgreSQL's ON CONFLICT clause for upsert functionality.
+        
+        Args:
+            user_data (dict): User profile information (google_id, email, name)
+            auth_info (dict): OAuth authentication data (tokens, scopes, expiry)
+            metadata (dict): Additional user metadata (currently unused)
+            
+        Returns:
+            int: The database user ID of the stored/updated user
+            
+        Raises:
+            Exception: If database operations fail
+        """
         conn = get_connection()
         
         try:
@@ -73,7 +118,23 @@ class UserModel:
     
     @staticmethod
     def queue_user_videos_for_optimization(user_id, limit_to_30_days=True):
-        """Queue user videos for optimization with optional 30-day limit."""
+        """
+        Queue user videos for optimization with optional 30-day limit.
+        
+        This method identifies videos that are eligible for optimization and marks
+        them as queued in the database. It can optionally limit the selection to
+        videos published within the last 30 days to focus on recent content.
+        
+        Args:
+            user_id (int): The database user ID to queue videos for
+            limit_to_30_days (bool): If True, only queue videos from last 30 days
+            
+        Returns:
+            int: Number of videos queued for optimization
+            
+        Raises:
+            Exception: If database operations fail
+        """
         conn = get_connection()
         
         try:

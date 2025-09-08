@@ -1,8 +1,31 @@
-# video_routes.py
+"""
+Video Routes Module
+
+This module defines all API endpoints related to video optimization and management
+for the YouTube Optimizer platform. It handles video data retrieval, optimization
+generation, application of optimizations to YouTube, and analytics tracking.
+
+Key functionalities:
+- Video data retrieval and management
+- AI-powered video optimization generation
+- Optimization application to YouTube videos
+- Video analytics and performance tracking
+- Competitor analysis integration
+- Background task processing for long-running operations
+
+The routes integrate with multiple services including LLM optimization, YouTube API,
+competitor analysis, and database operations to provide comprehensive video optimization.
+
+Author: YouTube Optimizer Team
+Version: 1.0.0
+"""
+
 from fastapi import APIRouter, HTTPException, BackgroundTasks, Depends
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta
+
+# Service imports - organized by functionality
 from services.video import (
     get_video_data,
     create_optimization,
@@ -13,31 +36,46 @@ from services.optimizer import apply_optimization_to_youtube_video, get_optimiza
 from services.llm_optimization import should_optimize_video, enhanced_should_optimize_video, get_comprehensive_optimization
 from services.youtube import fetch_video_timeseries_data, fetch_and_store_youtube_analytics
 from services.competitor_analysis import get_competitor_analysis
+
+# Utility imports
 from utils.auth import get_user_credentials, get_user_from_session, User
 from utils.db import get_connection
 import logging
 
+# Initialize logger for this module
 logger = logging.getLogger(__name__)
 
+# Create FastAPI router with prefix and tags for API documentation
 router = APIRouter(prefix="/video", tags=["Video Optimization"])
 
+# =============================================================================
+# PYDANTIC MODELS FOR API REQUEST/RESPONSE VALIDATION
+# =============================================================================
+
 class VideoOptimizationStatusResponse(BaseModel):
-    id: int
-    video_id: int
-    status: str
-    progress: int
-    created_at: Optional[datetime] = None
-    updated_at: Optional[datetime] = None
-    # Optional fields that will be included for completed optimizations
-    original_title: Optional[str] = None
-    optimized_title: Optional[str] = None
-    original_description: Optional[str] = None
-    optimized_description: Optional[str] = None
-    original_tags: Optional[List[str]] = None
-    optimized_tags: Optional[List[str]] = None
-    optimization_notes: Optional[str] = None
-    is_applied: Optional[bool] = None
-    applied_at: Optional[datetime] = None
+    """
+    Response model for video optimization status information.
+    
+    This model represents the current status of a video optimization process,
+    including progress tracking and optimization details for completed optimizations.
+    """
+    id: int                                    # Unique optimization ID
+    video_id: int                             # Associated video ID
+    status: str                               # Current optimization status
+    progress: int                             # Progress percentage (0-100)
+    created_at: Optional[datetime] = None     # When optimization was created
+    updated_at: Optional[datetime] = None     # When optimization was last updated
+    
+    # Optional fields included for completed optimizations
+    original_title: Optional[str] = None      # Original video title
+    optimized_title: Optional[str] = None     # AI-optimized title
+    original_description: Optional[str] = None # Original video description
+    optimized_description: Optional[str] = None # AI-optimized description
+    original_tags: Optional[List[str]] = None # Original video tags
+    optimized_tags: Optional[List[str]] = None # AI-optimized tags
+    optimization_notes: Optional[str] = None  # AI-generated optimization notes
+    is_applied: Optional[bool] = None         # Whether optimization was applied to YouTube
+    applied_at: Optional[datetime] = None     # When optimization was applied
 
 class ComprehensiveVideoOptimizationResponse(BaseModel):
     id: int
