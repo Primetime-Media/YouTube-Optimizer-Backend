@@ -15,6 +15,7 @@ def get_channel_data(channel_id: int) -> Optional[Dict]:
     Returns:
         dict: The channel data including branding settings or None if not found
     """
+    logger.info(f"Getting channel data for channel {channel_id}")
     try:
         conn = get_connection()
         with conn.cursor() as cursor:
@@ -26,6 +27,7 @@ def get_channel_data(channel_id: int) -> Optional[Dict]:
             
             result = cursor.fetchone()
             if not result:
+                logger.warning(f"Channel {channel_id} not found in database")
                 return None
                 
             title, branding_settings = result

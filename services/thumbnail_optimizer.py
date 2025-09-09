@@ -31,7 +31,10 @@ client = vision.ImageAnnotatorClient()
 
 load_dotenv()
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+from utils.logging_config import get_safe_logger
+
+# Use centralized logging to avoid conflicts
+logger = get_safe_logger(__name__)
 
 GEMINI_API_KEY = os.getenv("GOOGLE_API_KEY")
 

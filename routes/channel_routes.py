@@ -56,17 +56,21 @@ async def optimize_channel(channel_id: int, background_tasks: BackgroundTasks):
     Returns:
         dict: Contains job ID and initial status
     """
+    logger.info(f"Starting optimization for channel {channel_id}")
     try:
         # Fetch channel data from database
         channel = get_channel_data(channel_id)
         if not channel:
+            logger.warning(f"Channel {channel_id} not found in database")
             raise HTTPException(status_code=404, detail="Channel not found")
 
         # Create a new optimization record for this request
         optimization_id = create_optimization(channel_id)
         if optimization_id == 0:
+            logger.error(f"Failed to create optimization record for channel {channel_id}")
             raise HTTPException(status_code=500, detail="Failed to create optimization record")
 
+        logger.info(f"Created optimization record {optimization_id} for channel {channel_id}")
         # Run the optimization in the background with the pre-created optimization ID
         background_tasks.add_task(generate_channel_optimization, channel, optimization_id)
 
@@ -96,11 +100,13 @@ async def get_optimization_status_endpoint(optimization_id: int):
     Returns:
         ChannelOptimizationStatusResponse: Contains status and progress information
     """
+    logger.info(f"Getting channel optimization status for ID {optimization_id}")
     try:
         status = get_optimization_status(optimization_id)
         if "error" in status:
+            logger.warning(f"Channel optimization {optimization_id} not found: {status['error']}")
             raise HTTPException(status_code=404, detail=status["error"])
-
+            
         return status
     except HTTPException:
         raise
@@ -121,8 +127,10 @@ async def get_channel_optimizations_endpoint(channel_id: int, limit: int = 5):
     Returns:
         list: Recent optimization records
     """
+    logger.info(f"Getting optimizations for channel {channel_id} with limit {limit}")
     try:
         optimizations = get_channel_optimizations(channel_id, limit)
+        logger.info(f"Found {len(optimizations)} optimizations for channel {channel_id}")
         return {
             "channel_id": channel_id,
             "optimizations": optimizations,
@@ -150,6 +158,7 @@ async def apply_optimization_to_channel(
     Returns:
         dict: Results of the update operation
     """
+    logger.info(f"Applying channel optimization {optimization_id} (description: {only_description}, keywords: {only_keywords})")
     try:
         # Get the user_id for this optimization's channel
         conn = get_connection()
@@ -164,9 +173,11 @@ async def apply_optimization_to_channel(
                 
                 result = cursor.fetchone()
                 if not result:
+                    logger.warning(f"Channel optimization {optimization_id} not found")
                     raise HTTPException(status_code=404, detail="Optimization not found")
                 
                 user_id = result[0]
+                logger.info(f"Found user {user_id} for channel optimization {optimization_id}")
         finally:
             conn.close()
 

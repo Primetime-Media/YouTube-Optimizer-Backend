@@ -28,6 +28,7 @@ from routes.health import health_bp
 from routes.auth import auth_bp
 from routes.oauth import oauth_bp
 from routes.stripe_routes import stripe_bp
+from utils.logging_config import get_safe_logger
 
 def create_app():
     """
@@ -56,14 +57,10 @@ def create_app():
         'https://primetime.media'  # Production frontend (without www)
     ])
     
-    # Configure logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
+    # Use centralized logging to avoid conflicts
+    logger = get_safe_logger(__name__)
     
     # Log configuration status
-    logger = logging.getLogger(__name__)
     logger.info("Flask service starting with OAuth support")
     logger.info(f"Frontend URL: {config.FRONTEND_URL}")
     logger.info(f"Client secret file: {config.CLIENT_SECRET_FILE}")

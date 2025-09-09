@@ -105,10 +105,12 @@ async def optimize_video(youtube_video_id: str, background_tasks: BackgroundTask
     Returns:
         dict: Contains job ID and initial status
     """
+    logger.info(f"Starting optimization for video {youtube_video_id}")
     try:
         # Fetch video data from database
         video = get_video_data(youtube_video_id)
         if not video:
+            logger.warning(f"Video {youtube_video_id} not found in database")
             raise HTTPException(status_code=404, detail="Video not found")
         
         # Get user_id from the video's channel
@@ -130,8 +132,10 @@ async def optimize_video(youtube_video_id: str, background_tasks: BackgroundTask
         # Create a new optimization record for this request
         optimization_id = create_optimization(video["id"])
         if optimization_id == 0:
+            logger.error(f"Failed to create optimization record for video {youtube_video_id}")
             raise HTTPException(status_code=500, detail="Failed to create optimization record")
             
+        logger.info(f"Created optimization record {optimization_id} for video {youtube_video_id}")
         # Run the optimization in the background with the pre-created optimization ID
         background_tasks.add_task(generate_video_optimization, video, user_id, optimization_id)
         
@@ -162,9 +166,11 @@ async def get_optimization_status_endpoint(optimization_id: int):
     Returns:
         VideoOptimizationStatusResponse: Contains status and progress information
     """
+    logger.info(f"Getting optimization status for ID {optimization_id}")
     try:
         status = get_optimization_status(optimization_id)
         if "error" in status:
+            logger.warning(f"Optimization {optimization_id} not found: {status['error']}")
             raise HTTPException(status_code=404, detail=status["error"])
             
         return status
@@ -187,13 +193,16 @@ async def get_video_optimizations_endpoint(youtube_video_id: str, limit: int = 5
     Returns:
         list: Recent optimization records
     """
+    logger.info(f"Getting optimizations for video {youtube_video_id} with limit {limit}")
     try:
         # First, get the database ID for the video
         video = get_video_data(youtube_video_id)
         if not video:
+            logger.warning(f"Video {youtube_video_id} not found when getting optimizations")
             raise HTTPException(status_code=404, detail="Video not found")
             
         optimizations = get_video_optimizations(video["id"], limit)
+        logger.info(f"Found {len(optimizations)} optimizations for video {youtube_video_id}")
         return {
             "video_id": youtube_video_id,
             "optimizations": optimizations,
@@ -215,8 +224,10 @@ async def apply_optimization_to_video(optimization_id: int, user = Depends(get_u
     Returns:
         dict: Results of the update operation
     """
+    logger.info(f"Applying optimization {optimization_id} to video")
     try:
         if not user:
+            logger.warning(f"Unauthorized attempt to apply optimization {optimization_id}")
             raise HTTPException(status_code=401, detail="Authentication required")
             
         # Get the video_id for this optimization

@@ -18,6 +18,7 @@ def get_video_data(video_id: str) -> Optional[Dict]:
     Returns:
         dict: The video data or None if not found
     """
+    logger.info(f"Getting video data for video {video_id}")
     try:
         conn = get_connection()
         with conn.cursor() as cursor:
@@ -29,6 +30,7 @@ def get_video_data(video_id: str) -> Optional[Dict]:
             
             result = cursor.fetchone()
             if not result:
+                logger.warning(f"Video {video_id} not found in database")
                 return None
                 
             db_id, title, description, tags, transcript, has_captions, like_count, comment_count, category_name, category_id = result

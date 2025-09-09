@@ -724,6 +724,7 @@ def fetch_videos(credentials, max_results=50):
 
 def store_youtube_data(user_id, channel_info, videos, credentials):
     """Store YouTube data in the database."""
+    logger.info(f"Storing YouTube data for user {user_id}: {len(videos)} videos")
     conn = get_connection()
     try:
         with conn.cursor() as cursor:
@@ -1059,6 +1060,7 @@ def store_youtube_data(user_id, channel_info, videos, credentials):
                     ))
             
             conn.commit()
+            logger.info(f"Successfully stored YouTube data for user {user_id}")
     except Exception as e:
         conn.rollback()
         logger.error(f"Error storing YouTube data: {e}")

@@ -24,22 +24,21 @@ from routes.video_routes import router as video_router
 from config import get_settings
 from utils.auth import cleanup_invalid_sessions
 from services.scheduler import initialize_scheduler
-from utils.logging_config import setup_logging
+from utils.logging_config import initialize_logging_once
 
 # Load environment variables and configure logging
 load_dotenv()
 settings = get_settings()
 
-logger = setup_logging(
+# Initialize centralized logging to prevent conflicts
+logger = initialize_logging_once(
     log_level="INFO",
     log_dir="logs",
     console_output=True,
     max_file_size=10 * 1024 * 1024,  # 10MB per log file
     backup_count=5,
+    service_name="fastapi_main"
 )
-
-# Suppress noisy warnings
-logging.getLogger("googleapiclient.discovery_cache").setLevel(logging.ERROR)
 
 # Security validation
 if settings.is_production and not os.getenv("SESSION_SECRET"):

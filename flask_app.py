@@ -11,18 +11,17 @@ from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from utils.db import get_connection
 from services.youtube import fetch_and_store_youtube_data
+from utils.logging_config import get_safe_logger
 # Note: queue_videos_for_optimization is implemented locally in this file
 
-# Load environment variables and configure logging
+# Load environment variables
 load_dotenv()
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
 
 # Initialize Flask application
 app = Flask(__name__)
-logger = logging.getLogger(__name__)
+
+# Use centralized logging to avoid conflicts
+logger = get_safe_logger(__name__)
 
 # Health check endpoint for monitoring and load balancers
 @app.route('/health', methods=['GET'])
