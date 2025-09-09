@@ -11,6 +11,8 @@ import html
 import re
 import json
 import datetime
+import asyncio
+import httpx
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from google.oauth2.credentials import Credentials
@@ -2436,15 +2438,19 @@ async def fetch_and_store_youtube_analytics(user_id, video_id, credentials_dict=
                     logger.info(f"Updated last_analytics_refresh timestamp for video {video_id}")
             
             # Return the result including fresh data
+            timeseries_data = analytics_data.get('timeseries_data', [])
+            data_points_count = len(timeseries_data)
+            
             result = {
                 'video_id': video_id,
                 'success': True,
                 'summary': analytics_data.get('summary', {}),
-                'timeseries_data': analytics_data.get('timeseries_data', []),
-                'time_range': analytics_data.get('time_range', {'start_date': start_date, 'end_date': end_date})
+                'timeseries_data': timeseries_data,
+                'time_range': analytics_data.get('time_range', {'start_date': start_date, 'end_date': end_date}),
+                'data_points': data_points_count
             }
             
-            logger.info(f"Successfully completed analytics refresh for video {video_id} with {result['data_points']} data points")
+            logger.info(f"Successfully completed analytics refresh for video {video_id} with {data_points_count} data points")
             return result
         finally:
             conn.close()
@@ -2499,3 +2505,164 @@ async def fetch_and_store_youtube_data(user_id, max_videos=10000):
             logger.error(f"YouTube API error for user {user_id}: {e}")
     except Exception as e:
         logger.error(f"Error fetching and storing YouTube data for user {user_id}: {e}", exc_info=True)
+
+
+# =============================================================================
+# ASYNC WRAPPER FUNCTIONS FOR NON-BLOCKING OPERATIONS
+# =============================================================================
+
+async def fetch_and_store_youtube_analytics_async(
+    user_id: int,
+    video_id: str,
+    credentials_dict: Dict,
+    interval: str = "day",
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None
+) -> Dict:
+    """
+    Async wrapper for fetch_and_store_youtube_analytics to prevent blocking.
+    
+    Args:
+        user_id: User ID for credentials
+        video_id: YouTube video ID
+        credentials_dict: User credentials dictionary
+        interval: Time interval for data points
+        start_date: Optional start date for data range (ignored - not supported by original function)
+        end_date: Optional end date for data range (ignored - not supported by original function)
+        
+    Returns:
+        dict: Analytics data with success status
+    """
+    # The original function is already async, so we can call it directly
+    # Note: start_date and end_date are ignored as the original function doesn't support them
+    return await fetch_and_store_youtube_analytics(
+        user_id,
+        video_id,
+        credentials_dict,
+        interval
+    )
+
+
+async def fetch_video_analytics_async(
+    credentials: Credentials,
+    video_id: str,
+    metrics: List[str],
+    dimensions: Optional[List[str]] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None
+) -> Dict:
+    """
+    Async wrapper for fetch_video_analytics to prevent blocking.
+    
+    Args:
+        credentials: Google OAuth2 credentials
+        video_id: YouTube video ID
+        metrics: List of metrics to fetch
+        dimensions: Optional list of dimensions to group by
+        start_date: Optional start date for data range
+        end_date: Optional end date for data range
+        
+    Returns:
+        dict: Analytics data with success status
+    """
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        None,
+        fetch_video_analytics,
+        credentials,
+        video_id,
+        metrics,
+        dimensions,
+        start_date,
+        end_date
+    )
+
+
+async def fetch_video_timeseries_data_async(
+    video_id: str,
+    interval: str = "day",
+    force_refresh: bool = False
+) -> Dict:
+    """
+    Async wrapper for fetch_video_timeseries_data to prevent blocking.
+    
+    Args:
+        video_id: YouTube video ID
+        interval: Time interval for data points
+        force_refresh: Whether to force refresh from API
+        
+    Returns:
+        dict: Timeseries data with success status
+    """
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        None,
+        fetch_video_timeseries_data,
+        video_id,
+        interval,
+        force_refresh
+    )
+
+
+async def fetch_video_transcript_async(
+    credentials: Credentials,
+    video_id: str
+) -> Dict:
+    """
+    Async wrapper for fetch_video_transcript to prevent blocking.
+    
+    Args:
+        credentials: Google OAuth2 credentials
+        video_id: YouTube video ID
+        
+    Returns:
+        dict: Transcript data with success status
+    """
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        None,
+        fetch_video_transcript,
+        credentials,
+        video_id
+    )
+
+
+async def fetch_and_store_youtube_data_async(
+    user_id: int,
+    max_videos: int = 1000
+) -> Dict:
+    """
+    Async wrapper for fetch_and_store_youtube_data to prevent blocking.
+    
+    Args:
+        user_id: User ID for credentials
+        max_videos: Maximum number of videos to fetch
+        
+    Returns:
+        dict: Data fetch results with success status
+    """
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        None,
+        fetch_and_store_youtube_data,
+        user_id,
+        max_videos
+    )
+
+
+async def build_youtube_client_async(credentials: Credentials):
+    """
+    Async wrapper for build_youtube_client to prevent blocking.
+    
+    Args:
+        credentials: Google OAuth2 credentials
+        
+    Returns:
+        YouTube API client
+    """
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        None,
+        build_youtube_client,
+        credentials
+    )

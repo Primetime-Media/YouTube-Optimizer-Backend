@@ -4,6 +4,7 @@ from fastapi.responses import RedirectResponse
 from typing import Optional
 from datetime import datetime, timedelta
 import requests
+import httpx
 import logging
 import secrets
 import json
@@ -312,18 +313,19 @@ async def auth_callback(request: Request, response: Response, background_tasks: 
             client_secret = client_config['client_secret']
             token_uri = client_config['token_uri']
             
-            # Use requests to directly exchange the code for tokens
-            # without any scope validation
-            token_response = requests.post(
-                token_uri,
-                data={
-                    'code': code,
-                    'client_id': client_id,
-                    'client_secret': client_secret,
-                    'redirect_uri': REDIRECT_URI,
-                    'grant_type': 'authorization_code'
-                }
-            )
+            # Use async HTTP client to exchange the code for tokens
+            import httpx
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                token_response = await client.post(
+                    token_uri,
+                    data={
+                        'code': code,
+                        'client_id': client_id,
+                        'client_secret': client_secret,
+                        'redirect_uri': REDIRECT_URI,
+                        'grant_type': 'authorization_code'
+                    }
+                )
             
             # Check for success
             if token_response.status_code != 200:
@@ -374,11 +376,13 @@ async def auth_callback(request: Request, response: Response, background_tasks: 
             'scopes': credentials.scopes
         }
 
-        # Fetch user info
-        userinfo = requests.get(
-            "https://www.googleapis.com/oauth2/v1/userinfo",
-            headers={"Authorization": f"Bearer {credentials.token}"}
-        ).json()
+        # Fetch user info asynchronously
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            userinfo_response = await client.get(
+                "https://www.googleapis.com/oauth2/v1/userinfo",
+                headers={"Authorization": f"Bearer {credentials.token}"}
+            )
+            userinfo = userinfo_response.json()
 
         logging.info(f"User authenticated: {userinfo.get('email')}")
 

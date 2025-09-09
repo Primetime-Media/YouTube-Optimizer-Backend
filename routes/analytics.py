@@ -6,7 +6,10 @@ from datetime import datetime
 from services.youtube import (
     fetch_video_analytics, 
     fetch_video_timeseries_data,
-    fetch_and_store_youtube_analytics
+    fetch_and_store_youtube_analytics,
+    fetch_video_analytics_async,
+    fetch_video_timeseries_data_async,
+    fetch_and_store_youtube_analytics_async
 )
 from utils.db import get_connection
 from utils.auth import get_user_credentials, get_credentials_dict
@@ -172,7 +175,7 @@ async def get_video_analytics(
                 "subscribersGained", "subscribersLost",
             ]
             
-        analytics_data = fetch_video_analytics(
+        analytics_data = await fetch_video_analytics_async(
             credentials,
             video_id,
             metrics_list,
@@ -225,7 +228,7 @@ async def get_video_timeseries(
             interval = 'day'
         
         # Try to get data from the database, with force_refresh if requested
-        db_data = fetch_video_timeseries_data(video_id, interval, force_refresh=refresh)
+        db_data = await fetch_video_timeseries_data_async(video_id, interval, force_refresh=refresh)
         
         # If we have data and not forcing refresh, return it
         if not db_data.get('error') and not refresh:
@@ -278,7 +281,7 @@ async def get_video_timeseries(
         
         # Fetch data directly using the fetch_and_store function
         logger.info(f"Fetching fresh data from YouTube API for video {video_id}")
-        analytics_data = await fetch_and_store_youtube_analytics(
+        analytics_data = await fetch_and_store_youtube_analytics_async(
             derived_user_id,
             video_id,
             credentials_dict,
@@ -353,7 +356,7 @@ async def refresh_video_analytics(
         if background_tasks:
             # Queue the background task
             background_tasks.add_task(
-                fetch_and_store_youtube_analytics,
+                fetch_and_store_youtube_analytics_async,
                 user_id,
                 video_id,
                 credentials_dict,
@@ -367,7 +370,7 @@ async def refresh_video_analytics(
             }
         else:
             # Fetch directly if no background tasks available
-            result = await fetch_and_store_youtube_analytics(
+            result = await fetch_and_store_youtube_analytics_async(
                 user_id,
                 video_id,
                 credentials_dict,

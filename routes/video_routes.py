@@ -24,6 +24,7 @@ from fastapi import APIRouter, HTTPException, BackgroundTasks, Depends
 from pydantic import BaseModel, Field
 from typing import Optional, List
 from datetime import datetime
+import asyncio
 
 # Service imports - organized by functionality
 from services.video import (
@@ -34,7 +35,13 @@ from services.video import (
 )
 from services.optimizer import apply_optimization_to_youtube_video, get_optimization_status
 from services.llm_optimization import should_optimize_video, enhanced_should_optimize_video, get_comprehensive_optimization
-from services.youtube import fetch_video_timeseries_data, fetch_and_store_youtube_analytics
+from services.youtube import (
+    fetch_video_timeseries_data, 
+    fetch_and_store_youtube_analytics,
+    fetch_and_store_youtube_analytics_async,
+    fetch_video_timeseries_data_async,
+    fetch_video_transcript_async
+)
 from services.competitor_analysis import get_competitor_analysis
 
 # Utility imports
@@ -436,6 +443,7 @@ async def get_all_videos_performance(
 @router.get("/performance/by-channel/{channel_id}")
 async def get_channel_videos_performance(
     channel_id: int,
+    background_tasks: BackgroundTasks,
     interval: str = "1d",
     refresh: bool = False,
     include_optimizations: bool = True,
@@ -581,7 +589,7 @@ async def get_channel_videos_performance(
                 if refresh and credentials_dict:
                     logger.info(f"Refreshing analytics data for video {video_id}")
                     try:
-                        analytics_data = await fetch_and_store_youtube_analytics(
+                        analytics_data = await fetch_and_store_youtube_analytics_async(
                             channel_owner_id,
                             video_id,
                             credentials_dict,
@@ -597,9 +605,9 @@ async def get_channel_videos_performance(
                             "error": str(refresh_err)
                         })
                 else:
-                    # Get cached timeseries data
+                    # Get cached timeseries data asynchronously
                     logger.info(f"Fetching timeseries data for video {video_id} with interval {interval}")
-                    analytics_data = fetch_video_timeseries_data(video_id, interval)
+                    analytics_data = await fetch_video_timeseries_data_async(video_id, interval)
 
                     """
                     # Extract analytics data from timeseries_data if available
@@ -633,7 +641,6 @@ async def get_channel_videos_performance(
                     if transcript_credentials_dict:
                         logger.info(f"Fetching transcript for video {video_id}")
                         try:
-                            from services.youtube import fetch_video_transcript
                             from google.oauth2.credentials import Credentials
                             
                             # Convert credentials dict to Credentials object
@@ -646,7 +653,7 @@ async def get_channel_videos_performance(
                                 scopes=transcript_credentials_dict['scopes']
                             )
                             
-                            transcript_data = fetch_video_transcript(creds, video_id)
+                            transcript_data = await fetch_video_transcript_async(creds, video_id)
                             if transcript_data.get('transcript'):
                                 detailed_video_data['transcript'] = transcript_data['transcript']
                                 logger.info(f"Successfully fetched transcript for video {video_id}")
@@ -657,41 +664,31 @@ async def get_channel_videos_performance(
                     else:
                         logger.info(f"No valid credentials available for transcript fetching for video {video_id}")
 
-                # Call LLM to determine if optimization is needed
-                logger.info(f"Calling LLM to evaluate if video {video_id} needs optimization")
-                optimization_decision = await enhanced_should_optimize_video(
-                    detailed_video_data,
-                    channel_subscriber_count,
-                    analytics_data,
-                    optimizations
-                )
-
-                if not optimization_decision["should_optimize"] or optimization_decision["confidence"] < optimization_confidence_threshold:
-                    logger.info(f"Video {video_id} does not need optimization")
-                    continue
-
-                competitor_analysis = get_competitor_analysis(channel_owner_id, detailed_video_data)
-
+                # Queue optimization for background processing instead of blocking
+                logger.info(f"Queueing video {video_id} for optimization processing")
+                
                 # Create a new optimization record for this request
                 optimization_id = create_optimization(video_db_id, num_optimizations_applied + 1)
                 if optimization_id == 0:
-                    raise Exception("Failed to create optimization record")
+                    logger.error(f"Failed to create optimization record for video {video_id}")
+                    continue
 
-                # Run the optimization with the pre-created optimization ID
-                video_optimization_details = generate_video_optimization(
-                    video=detailed_video_data,
+                # Add optimization to background task queue
+                background_tasks.add_task(
+                    process_video_optimization_async,
+                    video_id=video_id,
+                    video_db_id=video_db_id,
                     user_id=channel_owner_id,
                     optimization_id=optimization_id,
-                    optimization_decision_data=optimization_decision,
+                    detailed_video_data=detailed_video_data,
+                    channel_subscriber_count=channel_subscriber_count,
                     analytics_data=analytics_data,
-                    competitor_analytics_data=competitor_analysis,
-                    apply_optimization=True,
-                    prev_optimizations=optimizations
+                    optimizations=optimizations,
+                    optimization_confidence_threshold=optimization_confidence_threshold
                 )
-
-                if video_optimization_details['is_applied']:
-                    logger.info(f"Optimization applied for video {video_id} with optimization ID {optimization_id}")
-                    video_optimizations_applied += 1
+                
+                logger.info(f"Video {video_id} queued for optimization with ID {optimization_id}")
+                video_optimizations_applied += 1
 
             except Exception as video_err:
                 logger.error(f"Error processing video {video_data[1] if len(video_data) > 1 else 'unknown'}: {video_err}")
@@ -1268,3 +1265,214 @@ async def optimize_video_comprehensive(video_id: str):
     except Exception as e:
         logging.error(f"Error generating comprehensive optimization: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error optimizing video: {str(e)}")
+
+
+# =============================================================================
+# ASYNC BACKGROUND PROCESSING FUNCTIONS
+# =============================================================================
+
+async def process_video_optimization_async(
+    video_id: str,
+    video_db_id: int,
+    user_id: int,
+    optimization_id: int,
+    detailed_video_data: dict,
+    channel_subscriber_count: int,
+    analytics_data: dict,
+    optimizations: list,
+    optimization_confidence_threshold: float = 0.5
+):
+    """
+    Process video optimization asynchronously in the background.
+    
+    This function handles the complete optimization pipeline without blocking
+    the main request thread, including LLM calls, competitor analysis, and
+    optimization generation.
+    
+    Args:
+        video_id: YouTube video ID
+        video_db_id: Database video ID
+        user_id: User ID who owns the video
+        optimization_id: Pre-created optimization record ID
+        detailed_video_data: Video metadata and content
+        channel_subscriber_count: Channel subscriber count for context
+        analytics_data: Video analytics data
+        optimizations: Previous optimization history
+        optimization_confidence_threshold: Minimum confidence for optimization
+    """
+    try:
+        logger.info(f"Starting async optimization for video {video_id} (ID: {optimization_id})")
+        
+        # Update optimization status to in_progress
+        await update_optimization_status_async(optimization_id, "in_progress", 10)
+        
+        # Call LLM to determine if optimization is needed (async)
+        logger.info(f"Evaluating optimization need for video {video_id}")
+        optimization_decision = await enhanced_should_optimize_video_async(
+            detailed_video_data,
+            channel_subscriber_count,
+            analytics_data,
+            optimizations
+        )
+        
+        await update_optimization_status_async(optimization_id, "in_progress", 30)
+        
+        if not optimization_decision["should_optimize"] or optimization_decision["confidence"] < optimization_confidence_threshold:
+            logger.info(f"Video {video_id} does not need optimization (confidence: {optimization_decision.get('confidence', 0)})")
+            await update_optimization_status_async(optimization_id, "completed", 100, "No optimization needed")
+            return
+        
+        # Get competitor analysis (async)
+        logger.info(f"Getting competitor analysis for video {video_id}")
+        competitor_analysis = await get_competitor_analysis_async(user_id, detailed_video_data)
+        
+        await update_optimization_status_async(optimization_id, "in_progress", 50)
+        
+        # Generate optimization (async)
+        logger.info(f"Generating optimization for video {video_id}")
+        video_optimization_details = await generate_video_optimization_async(
+            video=detailed_video_data,
+            user_id=user_id,
+            optimization_id=optimization_id,
+            optimization_decision_data=optimization_decision,
+            analytics_data=analytics_data,
+            competitor_analytics_data=competitor_analysis,
+            apply_optimization=True,
+            prev_optimizations=optimizations
+        )
+        
+        await update_optimization_status_async(optimization_id, "in_progress", 80)
+        
+        if video_optimization_details.get('is_applied'):
+            logger.info(f"Optimization applied for video {video_id} with optimization ID {optimization_id}")
+            await update_optimization_status_async(optimization_id, "completed", 100, "Optimization applied successfully")
+        else:
+            logger.info(f"Optimization generated but not applied for video {video_id}")
+            await update_optimization_status_async(optimization_id, "completed", 100, "Optimization generated")
+            
+    except Exception as e:
+        logger.error(f"Error in async optimization for video {video_id}: {str(e)}")
+        await update_optimization_status_async(optimization_id, "failed", 0, f"Error: {str(e)}")
+
+
+async def update_optimization_status_async(
+    optimization_id: int, 
+    status: str, 
+    progress: int, 
+    message: str = None
+):
+    """
+    Update optimization status asynchronously.
+    
+    Args:
+        optimization_id: ID of the optimization record
+        status: New status (pending, in_progress, completed, failed)
+        progress: Progress percentage (0-100)
+        message: Optional status message
+    """
+    try:
+        conn = get_connection()
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                UPDATE video_optimizations 
+                SET status = %s, progress = %s, updated_at = NOW()
+                WHERE id = %s
+            """, (status, progress, optimization_id))
+            conn.commit()
+            logger.debug(f"Updated optimization {optimization_id}: {status} ({progress}%)")
+    except Exception as e:
+        logger.error(f"Error updating optimization status: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+
+async def enhanced_should_optimize_video_async(
+    detailed_video_data: dict,
+    channel_subscriber_count: int,
+    analytics_data: dict,
+    optimizations: list
+) -> dict:
+    """
+    Async wrapper for enhanced_should_optimize_video to prevent blocking.
+    
+    Args:
+        detailed_video_data: Video metadata and content
+        channel_subscriber_count: Channel subscriber count
+        analytics_data: Video analytics data
+        optimizations: Previous optimization history
+        
+    Returns:
+        dict: Optimization decision with confidence score
+    """
+    # Run the synchronous function in a thread pool to prevent blocking
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        None,
+        enhanced_should_optimize_video,
+        detailed_video_data,
+        channel_subscriber_count,
+        analytics_data,
+        optimizations
+    )
+
+
+async def get_competitor_analysis_async(user_id: int, detailed_video_data: dict) -> dict:
+    """
+    Async wrapper for get_competitor_analysis to prevent blocking.
+    
+    Args:
+        user_id: User ID for analysis context
+        detailed_video_data: Video data for analysis
+        
+    Returns:
+        dict: Competitor analysis results
+    """
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        None,
+        get_competitor_analysis,
+        user_id,
+        detailed_video_data
+    )
+
+
+async def generate_video_optimization_async(
+    video: dict,
+    user_id: int,
+    optimization_id: int,
+    optimization_decision_data: dict,
+    analytics_data: dict,
+    competitor_analytics_data: dict,
+    apply_optimization: bool = True,
+    prev_optimizations: list = None
+) -> dict:
+    """
+    Async wrapper for generate_video_optimization to prevent blocking.
+    
+    Args:
+        video: Video metadata and content
+        user_id: User ID who owns the video
+        optimization_id: Pre-created optimization record ID
+        optimization_decision_data: LLM decision data
+        analytics_data: Video analytics data
+        competitor_analytics_data: Competitor analysis results
+        apply_optimization: Whether to apply optimization to YouTube
+        prev_optimizations: Previous optimization history
+        
+    Returns:
+        dict: Optimization results
+    """
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        None,
+        generate_video_optimization,
+        video,
+        user_id,
+        optimization_id,
+        optimization_decision_data,
+        analytics_data,
+        competitor_analytics_data,
+        apply_optimization,
+        prev_optimizations
+    )
