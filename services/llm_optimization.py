@@ -17,7 +17,7 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any, Tuple
 from services.google_trends_helper import get_trending_data_with_serpapi, select_final_hashtags
 from utils.db import get_connection
-
+import time
 # Load environment variables
 load_dotenv()
 
@@ -826,6 +826,12 @@ def _extract_keywords_from_trend_data(trend_data: Dict) -> List[Dict]:
 
                             # Add to results if not already in list
                             if not any(k["query"] == query_text for k in extracted_keywords):
+                                # Ensure value is an integer
+                                try:
+                                    value = int(value) if value is not None else 50
+                                except (ValueError, TypeError):
+                                    value = 50
+                                
                                 extracted_keywords.append({
                                     "query": query_text,
                                     "interest_score": value
@@ -851,7 +857,19 @@ def _extract_keywords_from_trend_data(trend_data: Dict) -> List[Dict]:
                             # Add to results if not already in list or update score if higher
                             existing_item = next((k for k in extracted_keywords if k["query"] == query_text), None)
                             if existing_item:
-                                existing_item["interest_score"] = max(existing_item["interest_score"], value)
+                                # Ensure both values are integers before comparison
+                                existing_score = existing_item["interest_score"]
+                                try:
+                                    existing_score = int(existing_score) if existing_score is not None else 0
+                                except (ValueError, TypeError):
+                                    existing_score = 0
+                                
+                                try:
+                                    value = int(value) if value is not None else 0
+                                except (ValueError, TypeError):
+                                    value = 0
+                                
+                                existing_item["interest_score"] = max(existing_score, value)
                             else:
                                 extracted_keywords.append({
                                     "query": query_text,
@@ -889,6 +907,7 @@ def _extract_keywords_from_trend_data(trend_data: Dict) -> List[Dict]:
                         })
     except Exception as e:
         logger.error(f"Error while extracting keywords from trend data: {e}")
+        logger.error(f"Trend data type: {type(trend_data)}, content: {str(trend_data)[:200] if trend_data else 'None'}")
         extracted_keywords = []
                 
     return extracted_keywords
@@ -1295,8 +1314,8 @@ def get_comprehensive_optimization(
     analytics_data: Dict = {},
     competitor_analytics_data: Dict = {},
     category_name: str = "",
-    model: str = "claude-3-7-sonnet-20250219",
-    max_retries: int = 3,
+    model: str = "claude-3-5-haiku-20241022",  # Faster model for optimization
+    max_retries: int = 2,  # Reduced retries for faster processing
     user_id: Optional[int] = None,
     maintain_full_original_description: bool = True, # Flag to maintain full original description
     prev_optimizations: List[Dict] = [] # List of existing optimizations
@@ -1374,106 +1393,134 @@ def get_comprehensive_optimization(
         trending_keywords, competitor_analytics_data, user_id
     )
 
-    # Try multiple times with slightly different prompts
-    for attempt in range(max_retries):
-        try:
-            if attempt > 0:
-                logger.info(f"Retry attempt {attempt} for comprehensive optimization")
+    # Define fallback models for comprehensive optimization
+    fallback_models = [
+        model,  # Original model first
+        "claude-3-5-haiku-20241022",  # Fastest model as fallback
+        "claude-3-5-sonnet-20241022"   # Alternative model
+    ]
+    
+    # Try multiple models and retries
+    for model_attempt, current_model in enumerate(fallback_models):
+        for attempt in range(max_retries):
+            try:
+                if attempt > 0:
+                    logger.info(f"Retry attempt {attempt} for comprehensive optimization with {current_model}")
 
-            temperature = 0.7 + (attempt * 0.1)
+                temperature = 0.7 + (attempt * 0.1)
 
-            system_message = """You are a YouTube SEO expert who specializes in optimizing videos for maximum engagement, 
-            searchability and audience retention. You understand what makes content perform well and how to optimize 
-            metadata to increase views, watch time, and subscriber conversion.
-            
-            IMPORTANT: Your response MUST be valid JSON with properly escaped characters."""
+                system_message = """You are a YouTube SEO expert who specializes in optimizing videos for maximum engagement, 
+                searchability and audience retention. You understand what makes content perform well and how to optimize 
+                metadata to increase views, watch time, and subscriber conversion.
+                
+                IMPORTANT: Your response MUST be valid JSON with properly escaped characters."""
 
-            # Build the optimization prompt
-            prompt = _build_optimization_prompt(
-                original_title, original_description, tags_str, translated_transcript,
-                original_language, trending_keywords, optimized_hashtags, category_name,
-                like_count, comment_count, optimization_decision_data,
-                maintain_full_original_description, attempt
-            )
+                # Build the optimization prompt
+                prompt = _build_optimization_prompt(
+                    original_title, original_description, tags_str, translated_transcript,
+                    original_language, trending_keywords, optimized_hashtags, category_name,
+                    like_count, comment_count, optimization_decision_data,
+                    maintain_full_original_description, attempt
+                )
 
-            tools = [
-                {
-                    "name": "provide_comprehensive_video_optimizations",
-                    "description": "Provides three distinct sets of optimized title, description, and tags for a YouTube video, along with notes explaining the reasoning for each variation.",
-                    "input_schema": {
-                        "type": "object",
-                        "properties": {
-                            "optimizations": {
-                                "type": "array",
-                                "description": "A list containing exactly three optimization objects.",
-                                "minItems": 3,
-                                "maxItems": 3,
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "optimized_title": {
-                                            "type": "string",
-                                            "description": "The optimized video title for this variation."
+                tools = [
+                    {
+                        "name": "provide_comprehensive_video_optimizations",
+                        "description": "Provides three distinct sets of optimized title, description, and tags for a YouTube video, along with notes explaining the reasoning for each variation.",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {
+                                "optimizations": {
+                                    "type": "array",
+                                    "description": "A list containing exactly three optimization objects.",
+                                    "minItems": 3,
+                                    "maxItems": 3,
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "optimized_title": {
+                                                "type": "string",
+                                                "description": "The optimized video title for this variation."
+                                            },
+                                            "optimized_description": {
+                                                "type": "string",
+                                                "description": "The optimized video description for this variation."
+                                            },
+                                            "optimized_tags": {
+                                                "type": "array",
+                                                "description": "A list of optimized video tags (strings) for this variation. Each tag should be a single word or joined phrase.",
+                                                "items": {"type": "string"}
+                                            },
+                                            "optimization_notes": {
+                                                "type": "string",
+                                                "description": "Detailed explanation of the changes made for this specific variation and why they will improve performance."
+                                            },
+                                            "optimization_score": {
+                                                "type": "number",
+                                                "description": "A score from 0.0 to 1.0 indicating the estimated effectiveness of this optimization variation.",
+                                                "minimum": 0,
+                                                "maximum": 1
+                                            }
                                         },
-                                        "optimized_description": {
-                                            "type": "string",
-                                            "description": "The optimized video description for this variation."
-                                        },
-                                        "optimized_tags": {
-                                            "type": "array",
-                                            "description": "A list of optimized video tags (strings) for this variation. Each tag should be a single word or joined phrase.",
-                                            "items": {"type": "string"}
-                                        },
-                                        "optimization_notes": {
-                                            "type": "string",
-                                            "description": "Detailed explanation of the changes made for this specific variation and why they will improve performance."
-                                        },
-                                        "optimization_score": {
-                                            "type": "number",
-                                            "description": "A score from 0.0 to 1.0 indicating the estimated effectiveness of this optimization variation.",
-                                            "minimum": 0,
-                                            "maximum": 1
-                                        }
-                                    },
-                                    "required": ["optimized_title", "optimized_description", "optimized_tags", "optimization_notes", "optimization_score"]
+                                        "required": ["optimized_title", "optimized_description", "optimized_tags", "optimization_notes", "optimization_score"]
+                                    }
                                 }
-                            }
-                        },
-                        "required": ["optimizations"]
+                            },
+                            "required": ["optimizations"]
+                        }
                     }
-                }
-            ]
-
-            response = client.messages.create(
-                model=model,
-                max_tokens=4096,
-                temperature=temperature,
-                system=system_message,
-                tools=tools,
-                messages=[
-                    {"role": "user", "content": prompt}
                 ]
-            )
 
-            generated_optimizations = None
-            for content in response.content:
-                if content.type == "tool_use" and content.name == "provide_comprehensive_video_optimizations":
-                    generated_optimizations = content.input
-                    if generated_optimizations:
-                        # Process and enhance the optimization response
-                        optimizations = _process_optimization_response(
-                            generated_optimizations, translated_transcript, original_title,
-                            original_description, optimized_hashtags, original_language,
-                            category_name, prev_optimizations
-                        )
-                        return optimizations
+                response = client.messages.create(
+                    model=current_model,
+                    max_tokens=4096,
+                    temperature=temperature,
+                    system=system_message,
+                    tools=tools,
+                    messages=[
+                        {"role": "user", "content": prompt}
+                    ]
+                )
 
-        except Exception as e:
-            logger.error(f"Retry attempt {attempt+1} failed with error: {e}")
-            retry_errors.append(f"Attempt {attempt+1}: {str(e)}")
+                generated_optimizations = None
+                for content in response.content:
+                    if content.type == "tool_use" and content.name == "provide_comprehensive_video_optimizations":
+                        generated_optimizations = content.input
+                        if generated_optimizations:
+                            # Process and enhance the optimization response
+                            optimizations = _process_optimization_response(
+                                generated_optimizations, translated_transcript, original_title,
+                                original_description, optimized_hashtags, original_language,
+                                category_name, prev_optimizations
+                            )
+                            return optimizations
 
-    # If we get here, all retries failed
-    logger.error(f"All {max_retries} optimization attempts failed")
+            except Exception as e:
+                error_message = str(e)
+                logger.warning(f"Model {current_model}, attempt {attempt+1} failed with error: {error_message}")
+                
+                # Check for specific error types
+                if "overloaded" in error_message.lower() or "529" in error_message:
+                    logger.warning(f"Model {current_model} is overloaded (529 error), trying next model...")
+                    break  # Break retry loop and try next model
+                elif "rate_limit" in error_message.lower() or "429" in error_message:
+                    logger.warning(f"Rate limit hit on {current_model}, waiting before retry...")
+                    time.sleep(5)
+                    continue
+                else:
+                    logger.error(f"Unexpected error with model {current_model}: {error_message}")
+                    retry_errors.append(f"Model {current_model}, Attempt {attempt+1}: {str(e)}")
+                    if attempt < max_retries - 1:
+                        continue
+                    else:
+                        break  # Move to next model
+        
+        # If we successfully got a response, break out of model loop
+        if 'generated_optimizations' in locals() and generated_optimizations:
+            break
+    
+    # If we get here, all models and retries failed
+    logger.error(f"All optimization attempts failed across all models")
     return {}
 
 def parse_json_with_pattern(response_text: str) -> Dict:
@@ -2207,32 +2254,98 @@ def extract_keywords_with_llm(
     Return ONLY a comma-separated list of {min_keywords}-{max_keywords} keywords (each 1-2 words), sorted from most to least optimal for competitor and trends research. NO other text.
     """
 
-    try:
-        response = client.messages.create(
-            model="claude-3-7-sonnet-20250219",
-            max_tokens=100,
-            temperature=0.3,  # Low temperature for consistency
-            system=system_message,
-            messages=[{"role": "user", "content": prompt}]
-        )
+    # Define fallback models for better reliability
+    fallback_models = [
+        "claude-3-5-haiku-20241022",  # Fastest model first
+        "claude-3-7-sonnet-20250219",  # Original model as fallback
+        "claude-3-5-sonnet-20241022"   # Alternative model
+    ]
+    
+    for model_attempt, model in enumerate(fallback_models):
+        try:
+            logger.info(f"Attempting keyword extraction with model: {model} (attempt {model_attempt + 1})")
+            
+            response = client.messages.create(
+                model=model,
+                max_tokens=100,
+                temperature=0.3,  # Low temperature for consistency
+                system=system_message,
+                messages=[{"role": "user", "content": prompt}]
+            )
 
-        # Extract response text and clean it
-        if response.content and len(response.content) > 0:
-            keywords_text = response.content[0].text.strip()
-            # Split by commas and strip whitespace from each keyword
-            keywords = [kw.strip() for kw in keywords_text.split(',')]
-            # Filter out empty strings or very short keywords
-            keywords = [kw for kw in keywords if len(kw) > 2]
+            # Extract response text and clean it
+            if response.content and len(response.content) > 0:
+                keywords_text = response.content[0].text.strip()
+                # Split by commas and strip whitespace from each keyword
+                keywords = [kw.strip() for kw in keywords_text.split(',')]
+                # Filter out empty strings or very short keywords
+                keywords = [kw for kw in keywords if len(kw) > 2]
 
-            logger.info(f"Extracted keywords via LLM: {keywords}")
-            return keywords[:max_keywords]  # Ensure we don't exceed max_keywords
+                logger.info(f"Successfully extracted keywords via LLM ({model}): {keywords}")
+                return keywords[:max_keywords]  # Ensure we don't exceed max_keywords
 
-        return []
+        except Exception as e:
+            error_message = str(e)
+            logger.warning(f"Model {model} failed with error: {error_message}")
+            
+            # Check for specific error types
+            if "overloaded" in error_message.lower() or "529" in error_message:
+                logger.warning(f"Model {model} is overloaded (529 error), trying next model...")
+                if model_attempt < len(fallback_models) - 1:
+                    time.sleep(2 ** model_attempt)  # Exponential backoff
+                    continue
+            elif "rate_limit" in error_message.lower() or "429" in error_message:
+                logger.warning(f"Rate limit hit on {model}, waiting before retry...")
+                time.sleep(5)
+                continue
+            else:
+                logger.error(f"Unexpected error with model {model}: {error_message}")
+                if model_attempt < len(fallback_models) - 1:
+                    continue
+    
+    # If all models failed, fall back to simple keyword extraction
+    logger.warning("All LLM models failed for keyword extraction, using fallback method")
+    return _extract_keywords_fallback(title, description, tags)
 
-    except Exception as e:
-        logger.error(f"Error extracting keywords with LLM: {e}")
-        # Fall back to frequency-based extraction if LLM fails
-        return []
+
+def _extract_keywords_fallback(title: str, description: str, tags: list = None) -> list[str]:
+    """
+    Fallback keyword extraction method when LLM fails.
+    Uses simple text analysis to extract potential keywords.
+    """
+    import re
+    from collections import Counter
+    
+    # Combine all text sources
+    text_sources = [title]
+    if description:
+        text_sources.append(description)
+    if tags:
+        text_sources.extend(tags)
+    
+    combined_text = " ".join(text_sources).lower()
+    
+    # Remove common stop words
+    stop_words = {
+        'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by',
+        'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did',
+        'will', 'would', 'could', 'should', 'may', 'might', 'can', 'this', 'that', 'these', 'those',
+        'i', 'you', 'he', 'she', 'it', 'we', 'they', 'me', 'him', 'her', 'us', 'them', 'my', 'your',
+        'his', 'her', 'its', 'our', 'their', 'how', 'what', 'when', 'where', 'why', 'who', 'which'
+    }
+    
+    # Extract words (2-3 characters minimum)
+    words = re.findall(r'\b[a-zA-Z]{2,}\b', combined_text)
+    
+    # Filter out stop words and count frequency
+    filtered_words = [word for word in words if word not in stop_words and len(word) > 2]
+    word_counts = Counter(filtered_words)
+    
+    # Get most common words as keywords
+    keywords = [word for word, count in word_counts.most_common(5)]
+    
+    logger.info(f"Fallback keyword extraction result: {keywords}")
+    return keywords
 
 
 def find_relevant_topic_id(
@@ -2559,43 +2672,68 @@ def extract_competitor_keywords(top_competitor_videos, video_data, max_keywords=
     }}
     """
     
-    try:
-        response = client.messages.create(
-            model=model,
-            max_tokens=1000,
-            temperature=0.3,
-            system=system_message,
-            messages=[{"role": "user", "content": prompt}]
-        )
-
-        if response.content and len(response.content) > 0:
-            response_text = response.content[0].text.strip()
-
-            result = parse_json_with_pattern(response_text)
-            
-            if result and "keywords" in result and isinstance(result["keywords"], list):
-                # Ensure we don't exceed max_keywords and remove any hashtags
-                processed_keywords = []
-                for kw in result["keywords"]:
-                    if isinstance(kw, str):
-                        processed_keywords.append(kw.replace("#", "").strip())
-                
-                result["keywords"] = [kw for kw in processed_keywords if kw][:max_keywords]
-                logger.info(f"Extracted competitor keywords relevant to user video: {result['keywords']}")
-                return result
-
-        logger.warning("Couldn't parse competitor keywords from model response")
-        return {
-            "keywords": [],
-            "explanation": "Failed to extract keywords from competitor analysis."
-        }
+    # Define fallback models for competitor analysis
+    fallback_models = [
+        "claude-3-5-haiku-20241022",  # Fastest model first
+        "claude-3-7-sonnet-20250219",  # Original model
+        "claude-3-5-sonnet-20241022"   # Alternative model
+    ]
     
-    except Exception as e:
-        logger.error(f"Error extracting competitor keywords: {e}")
-        return {
-            "keywords": [],
-            "explanation": f"Error extracting keywords: {str(e)}"
-        }
+    for model_attempt, current_model in enumerate(fallback_models):
+        try:
+            logger.info(f"Attempting competitor keyword extraction with model: {current_model}")
+            
+            response = client.messages.create(
+                model=current_model,
+                max_tokens=1000,
+                temperature=0.3,
+                system=system_message,
+                messages=[{"role": "user", "content": prompt}]
+            )
+
+            if response.content and len(response.content) > 0:
+                response_text = response.content[0].text.strip()
+
+                result = parse_json_with_pattern(response_text)
+                
+                if result and "keywords" in result and isinstance(result["keywords"], list):
+                    # Ensure we don't exceed max_keywords and remove any hashtags
+                    processed_keywords = []
+                    for kw in result["keywords"]:
+                        if isinstance(kw, str):
+                            processed_keywords.append(kw.replace("#", "").strip())
+                    
+                    result["keywords"] = [kw for kw in processed_keywords if kw][:max_keywords]
+                    logger.info(f"Successfully extracted competitor keywords ({current_model}): {result['keywords']}")
+                    return result
+
+            logger.warning(f"Couldn't parse competitor keywords from {current_model} response")
+            
+        except Exception as e:
+            error_message = str(e)
+            logger.warning(f"Model {current_model} failed with error: {error_message}")
+            
+            # Check for specific error types
+            if "overloaded" in error_message.lower() or "529" in error_message:
+                logger.warning(f"Model {current_model} is overloaded (529 error), trying next model...")
+                if model_attempt < len(fallback_models) - 1:
+                    time.sleep(2 ** model_attempt)  # Exponential backoff
+                    continue
+            elif "rate_limit" in error_message.lower() or "429" in error_message:
+                logger.warning(f"Rate limit hit on {current_model}, waiting before retry...")
+                time.sleep(5)
+                continue
+            else:
+                logger.error(f"Unexpected error with model {current_model}: {error_message}")
+                if model_attempt < len(fallback_models) - 1:
+                    continue
+    
+    # If all models failed, return empty result
+    logger.warning("All LLM models failed for competitor keyword extraction")
+    return {
+        "keywords": [],
+        "explanation": "All LLM models failed due to overload or other errors. Using fallback."
+    }
 
 def filter_generic_keywords_with_llm(
     keywords: List[str],

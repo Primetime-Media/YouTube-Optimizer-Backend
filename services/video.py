@@ -204,39 +204,54 @@ def generate_video_optimization(
     update_optimization_progress(optimization_id, 25)
     
     try:
-        thumbnail_optimization_result = None
-        try:
-            # TODO: PARALLELIZE THUMBNAIL OPTIMIZATION AND COMPREHENSIVE OPTIMIZATION
-            thumbnail_optimization_result = do_thumbnail_optimization(
-                video_id=video.get("video_id"),
+        # PARALLELIZE THUMBNAIL AND CONTENT OPTIMIZATION
+        import asyncio
+        import concurrent.futures
+        
+        def run_thumbnail_optimization():
+            try:
+                return do_thumbnail_optimization(
+                    video_id=video.get("video_id"),
+                    original_title=title,
+                    original_description=description,
+                    original_tags=tags,
+                    transcript=transcript,
+                    competitor_analytics_data=competitor_analytics_data,
+                    category_name=category_name,
+                    user_id=user_id
+                )
+            except Exception as e:
+                logger.warning(f"Thumbnail optimization failed for video {video.get('video_id')}: {str(e)}")
+                return None
+        
+        def run_content_optimization():
+            return get_comprehensive_optimization(
                 original_title=title,
                 original_description=description,
                 original_tags=tags,
                 transcript=transcript,
-                competitor_analytics_data=competitor_analytics_data,
+                has_captions=has_captions,
+                like_count=like_count,
+                comment_count=comment_count,
+                optimization_decision_data=optimization_decision_data or {},
+                analytics_data=analytics_data or {},
+                competitor_analytics_data=competitor_analytics_data or {},
                 category_name=category_name,
-                user_id=user_id
+                user_id=user_id,
+                prev_optimizations=prev_optimizations or []
             )
-        except Exception as e:
-            logger.warning(f"Thumbnail optimization failed for video {video.get('video_id')}: {str(e)}")
-            thumbnail_optimization_result = None
-
-        # Call the optimization function with all data
-        result = get_comprehensive_optimization(
-            original_title=title,
-            original_description=description,
-            original_tags=tags,
-            transcript=transcript,
-            has_captions=has_captions,
-            like_count=like_count,
-            comment_count=comment_count,
-            optimization_decision_data=optimization_decision_data or {},
-            analytics_data=analytics_data or {},
-            competitor_analytics_data=competitor_analytics_data or {},
-            category_name=category_name,
-            user_id=user_id,
-            prev_optimizations=prev_optimizations or []
-        )
+        
+        # Run both optimizations in parallel
+        logger.info("Starting parallel optimization processes...")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            thumbnail_future = executor.submit(run_thumbnail_optimization)
+            content_future = executor.submit(run_content_optimization)
+            
+            # Wait for both to complete
+            thumbnail_optimization_result = thumbnail_future.result()
+            result = content_future.result()
+        
+        logger.info("Parallel optimization processes completed")
 
         if not result:
             raise Exception("Optimization failed")
