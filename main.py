@@ -12,7 +12,6 @@ import os
 import uvicorn
 import logging
 import secrets
-
 # Local imports - organized by functionality
 from utils.db import init_db
 from routes.analytics import router as analytics_router
@@ -114,11 +113,17 @@ async def startup_db_client():
             raise RuntimeError("Insufficient system entropy for secure operations")
 
     # Initialize systems
-    init_db()
-    initialize_scheduler()
-    cleanup_invalid_sessions()
-    
-    logging.info("Database and scheduler initialized")
+    try:
+        init_db()
+        initialize_scheduler()
+        cleanup_invalid_sessions()
+        logging.info("Database and scheduler initialized")
+    except ConnectionError as e:
+        logging.error(f"Database initialization failed: {e}")
+        raise RuntimeError(f"Failed to initialize database: {e}")
+    except Exception as e:
+        logging.error(f"Unexpected error during initialization: {e}")
+        raise RuntimeError(f"Failed to initialize application: {e}")
 
 
 # Main entry point - Run application directly with uvicorn
