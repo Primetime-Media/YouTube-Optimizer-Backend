@@ -254,7 +254,7 @@ def generate_video_optimization(
         logger.info("Parallel optimization processes completed")
 
         if not result:
-            raise Exception("Optimization failed")
+            raise RuntimeError("LLM optimization failed to generate results")
 
         best_optimization = max(result, key=lambda x: x['optimization_score'])
 
@@ -276,7 +276,7 @@ def generate_video_optimization(
         optimization_results_stored = store_optimization_results(optimization_id, db_video_id, best_optimization)
 
         if not optimization_results_stored:
-            raise Exception("Failed to store optimization results")
+            raise RuntimeError("Failed to store optimization results in database")
         
         # Add optimization ID to the result
         best_optimization["id"] = optimization_id

@@ -4,9 +4,6 @@ import logging
 import re
 from datetime import datetime
 from services.youtube import (
-    fetch_video_analytics, 
-    fetch_video_timeseries_data,
-    fetch_and_store_youtube_analytics,
     fetch_video_analytics_async,
     fetch_video_timeseries_data_async,
     fetch_and_store_youtube_analytics_async
@@ -195,8 +192,17 @@ async def get_video_analytics(
     except HTTPException:
         # Re-raise HTTPExceptions directly
         raise
+    except ValueError as e:
+        logger.error(f"Invalid input for video analytics: {e}")
+        raise HTTPException(status_code=400, detail=f"Invalid input: {str(e)}")
+    except ConnectionError as e:
+        logger.error(f"Connection error getting video analytics: {e}")
+        raise HTTPException(status_code=503, detail=f"Connection error: {str(e)}")
+    except PermissionError as e:
+        logger.error(f"Permission error getting video analytics: {e}")
+        raise HTTPException(status_code=403, detail=f"Permission denied: {str(e)}")
     except Exception as e:
-        logger.error(f"Error getting video analytics: {e}")
+        logger.error(f"Unexpected error getting video analytics: {e}")
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
 
 @router.get("/video/{video_id}/timeseries")
@@ -298,8 +304,17 @@ async def get_video_timeseries(
     except HTTPException as http_exc:
         # Re-raise HTTPExceptions directly
         raise http_exc
+    except ValueError as e:
+        logger.error(f"Invalid input for video timeseries: {e}")
+        raise HTTPException(status_code=400, detail=f"Invalid input: {str(e)}")
+    except ConnectionError as e:
+        logger.error(f"Connection error getting video timeseries: {e}")
+        raise HTTPException(status_code=503, detail=f"Connection error: {str(e)}")
+    except PermissionError as e:
+        logger.error(f"Permission error getting video timeseries: {e}")
+        raise HTTPException(status_code=403, detail=f"Permission denied: {str(e)}")
     except Exception as e:
-        logger.error(f"Error getting video timeseries data for {video_id}: {e}")
+        logger.error(f"Unexpected error getting video timeseries data for {video_id}: {e}")
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
 
 @router.post("/video/{video_id}/refresh")

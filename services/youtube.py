@@ -12,7 +12,6 @@ import re
 import json
 import datetime
 import asyncio
-import httpx
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from google.oauth2.credentials import Credentials
@@ -75,9 +74,17 @@ def build_youtube_client(credentials):
             #developerKey="AIzaSyDrvHTmmZ5Vek_nN8moZVquSeQe1v4fY_0",
             cache_discovery=False,  # Disable cache to ensure fresh credentials are used
         )
+    except HttpError as e:
+        logger.error(f"YouTube API error building client: {e}")
+        if e.resp.status == 403:
+            raise PermissionError(f"YouTube API quota exceeded: {e}")
+        elif e.resp.status == 401:
+            raise PermissionError(f"YouTube API authentication failed: {e}")
+        else:
+            raise ConnectionError(f"YouTube API error: {e}")
     except Exception as e:
-        logger.error(f"Error building YouTube client: {e}")
-        raise
+        logger.error(f"Unexpected error building YouTube client: {e}")
+        raise RuntimeError(f"Failed to build YouTube client: {e}")
         
 def get_user_id_for_channel(channel_id: int) -> Optional[int]:
     """

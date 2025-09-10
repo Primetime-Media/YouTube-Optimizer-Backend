@@ -5,9 +5,9 @@ PostgreSQL connection pooling, database initialization, and database operation h
 with thread-safe connection management and resource cleanup.
 """
 
-import psycopg2
 from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 from psycopg2_pool import ThreadSafeConnectionPool
+from psycopg2 import OperationalError, DatabaseError as Psycopg2DatabaseError, InterfaceError, ProgrammingError
 from dotenv import load_dotenv
 import logging
 import threading
@@ -56,9 +56,12 @@ def get_connection_pool():
                     atexit.register(close_connection_pool)
                     
                     logger.info("Connection pool created successfully")
+                except (OperationalError, Psycopg2DatabaseError, InterfaceError) as e:
+                    logger.error(f"Database connection error creating pool: {e}")
+                    raise ConnectionError(f"Failed to create database connection pool: {e}")
                 except Exception as e:
-                    logger.error(f"Error creating connection pool: {e}")
-                    raise
+                    logger.error(f"Unexpected error creating connection pool: {e}")
+                    raise RuntimeError(f"Unexpected error during database pool creation: {e}")
     
     return _connection_pool
 
@@ -68,9 +71,12 @@ def get_connection():
         pool = get_connection_pool()
         conn = pool.getconn()
         return conn
+    except (OperationalError, Psycopg2DatabaseError, InterfaceError) as e:
+        logger.error(f"Database connection error getting connection from pool: {e}")
+        raise ConnectionError(f"Failed to get database connection from pool: {e}")
     except Exception as e:
-        logger.error(f"Error getting connection from pool: {e}")
-        raise
+        logger.error(f"Unexpected error getting connection from pool: {e}")
+        raise RuntimeError(f"Unexpected error getting database connection: {e}")
 
 def return_connection(conn):
     """Return a connection to the pool."""
@@ -80,8 +86,12 @@ def return_connection(conn):
             pool.putconn(conn)
         else:
             logger.warning("Attempted to return closed or invalid connection")
+    except (OperationalError, Psycopg2DatabaseError, InterfaceError) as e:
+        logger.error(f"Database error returning connection to pool: {e}")
+        # Don't raise here as this is cleanup - just log the error
     except Exception as e:
-        logger.error(f"Error returning connection to pool: {e}")
+        logger.error(f"Unexpected error returning connection to pool: {e}")
+        # Don't raise here as this is cleanup - just log the error
 
 def close_connection_pool():
     """Close the connection pool and all connections."""
