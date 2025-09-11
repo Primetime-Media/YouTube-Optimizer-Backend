@@ -19,6 +19,22 @@ from utils.db import get_connection
 from typing import Dict, List, Optional, Any
 from datetime import timezone  # Import timezone for UTC operations
 
+# Time constants
+DEFAULT_ANALYTICS_DAYS = 28
+DEFAULT_ANALYTICS_DAYS_TIMEDELTA = datetime.timedelta(days=DEFAULT_ANALYTICS_DAYS)
+SECONDS_PER_HOUR = 3600
+SECONDS_PER_MINUTE = 60
+MINUTES_PER_HOUR = 60
+HOURS_PER_DAY = 24
+DAYS_PER_WEEK = 7
+
+# Video duration constants
+MIN_VIDEO_DURATION_SECONDS = 360  # 6 minutes
+SHORTS_MAX_DURATION_SECONDS = 180  # 3 minutes
+
+# Image quality constants
+THUMBNAIL_JPEG_QUALITY = 90
+
 # Initialize logger for this module
 logger = logging.getLogger(__name__)
 
@@ -49,7 +65,7 @@ def parse_duration_to_seconds(duration_str):
         seconds = int(match.group(3) or 0)
         
         # Convert to total seconds
-        return hours * 3600 + minutes * 60 + seconds
+        return hours * SECONDS_PER_HOUR + minutes * SECONDS_PER_MINUTE + seconds
     except (ValueError, AttributeError) as e:
         logger.error(f"Error parsing duration '{duration_str}': {e}")
         return 0
@@ -158,7 +174,7 @@ def set_video_thumbnail(youtube_client, video_id: str, thumbnail_file: str) -> D
                     if img.mode in ('RGBA', 'P'):
                         img = img.convert('RGB')
                     # Save as JPG with 90% quality (good balance between quality and size)
-                    img.save(jpg_file, 'JPEG', quality=90, optimize=True, progressive=True)
+                    img.save(jpg_file, 'JPEG', quality=THUMBNAIL_JPEG_QUALITY, optimize=True, progressive=True)
 
                 # Update thumbnail_file to use the new JPG
                 thumbnail_file = jpg_file
@@ -394,7 +410,7 @@ def update_youtube_video(
 
 def update_youtube_channel_branding(
     youtube_client,
-    channel_db_id: int,
+    db_channel_id: int,
     optimized_description: str,
     optimized_keywords: str,
     optimization_id: int = None,
@@ -406,7 +422,7 @@ def update_youtube_channel_branding(
     
     Args:
         youtube_client: YouTube API client
-        channel_db_id: The database ID of the channel
+        db_channel_id: The database ID of the channel
         optimized_description: The optimized channel description
         optimized_keywords: The optimized channel keywords (as a single string)
         optimization_id: The ID of the optimization record (optional)
@@ -417,7 +433,7 @@ def update_youtube_channel_branding(
         dict: Result of the update operation
     """
     try:
-        logger.info(f"Starting YouTube channel branding update for channel {channel_db_id}")
+        logger.info(f"Starting YouTube channel branding update for channel {db_channel_id}")
         
         # Determine if updating all fields or specific ones
         update_all = not (only_description or only_keywords)
@@ -430,11 +446,11 @@ def update_youtube_channel_branding(
                     SELECT channel_id, branding_settings
                     FROM youtube_channels
                     WHERE id = %s
-                """, (channel_db_id,))
+                """, (db_channel_id,))
                 
                 result = cursor.fetchone()
                 if not result:
-                    logger.error(f"Channel {channel_db_id} not found in database")
+                    logger.error(f"Channel {db_channel_id} not found in database")
                     return {
                         "success": False,
                         "error": "Channel not found in database"
@@ -513,7 +529,7 @@ def update_youtube_channel_branding(
                          set_clauses.append("last_optimization_id = %s")
                          params.append(optimization_id)
                          
-                         params.append(channel_db_id) # For the WHERE clause
+                         params.append(db_channel_id) # For the WHERE clause
                          
                          sql = f"UPDATE youtube_channels SET {', '.join(set_clauses)} WHERE id = %s"
                          cursor.execute(sql, tuple(params))
@@ -689,7 +705,7 @@ def fetch_videos(credentials, max_results=50):
             duration_seconds = parse_duration_to_seconds(duration_str)
             
             # Skip shorts (under 60 seconds) and videos under 6 minutes (360 seconds)
-            if duration_seconds >= 360:  # 6 minutes = 360 seconds
+            if duration_seconds >= MIN_VIDEO_DURATION_SECONDS:  # 6 minutes = 360 seconds
                 filtered_videos.append(video)
 
         all_videos = filtered_videos
@@ -1349,7 +1365,7 @@ def timecode_to_seconds(timecode: str) -> float:
             return 0.0
         
         hours, minutes, seconds = parts
-        return float(hours) * 3600 + float(minutes) * 60 + float(seconds)
+        return float(hours) * SECONDS_PER_HOUR + float(minutes) * SECONDS_PER_MINUTE + float(seconds)
         
     except (ValueError, IndexError) as e:
         logger.error(f"Error parsing timecode '{timecode}': {e}")
@@ -1408,7 +1424,7 @@ def fetch_video_analytics(credentials, video_id: str, metrics: List[str], dimens
             logger.info(f"Using default end_date: {end_date}")
         if not start_date:
             # Default to 28 days ago
-            start_date = (datetime.datetime.now() - datetime.timedelta(days=28)).strftime('%Y-%m-%d')
+            start_date = (datetime.datetime.now() - DEFAULT_ANALYTICS_DAYS_TIMEDELTA).strftime('%Y-%m-%d')
             logger.info(f"Using default start_date: {start_date}")
         
         # Prepare filters and parameters
@@ -1936,7 +1952,7 @@ def fetch_channel_analytics(credentials, metrics: List[str], dimensions: List[st
             end_date = datetime.datetime.now().strftime('%Y-%m-%d')
         if not start_date:
             # Default to 28 days ago
-            start_date = (datetime.datetime.now() - datetime.timedelta(days=28)).strftime('%Y-%m-%d')
+            start_date = (datetime.datetime.now() - DEFAULT_ANALYTICS_DAYS_TIMEDELTA).strftime('%Y-%m-%d')
         
         # Prepare parameters
         metrics_str = ','.join(metrics)

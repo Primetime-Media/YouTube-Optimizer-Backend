@@ -262,7 +262,7 @@ def _store_channel_data(cursor, user_id, channel_info):
     result = cursor.fetchone()
     return result[0] if result else None
 
-def _store_video_data(cursor, channel_db_id, videos):
+def _store_video_data(cursor, db_channel_id, videos):
     """
     Store video data in database using FastAPI-compatible comprehensive schema, filtering out shorts.
     """
@@ -371,8 +371,8 @@ def _store_video_data(cursor, channel_db_id, videos):
                     status_details = EXCLUDED.status_details,
                     topic_details = EXCLUDED.topic_details,
                     updated_at = CURRENT_TIMESTAMP
-            """, (
-                channel_db_id,
+                """, (
+                db_channel_id,
                 video['id'],
                 video.get('kind', 'youtube#video'),
                 video.get('etag', ''),
@@ -454,14 +454,14 @@ def fetch_and_store_youtube_data(user_id: int, max_videos: int = 1000):
         try:
             with conn.cursor() as cursor:
                 # Store channel data
-                channel_db_id = _store_channel_data(cursor, user_id, channel_info)
+                db_channel_id = _store_channel_data(cursor, user_id, channel_info)
                 
-                if not channel_db_id:
+                if not db_channel_id:
                     logger.error(f"Failed to store channel data for user {user_id}")
                     return False
                 
                 # Store video data
-                stored_count = _store_video_data(cursor, channel_db_id, videos)
+                stored_count = _store_video_data(cursor, db_channel_id, videos)
                 
                 conn.commit()
                 
