@@ -34,6 +34,25 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 GEMINI_API_KEY = os.getenv("GOOGLE_API_KEY")
+# Download constants
+DEFAULT_CHUNK_SIZE = 8192
+DEFAULT_MAX_WORKERS = 5
+DEFAULT_VIDEO_FORMAT = "mp4"
+DEFAULT_AUDIO_FORMAT = "mp3"
+DEFAULT_RESOLUTION = "lowest-available"
+
+# --- Sieve API related constants and functions ---
+SIEVE_API_KEY = os.getenv("SIEVE_API_KEY")
+ # Replace with your key or set env var
+# if SIEVE_API_KEY == "YOUR_SIEVE_API_KEY_HERE":
+#     logging.error("SIEVE_API_KEY is not set in environment variables")
+
+BASE_URL = "https://mango.sievedata.com/v2"
+PUSH_ENDPOINT = f"{BASE_URL}/push"
+JOB_STATUS_ENDPOINT = f"{BASE_URL}/jobs"
+POLL_INTERVAL_SECONDS = 10 # How often to check the job status
+
+
 
 class SceneTime(BaseModel):
     timestamp_seconds: float = Field(..., description="The timestamp in seconds (e.g., 123.45) into the video for the suggested thumbnail frame.")
@@ -1373,24 +1392,6 @@ def optimize_thumbnail_with_openai(
         logging.error(f"An unexpected error occurred during OpenAI thumbnail optimization: {e}", exc_info=True)
         return None
 
-
-# --- Sieve API related constants and functions ---
-SIEVE_API_KEY = os.getenv("SIEVE_API_KEY")
- # Replace with your key or set env var
-# if SIEVE_API_KEY == "YOUR_SIEVE_API_KEY_HERE":
-#     logging.error("SIEVE_API_KEY is not set in environment variables")
-
-BASE_URL = "https://mango.sievedata.com/v2"
-PUSH_ENDPOINT = f"{BASE_URL}/push"
-JOB_STATUS_ENDPOINT = f"{BASE_URL}/jobs"
-POLL_INTERVAL_SECONDS = 10 # How often to check the job status
-
-# Download constants
-DEFAULT_CHUNK_SIZE = 8192
-DEFAULT_MAX_WORKERS = 5
-DEFAULT_VIDEO_FORMAT = "mp4"
-DEFAULT_AUDIO_FORMAT = "mp3"
-DEFAULT_RESOLUTION = "lowest-available"
 
 def submit_youtube_download_job(youtube_url: str, api_key: str) -> str | None:
     """
