@@ -394,7 +394,7 @@ def update_youtube_video(
 
 def update_youtube_channel_branding(
     youtube_client,
-    channel_db_id: int,
+    db_channel_id: int,
     optimized_description: str,
     optimized_keywords: str,
     optimization_id: int = None,
@@ -406,7 +406,7 @@ def update_youtube_channel_branding(
     
     Args:
         youtube_client: YouTube API client
-        channel_db_id: The database ID of the channel
+        db_channel_id: The database ID of the channel
         optimized_description: The optimized channel description
         optimized_keywords: The optimized channel keywords (as a single string)
         optimization_id: The ID of the optimization record (optional)
@@ -417,7 +417,7 @@ def update_youtube_channel_branding(
         dict: Result of the update operation
     """
     try:
-        logger.info(f"Starting YouTube channel branding update for channel {channel_db_id}")
+        logger.info(f"Starting YouTube channel branding update for channel {db_channel_id}")
         
         # Determine if updating all fields or specific ones
         update_all = not (only_description or only_keywords)
@@ -430,11 +430,11 @@ def update_youtube_channel_branding(
                     SELECT channel_id, branding_settings
                     FROM youtube_channels
                     WHERE id = %s
-                """, (channel_db_id,))
+                """, (db_channel_id,))
                 
                 result = cursor.fetchone()
                 if not result:
-                    logger.error(f"Channel {channel_db_id} not found in database")
+                    logger.error(f"Channel {db_channel_id} not found in database")
                     return {
                         "success": False,
                         "error": "Channel not found in database"
@@ -513,7 +513,7 @@ def update_youtube_channel_branding(
                          set_clauses.append("last_optimization_id = %s")
                          params.append(optimization_id)
                          
-                         params.append(channel_db_id) # For the WHERE clause
+                         params.append(db_channel_id) # For the WHERE clause
                          
                          sql = f"UPDATE youtube_channels SET {', '.join(set_clauses)} WHERE id = %s"
                          cursor.execute(sql, tuple(params))

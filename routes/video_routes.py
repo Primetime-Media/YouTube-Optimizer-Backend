@@ -250,9 +250,10 @@ async def apply_optimization_to_video(optimization_id: int, user = Depends(get_u
         try:
             with conn.cursor() as cursor:
                 cursor.execute("""
-                    SELECT v.channel_id
+                    SELECT c.user_id, v.channel_id
                     FROM video_optimizations o
                     JOIN youtube_videos v ON v.id = o.video_id
+                    JOIN youtube_channels c ON c.id = v.channel_id
                     WHERE o.id = %s
                 """, (optimization_id,))
                 
@@ -260,20 +261,7 @@ async def apply_optimization_to_video(optimization_id: int, user = Depends(get_u
                 if not result:
                     raise HTTPException(status_code=404, detail="Optimization not found")
                 
-                channel_id = result[0]
-                
-                # Get the user_id for this channel
-                cursor.execute("""
-                    SELECT user_id
-                    FROM youtube_channels
-                    WHERE id = %s
-                """, (channel_id,))
-                
-                user_result = cursor.fetchone()
-                if not user_result:
-                    raise HTTPException(status_code=404, detail="Channel not found")
-                
-                video_owner_id = user_result[0]
+                video_owner_id, channel_id = result
                 
                 # Verify the user owns this video
                 if user.id != video_owner_id:
@@ -592,7 +580,7 @@ async def get_channel_videos_performance(
             logger.info(f"Processing video {i+1}/{len(videos)}")
             
             try:
-                video_db_id = video_data[0]
+                db_video_id = video_data[0]
                 video_id = video_data[1]
                 title = video_data[2]
                 view_count = video_data[3]
@@ -601,14 +589,14 @@ async def get_channel_videos_performance(
                 last_optimized_at = video_data[8] if len(video_data) > 8 else None
                 last_optimization_id = video_data[9] if len(video_data) > 9 else None
                 
-                logger.info(f"Video DB ID: {video_db_id}, YouTube ID: {video_id}, Title: {title}")
+                logger.info(f"Video DB ID: {db_video_id}, YouTube ID: {video_id}, Title: {title}")
 
                 # Get optimization data if requested
                 optimizations = []
                 if include_optimizations:
-                    logger.info(f"Fetching optimization history for video {video_db_id}")
+                    logger.info(f"Fetching optimization history for video {db_video_id}")
                     try:
-                        optimizations = get_video_optimizations(video_db_id, optimization_limit)
+                        optimizations = get_video_optimizations(db_video_id, optimization_limit)
                         logger.info(f"Found {len(optimizations)} optimizations for video {video_id}")
                     except Exception as opt_err:
                         logger.warning(f"Error getting optimizations for video {video_id}: {opt_err}")
@@ -705,7 +693,7 @@ async def get_channel_videos_performance(
                 logger.info(f"Queueing video {video_id} for optimization processing")
                 
                 # Create a new optimization record for this request
-                optimization_id = create_optimization(video_db_id, num_optimizations_applied + 1)
+                optimization_id = create_optimization(db_video_id, num_optimizations_applied + 1)
                 if optimization_id == 0:
                     logger.error(f"Failed to create optimization record for video {video_id}")
                     continue
@@ -714,7 +702,7 @@ async def get_channel_videos_performance(
                 background_tasks.add_task(
                     process_video_optimization_async,
                     video_id=video_id,
-                    video_db_id=video_db_id,
+                    db_video_id=db_video_id,
                     user_id=channel_owner_id,
                     optimization_id=optimization_id,
                     detailed_video_data=detailed_video_data,
@@ -794,7 +782,7 @@ async def queue_videos_for_optimization(
                         failed_to_queue.append({"video_id": youtube_video_id, "reason": "Not found"})
                         continue # Skip to the next video ID
 
-                    video_db_id, video_owner_id = video_result
+                    db_video_id, video_owner_id = video_result
 
                     # 2. Verify the requesting user owns this video
                     # Add admin check if needed: and not user.is_admin
@@ -804,16 +792,16 @@ async def queue_videos_for_optimization(
                          continue # Skip to the next video ID
 
                     # 3. Update the video record to mark it for optimization
-                    logger.info(f"Updating video {video_db_id} (YouTube ID: {youtube_video_id}) to set queued_for_optimization=TRUE")
+                    logger.info(f"Updating video {db_video_id} (YouTube ID: {youtube_video_id}) to set queued_for_optimization=TRUE")
                     cursor.execute("""
                         UPDATE youtube_videos
                         SET queued_for_optimization = TRUE,
                             updated_at = NOW()
                         WHERE id = %s
-                    """, (video_db_id,))
+                    """, (db_video_id,))
 
                     # Add to success list *before* commit in case commit fails later
-                    successfully_queued.append({"video_id": youtube_video_id, "db_id": video_db_id})
+                    successfully_queued.append({"video_id": youtube_video_id, "db_id": db_video_id})
 
                 except Exception as video_err:                    
                     logger.error(f"Error processing video {youtube_video_id} in batch queue: {video_err}")
@@ -1365,7 +1353,7 @@ async def optimize_video_comprehensive(video_id: str):
 
 async def process_video_optimization_async(
     video_id: str,
-    video_db_id: int,
+    db_video_id: int,
     user_id: int,
     optimization_id: int,
     detailed_video_data: dict,
@@ -1383,7 +1371,7 @@ async def process_video_optimization_async(
     
     Args:
         video_id: YouTube video ID
-        video_db_id: Database video ID
+        db_video_id: Database video ID
         user_id: User ID who owns the video
         optimization_id: Pre-created optimization record ID
         detailed_video_data: Video metadata and content
