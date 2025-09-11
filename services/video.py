@@ -151,6 +151,55 @@ def update_optimization_progress(optimization_id: int, progress: int, status: st
         if conn:
             conn.close()
 
+def cleanup_generated_files(video_id: str) -> None:
+    """
+    Clean up generated video file and extracted thumbnails after optimization
+    
+    Args:
+        video_id: The YouTube video ID used for file naming
+    """
+    import os
+    import glob
+    from pathlib import Path
+    
+    try:
+        # Clean up video file
+        video_filename = f"{video_id}.mp4"
+        if os.path.exists(video_filename):
+            os.remove(video_filename)
+            logger.info(f"Cleaned up video file: {video_filename}")
+        
+        # Clean up extracted thumbnails directory
+        extracted_thumbnails_dir = "extracted_thumbnails"
+        if os.path.exists(extracted_thumbnails_dir):
+            # Find all thumbnail files related to this video
+            thumbnail_pattern = f"{extracted_thumbnails_dir}/orig_{video_id}_*.jpg"
+            thumbnail_files = glob.glob(thumbnail_pattern)
+            
+            for thumbnail_file in thumbnail_files:
+                try:
+                    os.remove(thumbnail_file)
+                    logger.info(f"Cleaned up thumbnail file: {thumbnail_file}")
+                except OSError as e:
+                    logger.warning(f"Failed to delete thumbnail file {thumbnail_file}: {e}")
+            
+            # Also clean up any thumbnails directory files that might not match the pattern
+            try:
+                thumbnails_pattern = f"{extracted_thumbnails_dir}/*{video_id}*.jpg"
+                additional_files = glob.glob(thumbnails_pattern)
+                for file_path in additional_files:
+                    if os.path.exists(file_path):
+                        os.remove(file_path)
+                        logger.info(f"Cleaned up additional thumbnail file: {file_path}")
+            except Exception as e:
+                logger.warning(f"Error cleaning up additional thumbnail files: {e}")
+        
+        
+        logger.info(f"Cleanup completed for video {video_id}")
+        
+    except Exception as e:
+        logger.error(f"Error during cleanup for video {video_id}: {str(e)}")
+
 def generate_video_optimization(
         video: Dict,
         user_id: int,
@@ -182,6 +231,7 @@ def generate_video_optimization(
     like_count = video.get("like_count", 0)
     comment_count = video.get("comment_count", 0)
     category_name = video.get("category_name", "")
+    video_id = video.get("video_id", "")  # YouTube video ID for cleanup
     
     # Verify optimization record exists
     if optimization_id == 0:
@@ -307,6 +357,10 @@ def generate_video_optimization(
             "id": optimization_id,
             "is_applied": False
         }
+    finally:
+        # Clean up generated files after optimization completes (success or failure)
+        if video_id:
+            cleanup_generated_files(video_id)
 
 def store_optimization_results(optimization_id: int, db_video_id: int, optimization_data: Dict) -> bool:
     """
