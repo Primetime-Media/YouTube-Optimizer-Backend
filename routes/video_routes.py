@@ -26,6 +26,21 @@ from typing import Optional, List
 from datetime import datetime
 import asyncio
 
+# HTTP Status Code Constants
+HTTP_STATUS_OK = 200
+HTTP_STATUS_BAD_REQUEST = 400
+HTTP_STATUS_UNAUTHORIZED = 401
+HTTP_STATUS_FORBIDDEN = 403
+HTTP_STATUS_NOT_FOUND = 404
+HTTP_STATUS_INTERNAL_SERVER_ERROR = 500
+HTTP_STATUS_SERVICE_UNAVAILABLE = 503
+
+# Default Values
+DEFAULT_OPTIMIZATION_LIMIT = 5
+DEFAULT_VIDEO_LIMIT = 100
+DEFAULT_OPTIMIZATION_CONFIDENCE_THRESHOLD = 0.5
+DEFAULT_OPTIMIZATION_CONFIDENCE_THRESHOLD_FLOAT = 0.5
+
 # Service imports - organized by functionality
 from services.video import (
     get_video_data,
@@ -114,7 +129,7 @@ async def optimize_video(youtube_video_id: str, background_tasks: BackgroundTask
         # Fetch video data from database
         video = get_video_data(youtube_video_id)
         if not video:
-            raise HTTPException(status_code=404, detail="Video not found")
+            raise HTTPException(status_code=HTTP_STATUS_NOT_FOUND, detail="Video not found")
         
         # Get user_id from the video's channel
         conn = get_connection()
@@ -135,7 +150,7 @@ async def optimize_video(youtube_video_id: str, background_tasks: BackgroundTask
         # Create a new optimization record for this request
         optimization_id = create_optimization(video["id"])
         if optimization_id == 0:
-            raise HTTPException(status_code=500, detail="Failed to create optimization record")
+            raise HTTPException(status_code=HTTP_STATUS_INTERNAL_SERVER_ERROR, detail="Failed to create optimization record")
             
         # Run the optimization in the background with the pre-created optimization ID
         background_tasks.add_task(generate_video_optimization, video, user_id, optimization_id)
@@ -196,7 +211,7 @@ async def get_optimization_status_endpoint(optimization_id: int):
 
 
 @router.get("/{youtube_video_id}/optimizations")
-async def get_video_optimizations_endpoint(youtube_video_id: str, limit: int = 5):
+async def get_video_optimizations_endpoint(youtube_video_id: str, limit: int = DEFAULT_OPTIMIZATION_LIMIT):
     """
     Get recent optimization results for a video
     
@@ -211,7 +226,7 @@ async def get_video_optimizations_endpoint(youtube_video_id: str, limit: int = 5
         # First, get the database ID for the video
         video = get_video_data(youtube_video_id)
         if not video:
-            raise HTTPException(status_code=404, detail="Video not found")
+            raise HTTPException(status_code=HTTP_STATUS_NOT_FOUND, detail="Video not found")
             
         optimizations = get_video_optimizations(video["id"], limit)
         return {
@@ -299,7 +314,7 @@ async def apply_optimization_to_video(optimization_id: int, user = Depends(get_u
 @router.get("/performance/all")
 async def get_all_videos_performance(
     interval: str = "1d",
-    limit: int = 100,
+    limit: int = DEFAULT_VIDEO_LIMIT,
     offset: int = 0,
     refresh: bool = False,
 ):
@@ -473,7 +488,7 @@ async def get_channel_videos_performance(
     refresh: bool = False,
     include_optimizations: bool = True,
     optimization_limit: int = 3,
-    optimization_confidence_threshold: float = 0.5
+    optimization_confidence_threshold: float = DEFAULT_OPTIMIZATION_CONFIDENCE_THRESHOLD
 ):
     """
     Get timeseries performance data for all videos in a specific channel.

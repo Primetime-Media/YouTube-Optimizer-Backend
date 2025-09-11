@@ -711,7 +711,7 @@ def do_thumbnail_optimization(
         
         # Process frames in parallel
         results = []
-        with ThreadPoolExecutor(max_workers=min(5, len(extracted_frames))) as executor:
+        with ThreadPoolExecutor(max_workers=min(DEFAULT_MAX_WORKERS, len(extracted_frames))) as executor:
             future_to_frame = {
                 executor.submit(
                     process_single_thumbnail,
@@ -1385,6 +1385,13 @@ PUSH_ENDPOINT = f"{BASE_URL}/push"
 JOB_STATUS_ENDPOINT = f"{BASE_URL}/jobs"
 POLL_INTERVAL_SECONDS = 10 # How often to check the job status
 
+# Download constants
+DEFAULT_CHUNK_SIZE = 8192
+DEFAULT_MAX_WORKERS = 5
+DEFAULT_VIDEO_FORMAT = "mp4"
+DEFAULT_AUDIO_FORMAT = "mp3"
+DEFAULT_RESOLUTION = "lowest-available"
+
 def submit_youtube_download_job(youtube_url: str, api_key: str) -> str | None:
     """
     Submits a job to the Sieve API to download a YouTube video.
@@ -1405,7 +1412,7 @@ def submit_youtube_download_job(youtube_url: str, api_key: str) -> str | None:
         "inputs": {
             "url": youtube_url,
             "download_type": "video", # Or "audio"
-            "resolution": "lowest-available",
+            "resolution": DEFAULT_RESOLUTION,
             "include_audio": True,
             "start_time": 0,
             "end_time": -1, # -1 means download until the end
@@ -1413,8 +1420,8 @@ def submit_youtube_download_job(youtube_url: str, api_key: str) -> str | None:
             # "metadata_fields": "title,thumbnail,description,tags,duration", # Uncomment if include_metadata is True
             "include_subtitles": False,
             # "subtitle_languages": "en", # Uncomment if include_subtitles is True
-            "video_format": "mp4",
-            "audio_format": "mp3" # Relevant if download_type is "audio" or include_audio is True
+            "video_format": DEFAULT_VIDEO_FORMAT,
+            "audio_format": DEFAULT_AUDIO_FORMAT # Relevant if download_type is "audio" or include_audio is True
         }
     }
 
@@ -1524,7 +1531,7 @@ def download_video_from_url(video_url: str, output_path: str) -> bool:
             # Ensure the directory exists
             Path(output_path).parent.mkdir(parents=True, exist_ok=True)
             with open(output_path, 'wb') as f:
-                for chunk in r.iter_content(chunk_size=8192):
+                for chunk in r.iter_content(chunk_size=DEFAULT_CHUNK_SIZE):
                     f.write(chunk)
         logging.info(f"Video downloaded successfully to: {output_path}")
         return True
