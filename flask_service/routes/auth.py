@@ -12,7 +12,6 @@ def process_auth_data():
     Stores user data, fetches YouTube videos, and queues them for optimization.
     """
     try:
-        breakpoint()
         # Get the JSON data from the request
         auth_data = request.get_json()
         

@@ -142,7 +142,6 @@ def payment_setup():
         
         logger.info(f"Stripe Checkout initiated for user: {user_data.get('email')}")
         logger.info(f"Redirecting to: {checkout_url}")
-        print(checkout_url)
         # Redirect to Stripe Checkout
         return redirect(checkout_url)
         
