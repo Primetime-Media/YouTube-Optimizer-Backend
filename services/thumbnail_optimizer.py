@@ -116,9 +116,9 @@ def generate_content_from_file(
 ) -> GenerateContentResponse | None:
     client = None
     uploaded_file_name = None
-    # Max time to wait for file processing (e.g., 3 minutes)
-    MAX_PROCESSING_TIME_SECONDS = 180
-    POLL_INTERVAL_SECONDS = 5
+    # Reduced processing time for faster optimization
+    MAX_PROCESSING_TIME_SECONDS = 60  # Reduced from 180 to 60 seconds
+    POLL_INTERVAL_SECONDS = 2  # Reduced from 5 to 2 seconds
 
     try:
         if not GEMINI_API_KEY:
@@ -182,13 +182,13 @@ def generate_content_from_file(
         if generation_config and "response_schema" in generation_config:
             response_schema = generation_config["response_schema"]
 
-        # Define fallback models in order of preference
+        # Define fallback models in order of preference (prioritize faster models)
         fallback_models = [
             model_name,
+            "gemini-2.0-flash",  # Prioritize faster model
+            "gemini-2.5-flash-preview-05-20",
             "gemini-2.5-pro-preview-05-06",
-            "gemini-2.5-pro-preview-06-05",
-            "gemini-2.0-flash",
-            "gemini-2.5-flash-preview-05-20"
+            "gemini-2.5-pro-preview-06-05"
         ]
         
         # Remove duplicates while preserving order
@@ -297,7 +297,7 @@ def generate_content_from_file(
 def get_competitor_thumbnail_descriptions(
     competitor_analytics_data: Dict[str, Any],
     model_name: str = "gemini-2.0-flash",
-    max_workers: int = 5
+    max_workers: int = 3  # Reduced workers for faster processing
 ) -> List[CompetitorThumbnailDescription]:
     """
     Generate thumbnail descriptions for competitor thumbnails in parallel.
@@ -1393,6 +1393,23 @@ def optimize_thumbnail_with_openai(
         return None
 
 
+# --- Sieve API related constants and functions ---
+SIEVE_API_KEY = os.getenv("SIEVE_API_KEY")
+ # Replace with your key or set env var
+# if SIEVE_API_KEY == "YOUR_SIEVE_API_KEY_HERE":
+#     logging.error("SIEVE_API_KEY is not set in environment variables")
+
+BASE_URL = "https://mango.sievedata.com/v2"
+PUSH_ENDPOINT = f"{BASE_URL}/push"
+JOB_STATUS_ENDPOINT = f"{BASE_URL}/jobs"
+POLL_INTERVAL_SECONDS = 5 # Reduced polling interval for faster processing
+
+# Download constants
+DEFAULT_CHUNK_SIZE = 8192
+DEFAULT_MAX_WORKERS = 5
+DEFAULT_VIDEO_FORMAT = "mp4"
+DEFAULT_AUDIO_FORMAT = "mp3"
+DEFAULT_RESOLUTION = "lowest-available"
 def submit_youtube_download_job(youtube_url: str, api_key: str) -> str | None:
     """
     Submits a job to the Sieve API to download a YouTube video.
