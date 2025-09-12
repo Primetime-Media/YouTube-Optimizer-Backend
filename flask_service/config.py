@@ -12,7 +12,7 @@ class Config:
     PORT = int(os.getenv('FLASK_PORT', 5001))
     
     # OAuth Configuration
-    CLIENT_SECRET_FILE = os.getenv('CLIENT_SECRET_FILE', '../client_secret_941974948417-la4udombfq14du8vea6b8jqmo6d8nbv8.apps.googleusercontent.com.json')
+    CLIENT_SECRET_FILE = os.getenv('CLIENT_SECRET_FILE')
     FRONTEND_URL = os.getenv('FRONTEND_URL', 'http://localhost:3000')
     
     # Load Google OAuth credentials from JSON file
