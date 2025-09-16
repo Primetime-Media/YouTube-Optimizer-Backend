@@ -5,6 +5,7 @@ from services.stripe_service import (
     process_checkout_session_success,
     get_customer_payment_methods,
     find_customer_by_email,
+    confirm_setup_intent,
 )
 from services.auth_service import AuthService
 
