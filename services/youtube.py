@@ -5,14 +5,12 @@ Comprehensive integration with YouTube Data API v3 for data fetching,
 video management, and API quota optimization using user OAuth2 credentials.
 """
 
-import os
 import logging
 import html
 import re
 import json
 import datetime
 import asyncio
-import httpx
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from google.oauth2.credentials import Credentials

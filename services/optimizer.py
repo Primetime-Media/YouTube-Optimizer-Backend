@@ -1,4 +1,4 @@
-from typing import Dict, Optional
+from typing import Dict
 import logging
 from services.channel import get_optimization_status as get_channel_optimization_status
 from services.channel import apply_channel_optimization

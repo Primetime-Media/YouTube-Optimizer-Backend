@@ -3,8 +3,6 @@ from fastapi import APIRouter, Response, HTTPException, Request, Depends, Backgr
 from fastapi.responses import RedirectResponse
 from typing import Optional
 from datetime import datetime, timedelta
-import requests
-import httpx
 import logging
 import secrets
 import json

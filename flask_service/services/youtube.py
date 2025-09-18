@@ -1,11 +1,9 @@
 import logging
 import re
-import json
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from google.oauth2.credentials import Credentials
 from utils.db import get_connection
-from typing import Dict
 from flask import session
 
 logger = logging.getLogger(__name__)
