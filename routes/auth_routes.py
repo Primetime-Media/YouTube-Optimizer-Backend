@@ -33,8 +33,10 @@ def get_db_connection():
     try:
         from utils.db import get_connection as get_db_conn
         return get_db_conn()
+    except ConnectionError as e:
+        raise HTTPException(status_code=503, detail=f"Database connection error: {str(e)}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database connection error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Unexpected database error: {str(e)}")
 
 def create_session(user_id: int, response: Response, request: Request) -> str:
     """Create a new session for a user and set the session cookie

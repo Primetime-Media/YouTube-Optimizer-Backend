@@ -8,6 +8,20 @@ from services.thumbnail_optimizer import do_thumbnail_optimization
 
 logger = logging.getLogger(__name__)
 
+# Progress constants
+PROGRESS_INITIAL = 0
+PROGRESS_DATA_EXTRACTION = 10
+PROGRESS_DATA_EXTRACTION_COMPLETE = 25
+PROGRESS_LLM_PROCESSING_COMPLETE = 75
+PROGRESS_COMPLETED = 100
+
+# Default values
+DEFAULT_LIKE_COUNT = 0
+DEFAULT_COMMENT_COUNT = 0
+DEFAULT_TRANSCRIPT_LENGTH = 0
+DEFAULT_OPTIMIZATION_LIMIT = 5
+INVALID_OPTIMIZATION_ID = 0
+
 def get_video_data(video_id: str) -> Optional[Dict]:
     """
     Retrieve video data from the database using the video_id
@@ -104,7 +118,7 @@ def create_optimization(db_video_id: int, optimization_step: int = 1) -> int:
             raise
     except Exception as e:
         logger.error(f"Error creating video optimization record: {str(e)}")
-        return 0
+        return INVALID_OPTIMIZATION_ID
     finally:
         if conn:
             try:
@@ -151,6 +165,55 @@ def update_optimization_progress(optimization_id: int, progress: int, status: st
         if conn:
             conn.close()
 
+def cleanup_generated_files(video_id: str) -> None:
+    """
+    Clean up generated video file and extracted thumbnails after optimization
+    
+    Args:
+        video_id: The YouTube video ID used for file naming
+    """
+    import os
+    import glob
+    from pathlib import Path
+    
+    try:
+        # Clean up video file
+        video_filename = f"{video_id}.mp4"
+        if os.path.exists(video_filename):
+            os.remove(video_filename)
+            logger.info(f"Cleaned up video file: {video_filename}")
+        
+        # Clean up extracted thumbnails directory
+        extracted_thumbnails_dir = "extracted_thumbnails"
+        if os.path.exists(extracted_thumbnails_dir):
+            # Find all thumbnail files related to this video
+            thumbnail_pattern = f"{extracted_thumbnails_dir}/orig_{video_id}_*.jpg"
+            thumbnail_files = glob.glob(thumbnail_pattern)
+            
+            for thumbnail_file in thumbnail_files:
+                try:
+                    os.remove(thumbnail_file)
+                    logger.info(f"Cleaned up thumbnail file: {thumbnail_file}")
+                except OSError as e:
+                    logger.warning(f"Failed to delete thumbnail file {thumbnail_file}: {e}")
+            
+            # Also clean up any thumbnails directory files that might not match the pattern
+            try:
+                thumbnails_pattern = f"{extracted_thumbnails_dir}/*{video_id}*.jpg"
+                additional_files = glob.glob(thumbnails_pattern)
+                for file_path in additional_files:
+                    if os.path.exists(file_path):
+                        os.remove(file_path)
+                        logger.info(f"Cleaned up additional thumbnail file: {file_path}")
+            except Exception as e:
+                logger.warning(f"Error cleaning up additional thumbnail files: {e}")
+        
+        
+        logger.info(f"Cleanup completed for video {video_id}")
+        
+    except Exception as e:
+        logger.error(f"Error during cleanup for video {video_id}: {str(e)}")
+
 def generate_video_optimization(
         video: Dict,
         user_id: int,
@@ -179,67 +242,83 @@ def generate_video_optimization(
     transcript = video.get("transcript")
     has_captions = video.get("has_captions", False)
     db_video_id = video.get("id")
-    like_count = video.get("like_count", 0)
-    comment_count = video.get("comment_count", 0)
+    like_count = video.get("like_count", DEFAULT_LIKE_COUNT)
+    comment_count = video.get("comment_count", DEFAULT_COMMENT_COUNT)
     category_name = video.get("category_name", "")
+    video_id = video.get("video_id", "")  # YouTube video ID for cleanup
     
     # Verify optimization record exists
-    if optimization_id == 0:
+    if optimization_id == INVALID_OPTIMIZATION_ID:
         logger.error(f"Invalid optimization ID for video {db_video_id}")
         return {
             "error": "Invalid optimization ID",
-            "id": 0
+            "id": INVALID_OPTIMIZATION_ID
         }
     
     # Update status to in_progress
-    update_optimization_progress(optimization_id, 10, "in_progress")
+    update_optimization_progress(optimization_id, PROGRESS_DATA_EXTRACTION, "in_progress")
     
     # Safely check transcript length
-    transcript_length = 0
+    transcript_length = DEFAULT_TRANSCRIPT_LENGTH
     if transcript is not None:
         transcript_length = len(transcript)
     logger.debug(f"Video data summary - Title: {title}, Description length: {len(description)}, Tags: {len(tags)}, Transcript length: {transcript_length}")
     
     # Update progress - data extraction complete
-    update_optimization_progress(optimization_id, 25)
+    update_optimization_progress(optimization_id, PROGRESS_DATA_EXTRACTION_COMPLETE)
     
     try:
-        thumbnail_optimization_result = None
-        try:
-            # TODO: PARALLELIZE THUMBNAIL OPTIMIZATION AND COMPREHENSIVE OPTIMIZATION
-            thumbnail_optimization_result = do_thumbnail_optimization(
-                video_id=video.get("video_id"),
+        # PARALLELIZE THUMBNAIL AND CONTENT OPTIMIZATION
+        import asyncio
+        import concurrent.futures
+        
+        def run_thumbnail_optimization():
+            try:
+                return do_thumbnail_optimization(
+                    video_id=video.get("video_id"),
+                    original_title=title,
+                    original_description=description,
+                    original_tags=tags,
+                    transcript=transcript,
+                    competitor_analytics_data=competitor_analytics_data,
+                    category_name=category_name,
+                    user_id=user_id
+                )
+            except Exception as e:
+                logger.warning(f"Thumbnail optimization failed for video {video.get('video_id')}: {str(e)}")
+                return None
+        
+        def run_content_optimization():
+            return get_comprehensive_optimization(
                 original_title=title,
                 original_description=description,
                 original_tags=tags,
                 transcript=transcript,
-                competitor_analytics_data=competitor_analytics_data,
+                has_captions=has_captions,
+                like_count=like_count,
+                comment_count=comment_count,
+                optimization_decision_data=optimization_decision_data or {},
+                analytics_data=analytics_data or {},
+                competitor_analytics_data=competitor_analytics_data or {},
                 category_name=category_name,
-                user_id=user_id
+                user_id=user_id,
+                prev_optimizations=prev_optimizations or []
             )
-        except Exception as e:
-            logger.warning(f"Thumbnail optimization failed for video {video.get('video_id')}: {str(e)}")
-            thumbnail_optimization_result = None
-
-        # Call the optimization function with all data
-        result = get_comprehensive_optimization(
-            original_title=title,
-            original_description=description,
-            original_tags=tags,
-            transcript=transcript,
-            has_captions=has_captions,
-            like_count=like_count,
-            comment_count=comment_count,
-            optimization_decision_data=optimization_decision_data or {},
-            analytics_data=analytics_data or {},
-            competitor_analytics_data=competitor_analytics_data or {},
-            category_name=category_name,
-            user_id=user_id,
-            prev_optimizations=prev_optimizations or []
-        )
+        
+        # Run both optimizations in parallel
+        logger.info("Starting parallel optimization processes...")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            thumbnail_future = executor.submit(run_thumbnail_optimization)
+            content_future = executor.submit(run_content_optimization)
+            
+            # Wait for both to complete
+            thumbnail_optimization_result = thumbnail_future.result()
+            result = content_future.result()
+        
+        logger.info("Parallel optimization processes completed")
 
         if not result:
-            raise Exception("Optimization failed")
+            raise RuntimeError("LLM optimization failed to generate results")
 
         best_optimization = max(result, key=lambda x: x['optimization_score'])
 
@@ -253,7 +332,7 @@ def generate_video_optimization(
             best_optimization.update({"thumbnail_optimization_file": thumbnail_optimization_result.get("optimized_thumbnail", {}).get("optimized_thumbnail")})
 
         # Update progress - LLM processing complete
-        update_optimization_progress(optimization_id, 75)
+        update_optimization_progress(optimization_id, PROGRESS_LLM_PROCESSING_COMPLETE)
         
         logger.info(f"Video optimization completed successfully for {title}")
         
@@ -261,7 +340,7 @@ def generate_video_optimization(
         optimization_results_stored = store_optimization_results(optimization_id, db_video_id, best_optimization)
 
         if not optimization_results_stored:
-            raise Exception("Failed to store optimization results")
+            raise RuntimeError("Failed to store optimization results in database")
         
         # Add optimization ID to the result
         best_optimization["id"] = optimization_id
@@ -286,12 +365,16 @@ def generate_video_optimization(
         }
     except Exception as e:
         logger.error(f"Error during video optimization: {str(e)}")
-        update_optimization_progress(optimization_id, 0, "failed")
+        update_optimization_progress(optimization_id, PROGRESS_INITIAL, "failed")
         return {
             "error": f"Optimization failed: {str(e)}",
             "id": optimization_id,
             "is_applied": False
         }
+    finally:
+        # Clean up generated files after optimization completes (success or failure)
+        if video_id:
+            cleanup_generated_files(video_id)
 
 def store_optimization_results(optimization_id: int, db_video_id: int, optimization_data: Dict) -> bool:
     """
@@ -322,7 +405,7 @@ def store_optimization_results(optimization_id: int, db_video_id: int, optimizat
                     optimized_tags = %s,
                     optimization_notes = %s,
                     status = 'completed',
-                    progress = 100,
+                    progress = PROGRESS_COMPLETED,
                     updated_at = NOW()
                 WHERE id = %s
                 RETURNING id
@@ -365,7 +448,7 @@ def store_optimization_results(optimization_id: int, db_video_id: int, optimizat
         if conn:
             conn.close()
 
-def get_video_optimizations(db_video_id: int, limit: int = 5) -> List[Dict]:
+def get_video_optimizations(db_video_id: int, limit: int = DEFAULT_OPTIMIZATION_LIMIT) -> List[Dict]:
     """
     Get the most recent optimizations for a video
     

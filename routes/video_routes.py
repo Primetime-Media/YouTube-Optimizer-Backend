@@ -26,6 +26,21 @@ from typing import Optional, List
 from datetime import datetime
 import asyncio
 
+# HTTP Status Code Constants
+HTTP_STATUS_OK = 200
+HTTP_STATUS_BAD_REQUEST = 400
+HTTP_STATUS_UNAUTHORIZED = 401
+HTTP_STATUS_FORBIDDEN = 403
+HTTP_STATUS_NOT_FOUND = 404
+HTTP_STATUS_INTERNAL_SERVER_ERROR = 500
+HTTP_STATUS_SERVICE_UNAVAILABLE = 503
+
+# Default Values
+DEFAULT_OPTIMIZATION_LIMIT = 5
+DEFAULT_VIDEO_LIMIT = 100
+DEFAULT_OPTIMIZATION_CONFIDENCE_THRESHOLD = 0.5
+DEFAULT_OPTIMIZATION_CONFIDENCE_THRESHOLD_FLOAT = 0.5
+
 # Service imports - organized by functionality
 from services.video import (
     get_video_data,
@@ -34,10 +49,8 @@ from services.video import (
     get_video_optimizations
 )
 from services.optimizer import apply_optimization_to_youtube_video, get_optimization_status
-from services.llm_optimization import should_optimize_video, enhanced_should_optimize_video, get_comprehensive_optimization
+from services.llm_optimization import enhanced_should_optimize_video, get_comprehensive_optimization
 from services.youtube import (
-    fetch_video_timeseries_data, 
-    fetch_and_store_youtube_analytics,
     fetch_and_store_youtube_analytics_async,
     fetch_video_timeseries_data_async,
     fetch_video_transcript_async
@@ -116,7 +129,7 @@ async def optimize_video(youtube_video_id: str, background_tasks: BackgroundTask
         # Fetch video data from database
         video = get_video_data(youtube_video_id)
         if not video:
-            raise HTTPException(status_code=404, detail="Video not found")
+            raise HTTPException(status_code=HTTP_STATUS_NOT_FOUND, detail="Video not found")
         
         # Get user_id from the video's channel
         conn = get_connection()
@@ -137,7 +150,7 @@ async def optimize_video(youtube_video_id: str, background_tasks: BackgroundTask
         # Create a new optimization record for this request
         optimization_id = create_optimization(video["id"])
         if optimization_id == 0:
-            raise HTTPException(status_code=500, detail="Failed to create optimization record")
+            raise HTTPException(status_code=HTTP_STATUS_INTERNAL_SERVER_ERROR, detail="Failed to create optimization record")
             
         # Run the optimization in the background with the pre-created optimization ID
         background_tasks.add_task(generate_video_optimization, video, user_id, optimization_id)
@@ -153,9 +166,18 @@ async def optimize_video(youtube_video_id: str, background_tasks: BackgroundTask
         }
     except HTTPException:
         raise
+    except ValueError as e:
+        logging.error(f"Invalid input: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except ConnectionError as e:
+        logging.error(f"Connection error starting optimization: {str(e)}")
+        raise HTTPException(status_code=503, detail=f"Connection error: {str(e)}")
+    except RuntimeError as e:
+        logging.error(f"Runtime error starting optimization: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Runtime error: {str(e)}")
     except Exception as e:
-        logging.error(f"Error starting video optimization: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error starting optimization: {str(e)}")
+        logging.error(f"Unexpected error starting video optimization: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
 
 
 @router.get("/optimization/{optimization_id}/status", response_model=VideoOptimizationStatusResponse)
@@ -177,13 +199,19 @@ async def get_optimization_status_endpoint(optimization_id: int):
         return status
     except HTTPException:
         raise
+    except ValueError as e:
+        logging.error(f"Invalid input getting optimization status: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Invalid input: {str(e)}")
+    except ConnectionError as e:
+        logging.error(f"Connection error getting optimization status: {str(e)}")
+        raise HTTPException(status_code=503, detail=f"Connection error: {str(e)}")
     except Exception as e:
-        logging.error(f"Error getting optimization status: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error getting status: {str(e)}")
+        logging.error(f"Unexpected error getting optimization status: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
 
 
 @router.get("/{youtube_video_id}/optimizations")
-async def get_video_optimizations_endpoint(youtube_video_id: str, limit: int = 5):
+async def get_video_optimizations_endpoint(youtube_video_id: str, limit: int = DEFAULT_OPTIMIZATION_LIMIT):
     """
     Get recent optimization results for a video
     
@@ -198,7 +226,7 @@ async def get_video_optimizations_endpoint(youtube_video_id: str, limit: int = 5
         # First, get the database ID for the video
         video = get_video_data(youtube_video_id)
         if not video:
-            raise HTTPException(status_code=404, detail="Video not found")
+            raise HTTPException(status_code=HTTP_STATUS_NOT_FOUND, detail="Video not found")
             
         optimizations = get_video_optimizations(video["id"], limit)
         return {
@@ -206,9 +234,15 @@ async def get_video_optimizations_endpoint(youtube_video_id: str, limit: int = 5
             "optimizations": optimizations,
             "count": len(optimizations)
         }
+    except ValueError as e:
+        logging.error(f"Invalid input getting video optimizations: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Invalid input: {str(e)}")
+    except ConnectionError as e:
+        logging.error(f"Connection error getting video optimizations: {str(e)}")
+        raise HTTPException(status_code=503, detail=f"Connection error: {str(e)}")
     except Exception as e:
-        logging.error(f"Error getting video optimizations: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error getting optimizations: {str(e)}")
+        logging.error(f"Unexpected error getting video optimizations: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
 
 
 @router.post("/optimization/{optimization_id}/apply")
@@ -231,9 +265,10 @@ async def apply_optimization_to_video(optimization_id: int, user = Depends(get_u
         try:
             with conn.cursor() as cursor:
                 cursor.execute("""
-                    SELECT v.channel_id
+                    SELECT c.user_id, v.channel_id
                     FROM video_optimizations o
                     JOIN youtube_videos v ON v.id = o.video_id
+                    JOIN youtube_channels c ON c.id = v.channel_id
                     WHERE o.id = %s
                 """, (optimization_id,))
                 
@@ -241,20 +276,7 @@ async def apply_optimization_to_video(optimization_id: int, user = Depends(get_u
                 if not result:
                     raise HTTPException(status_code=404, detail="Optimization not found")
                 
-                channel_id = result[0]
-                
-                # Get the user_id for this channel
-                cursor.execute("""
-                    SELECT user_id
-                    FROM youtube_channels
-                    WHERE id = %s
-                """, (channel_id,))
-                
-                user_result = cursor.fetchone()
-                if not user_result:
-                    raise HTTPException(status_code=404, detail="Channel not found")
-                
-                video_owner_id = user_result[0]
+                video_owner_id, channel_id = result
                 
                 # Verify the user owns this video
                 if user.id != video_owner_id:
@@ -275,15 +297,24 @@ async def apply_optimization_to_video(optimization_id: int, user = Depends(get_u
         
     except HTTPException:
         raise
+    except ValueError as e:
+        logger.error(f"Invalid input applying optimization: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Invalid input: {str(e)}")
+    except PermissionError as e:
+        logger.error(f"Permission error applying optimization: {str(e)}")
+        raise HTTPException(status_code=403, detail=f"Permission denied: {str(e)}")
+    except ConnectionError as e:
+        logger.error(f"Connection error applying optimization: {str(e)}")
+        raise HTTPException(status_code=503, detail=f"Connection error: {str(e)}")
     except Exception as e:
-        logger.error(f"Error applying optimization: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error applying optimization: {str(e)}")
+        logger.error(f"Unexpected error applying optimization: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
     
 @router.get("/")
 @router.get("/performance/all")
 async def get_all_videos_performance(
     interval: str = "1d",
-    limit: int = 100,
+    limit: int = DEFAULT_VIDEO_LIMIT,
     offset: int = 0,
     refresh: bool = False,
 ):
@@ -323,6 +354,9 @@ async def get_all_videos_performance(
                 total_count_result = cursor.fetchone()
                 total_count = total_count_result[0] if total_count_result else 0
                 logger.info(f"Total videos across all channels: {total_count}")
+        except ConnectionError as db_err:
+            logger.error(f"Database connection error fetching channels: {db_err}")
+            raise HTTPException(status_code=503, detail="Database connection error retrieving channel list.")
         except Exception as db_err:
             logger.error(f"Database error fetching channels or total count: {db_err}")
             raise HTTPException(status_code=500, detail="Database error retrieving channel list.")
@@ -435,6 +469,12 @@ async def get_all_videos_performance(
     except HTTPException as http_exc:
         logger.error(f"HTTPException in get_all_videos_performance: {http_exc.detail}")
         raise # Re-raise HTTPException
+    except ConnectionError as e:
+        logger.error(f"Connection error in get_all_videos_performance: {str(e)}")
+        raise HTTPException(status_code=503, detail=f"Connection error retrieving performance data: {str(e)}")
+    except ValueError as e:
+        logger.error(f"Invalid input in get_all_videos_performance: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Invalid input: {str(e)}")
     except Exception as e:
         logger.exception(f"Unexpected error in get_all_videos_performance: {str(e)}") # Use logger.exception to include traceback
         raise HTTPException(status_code=500, detail=f"Error retrieving performance data: {str(e)}")
@@ -448,7 +488,7 @@ async def get_channel_videos_performance(
     refresh: bool = False,
     include_optimizations: bool = True,
     optimization_limit: int = 3,
-    optimization_confidence_threshold: float = 0.5
+    optimization_confidence_threshold: float = DEFAULT_OPTIMIZATION_CONFIDENCE_THRESHOLD
 ):
     """
     Get timeseries performance data for all videos in a specific channel.
@@ -555,7 +595,7 @@ async def get_channel_videos_performance(
             logger.info(f"Processing video {i+1}/{len(videos)}")
             
             try:
-                video_db_id = video_data[0]
+                db_video_id = video_data[0]
                 video_id = video_data[1]
                 title = video_data[2]
                 view_count = video_data[3]
@@ -564,14 +604,14 @@ async def get_channel_videos_performance(
                 last_optimized_at = video_data[8] if len(video_data) > 8 else None
                 last_optimization_id = video_data[9] if len(video_data) > 9 else None
                 
-                logger.info(f"Video DB ID: {video_db_id}, YouTube ID: {video_id}, Title: {title}")
+                logger.info(f"Video DB ID: {db_video_id}, YouTube ID: {video_id}, Title: {title}")
 
                 # Get optimization data if requested
                 optimizations = []
                 if include_optimizations:
-                    logger.info(f"Fetching optimization history for video {video_db_id}")
+                    logger.info(f"Fetching optimization history for video {db_video_id}")
                     try:
-                        optimizations = get_video_optimizations(video_db_id, optimization_limit)
+                        optimizations = get_video_optimizations(db_video_id, optimization_limit)
                         logger.info(f"Found {len(optimizations)} optimizations for video {video_id}")
                     except Exception as opt_err:
                         logger.warning(f"Error getting optimizations for video {video_id}: {opt_err}")
@@ -668,7 +708,7 @@ async def get_channel_videos_performance(
                 logger.info(f"Queueing video {video_id} for optimization processing")
                 
                 # Create a new optimization record for this request
-                optimization_id = create_optimization(video_db_id, num_optimizations_applied + 1)
+                optimization_id = create_optimization(db_video_id, num_optimizations_applied + 1)
                 if optimization_id == 0:
                     logger.error(f"Failed to create optimization record for video {video_id}")
                     continue
@@ -677,7 +717,7 @@ async def get_channel_videos_performance(
                 background_tasks.add_task(
                     process_video_optimization_async,
                     video_id=video_id,
-                    video_db_id=video_db_id,
+                    db_video_id=db_video_id,
                     user_id=channel_owner_id,
                     optimization_id=optimization_id,
                     detailed_video_data=detailed_video_data,
@@ -700,10 +740,16 @@ async def get_channel_videos_performance(
         # Re-raise HTTP exceptions with their original status code
         logger.error(f"HTTP exception in get_channel_videos_performance: {http_exc.detail}")
         raise
+    except ConnectionError as e:
+        logger.error(f"Connection error in get_channel_videos_performance: {str(e)}")
+        raise HTTPException(status_code=503, detail=f"Connection error retrieving channel performance: {str(e)}")
+    except ValueError as e:
+        logger.error(f"Invalid input in get_channel_videos_performance: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Invalid input: {str(e)}")
     except Exception as e:
         # For other exceptions, log with traceback and return 500
         logger.exception(f"Unexpected error in get_channel_videos_performance for channel {channel_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Error retrieving performance data: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error retrieving channel performance data: {str(e)}")
 
 
 @router.post("/queue-optimizations")
@@ -751,7 +797,7 @@ async def queue_videos_for_optimization(
                         failed_to_queue.append({"video_id": youtube_video_id, "reason": "Not found"})
                         continue # Skip to the next video ID
 
-                    video_db_id, video_owner_id = video_result
+                    db_video_id, video_owner_id = video_result
 
                     # 2. Verify the requesting user owns this video
                     # Add admin check if needed: and not user.is_admin
@@ -761,16 +807,16 @@ async def queue_videos_for_optimization(
                          continue # Skip to the next video ID
 
                     # 3. Update the video record to mark it for optimization
-                    logger.info(f"Updating video {video_db_id} (YouTube ID: {youtube_video_id}) to set queued_for_optimization=TRUE")
+                    logger.info(f"Updating video {db_video_id} (YouTube ID: {youtube_video_id}) to set queued_for_optimization=TRUE")
                     cursor.execute("""
                         UPDATE youtube_videos
                         SET queued_for_optimization = TRUE,
                             updated_at = NOW()
                         WHERE id = %s
-                    """, (video_db_id,))
+                    """, (db_video_id,))
 
                     # Add to success list *before* commit in case commit fails later
-                    successfully_queued.append({"video_id": youtube_video_id, "db_id": video_db_id})
+                    successfully_queued.append({"video_id": youtube_video_id, "db_id": db_video_id})
 
                 except Exception as video_err:                    
                     logger.error(f"Error processing video {youtube_video_id} in batch queue: {video_err}")
@@ -792,6 +838,16 @@ async def queue_videos_for_optimization(
         if conn: conn.rollback()
         logger.error(f"HTTPException queuing video batch: {http_exc.detail}")
         raise # Re-raise the specific HTTP exception
+    except ConnectionError as e:
+        # This catches database connection issues
+        if conn: conn.rollback()
+        logger.error(f"Connection error queuing video batch: {e}")
+        raise HTTPException(status_code=503, detail=f"Database connection error: {str(e)}")
+    except ValueError as e:
+        # This catches invalid input errors
+        if conn: conn.rollback()
+        logger.error(f"Invalid input queuing video batch: {e}")
+        raise HTTPException(status_code=400, detail=f"Invalid input: {str(e)}")
     except Exception as e:
         # This catches unexpected errors (like DB connection issues before loop)
         if conn: conn.rollback()
@@ -881,8 +937,14 @@ async def fetch_and_store_transcript(video_id: str, user_id: int):
         
     except HTTPException:
         raise
+    except ConnectionError as e:
+        logging.error(f"Connection error fetching transcript: {str(e)}")
+        raise HTTPException(status_code=503, detail=f"Connection error: {str(e)}")
+    except ValueError as e:
+        logging.error(f"Invalid input fetching transcript: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Invalid input: {str(e)}")
     except Exception as e:
-        logging.error(f"Error fetching transcript: {str(e)}")
+        logging.error(f"Unexpected error fetching transcript: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error fetching transcript: {str(e)}")
 
 @router.get("/youtube-data/{user_id}")
@@ -1014,8 +1076,14 @@ async def get_youtube_data(user_id: int, _: dict = Depends(get_user_from_session
             }
         }
         
+    except ConnectionError as e:
+        logging.error(f"Connection error fetching YouTube data: {str(e)}")
+        raise HTTPException(status_code=503, detail=f"Connection error: {str(e)}")
+    except ValueError as e:
+        logging.error(f"Invalid input fetching YouTube data: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Invalid input: {str(e)}")
     except Exception as e:
-        logging.error(f"Error fetching YouTube data: {str(e)}")
+        logging.error(f"Unexpected error fetching YouTube data: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error fetching YouTube data: {str(e)}")
 
 @router.post("/refresh-youtube-data/{user_id}")
@@ -1041,8 +1109,14 @@ async def refresh_youtube_data(user_id: int, background_tasks: BackgroundTasks):
         
     except HTTPException:
         raise
+    except ConnectionError as e:
+        logging.error(f"Connection error refreshing YouTube data: {str(e)}")
+        raise HTTPException(status_code=503, detail=f"Connection error: {str(e)}")
+    except ValueError as e:
+        logging.error(f"Invalid input refreshing YouTube data: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Invalid input: {str(e)}")
     except Exception as e:
-        logging.error(f"Error refreshing YouTube data: {str(e)}")
+        logging.error(f"Unexpected error refreshing YouTube data: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error refreshing YouTube data: {str(e)}")
 
 class VideoOptimizationStatus(BaseModel):
@@ -1079,8 +1153,14 @@ async def update_video_optimization_status(video_id: str, status: VideoOptimizat
         
     except HTTPException:
         raise
+    except ConnectionError as e:
+        logging.error(f"Connection error updating video optimization status: {str(e)}")
+        raise HTTPException(status_code=503, detail=f"Connection error: {str(e)}")
+    except ValueError as e:
+        logging.error(f"Invalid input updating video optimization status: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Invalid input: {str(e)}")
     except Exception as e:
-        logging.error(f"Error updating video optimization status: {str(e)}")
+        logging.error(f"Unexpected error updating video optimization status: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error updating video status: {str(e)}")
 
 @router.get("/optimized-videos/{user_id}")
@@ -1123,8 +1203,14 @@ async def get_optimized_videos(user_id: int):
             }
         }
         
+    except ConnectionError as e:
+        logging.error(f"Connection error fetching optimized videos: {str(e)}")
+        raise HTTPException(status_code=503, detail=f"Connection error: {str(e)}")
+    except ValueError as e:
+        logging.error(f"Invalid input fetching optimized videos: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Invalid input: {str(e)}")
     except Exception as e:
-        logging.error(f"Error fetching optimized videos: {str(e)}")
+        logging.error(f"Unexpected error fetching optimized videos: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error fetching optimized videos: {str(e)}")
 
 class ComprehensiveOptimizationResponse(BaseModel):
@@ -1262,8 +1348,17 @@ async def optimize_video_comprehensive(video_id: str):
 
     except HTTPException:
         raise
+    except ConnectionError as e:
+        logging.error(f"Connection error generating comprehensive optimization: {str(e)}")
+        raise HTTPException(status_code=503, detail=f"Connection error: {str(e)}")
+    except ValueError as e:
+        logging.error(f"Invalid input generating comprehensive optimization: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Invalid input: {str(e)}")
+    except RuntimeError as e:
+        logging.error(f"Runtime error generating comprehensive optimization: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Runtime error: {str(e)}")
     except Exception as e:
-        logging.error(f"Error generating comprehensive optimization: {str(e)}")
+        logging.error(f"Unexpected error generating comprehensive optimization: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error optimizing video: {str(e)}")
 
 
@@ -1273,7 +1368,7 @@ async def optimize_video_comprehensive(video_id: str):
 
 async def process_video_optimization_async(
     video_id: str,
-    video_db_id: int,
+    db_video_id: int,
     user_id: int,
     optimization_id: int,
     detailed_video_data: dict,
@@ -1291,7 +1386,7 @@ async def process_video_optimization_async(
     
     Args:
         video_id: YouTube video ID
-        video_db_id: Database video ID
+        db_video_id: Database video ID
         user_id: User ID who owns the video
         optimization_id: Pre-created optimization record ID
         detailed_video_data: Video metadata and content

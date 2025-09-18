@@ -5,9 +5,9 @@ PostgreSQL connection pooling, database initialization, and database operation h
 with thread-safe connection management and resource cleanup.
 """
 
-
 from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 from psycopg2_pool import ThreadSafeConnectionPool
+from psycopg2 import OperationalError, DatabaseError as Psycopg2DatabaseError, InterfaceError, ProgrammingError
 from dotenv import load_dotenv
 import logging
 import threading
@@ -56,9 +56,12 @@ def get_connection_pool():
                     atexit.register(close_connection_pool)
                     
                     logger.info("Connection pool created successfully")
+                except (OperationalError, Psycopg2DatabaseError, InterfaceError) as e:
+                    logger.error(f"Database connection error creating pool: {e}")
+                    raise ConnectionError(f"Failed to create database connection pool: {e}")
                 except Exception as e:
-                    logger.error(f"Error creating connection pool: {e}")
-                    raise
+                    logger.error(f"Unexpected error creating connection pool: {e}")
+                    raise RuntimeError(f"Unexpected error during database pool creation: {e}")
     
     return _connection_pool
 
@@ -68,9 +71,12 @@ def get_connection():
         pool = get_connection_pool()
         conn = pool.getconn()
         return conn
+    except (OperationalError, Psycopg2DatabaseError, InterfaceError) as e:
+        logger.error(f"Database connection error getting connection from pool: {e}")
+        raise ConnectionError(f"Failed to get database connection from pool: {e}")
     except Exception as e:
-        logger.error(f"Error getting connection from pool: {e}")
-        raise
+        logger.error(f"Unexpected error getting connection from pool: {e}")
+        raise RuntimeError(f"Unexpected error getting database connection: {e}")
 
 def return_connection(conn):
     """Return a connection to the pool."""
@@ -80,8 +86,12 @@ def return_connection(conn):
             pool.putconn(conn)
         else:
             logger.warning("Attempted to return closed or invalid connection")
+    except (OperationalError, Psycopg2DatabaseError, InterfaceError) as e:
+        logger.error(f"Database error returning connection to pool: {e}")
+        # Don't raise here as this is cleanup - just log the error
     except Exception as e:
-        logger.error(f"Error returning connection to pool: {e}")
+        logger.error(f"Unexpected error returning connection to pool: {e}")
+        # Don't raise here as this is cleanup - just log the error
 
 def close_connection_pool():
     """Close the connection pool and all connections."""
@@ -222,6 +232,10 @@ def init_db():
                 -- Index for session token lookups
                 CREATE INDEX IF NOT EXISTS idx_users_session_token
                 ON users(session_token);
+                
+                -- Essential indexes for query optimization
+                CREATE INDEX IF NOT EXISTS idx_users_google_id ON users(google_id);
+                CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
             """)
             
             # Create YouTube channels table with enhanced fields for optimization
@@ -276,6 +290,10 @@ def init_db():
                     last_optimized_at TIMESTAMP,
                     last_optimization_id INTEGER
                 );
+                
+                -- Essential indexes for query optimization
+                CREATE INDEX IF NOT EXISTS idx_youtube_channels_user_id ON youtube_channels(user_id);
+                CREATE INDEX IF NOT EXISTS idx_youtube_channels_channel_id ON youtube_channels(channel_id);
             """)
             
             # Create YouTube videos table with enhanced optimization fields
@@ -362,6 +380,13 @@ def init_db():
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
+                
+                -- Essential indexes for query optimization
+                CREATE INDEX IF NOT EXISTS idx_youtube_videos_video_id ON youtube_videos(video_id);
+                CREATE INDEX IF NOT EXISTS idx_youtube_videos_channel_id ON youtube_videos(channel_id);
+                CREATE INDEX IF NOT EXISTS idx_youtube_videos_published_at ON youtube_videos(published_at);
+                CREATE INDEX IF NOT EXISTS idx_youtube_videos_is_optimized ON youtube_videos(is_optimized);
+                CREATE INDEX IF NOT EXISTS idx_youtube_videos_queued_for_optimization ON youtube_videos(queued_for_optimization);
             """)
 
             
@@ -470,6 +495,21 @@ def init_scheduler_tables(cursor):
         )
     """)
     
+    # Create indexes for channel_optimization_schedules
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_channel_schedules_channel_id 
+        ON channel_optimization_schedules(channel_id);
+        
+        CREATE INDEX IF NOT EXISTS idx_channel_schedules_is_active 
+        ON channel_optimization_schedules(is_active);
+        
+        CREATE INDEX IF NOT EXISTS idx_channel_schedules_next_run 
+        ON channel_optimization_schedules(next_run);
+        
+        CREATE INDEX IF NOT EXISTS idx_channel_schedules_active_next_run 
+        ON channel_optimization_schedules(is_active, next_run) WHERE is_active = TRUE;
+    """)
+    
     # Table to log scheduled runs
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS scheduler_run_history (
@@ -482,6 +522,24 @@ def init_scheduler_tables(cursor):
             applied BOOLEAN DEFAULT FALSE,
             error_message TEXT
         )
+    """)
+    
+    # Create indexes for scheduler_run_history
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_scheduler_history_schedule_id 
+        ON scheduler_run_history(schedule_id);
+        
+        CREATE INDEX IF NOT EXISTS idx_scheduler_history_start_time 
+        ON scheduler_run_history(start_time);
+        
+        CREATE INDEX IF NOT EXISTS idx_scheduler_history_status 
+        ON scheduler_run_history(status);
+        
+        CREATE INDEX IF NOT EXISTS idx_scheduler_history_applied 
+        ON scheduler_run_history(applied);
+        
+        CREATE INDEX IF NOT EXISTS idx_scheduler_history_schedule_start 
+        ON scheduler_run_history(schedule_id, start_time DESC);
     """)
 
 def delete_all_tables_except_users():
