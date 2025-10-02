@@ -81,7 +81,6 @@ def get_channel_subscriber_counts(client: object, channel_ids: list[str]) -> dic
         except Exception as e:
             logger.error(f"Failed to fetch subscriber counts for batch starting with {batch_ids[0]}: {e}")
             # Continue to next batch if one fails, or return partial results
-            # You might want more sophisticated error handling here
 
     return subscriber_counts
 
@@ -116,7 +115,7 @@ def get_video_view_counts(client: object, video_ids: list[str]) -> dict:
             for item in response.get("items", []):
                 video_id = item.get("id")
                 stats = item.get("statistics", {})
-                view_count = int(stats.get("viewCount", 0)) # Default to 0 if missing
+                view_count = int(stats.get("viewCount", 0))  # Default to 0 if missing
                 if video_id:
                     view_counts[video_id] = view_count
 
@@ -131,12 +130,12 @@ def search_competitors(client: object, user_id: int, video_data: dict):
 
     title = video_data['title']
     description = video_data['description']
-    tags = video_data.get('tags', []) # Use .get for potentially missing keys like tags
+    tags = video_data.get('tags', [])  # Use .get for potentially missing keys like tags
     category_id = video_data['category_id']
     category_name = video_data['category_name']
     transcript = video_data['transcript']
 
-    # Readded query generation/search to get more relevant competitors
+    # Generate search query to get more relevant competitors
     query = generate_search_query(title, description, tags, category_name)
     if query:
         logger.info(f"Generated search query for user {user_id}: {query}")
@@ -144,13 +143,16 @@ def search_competitors(client: object, user_id: int, video_data: dict):
     topic_data = find_relevant_topic_id(title, description, transcript, tags, category_name)
     topic_id = topic_data['topic_id']
 
-    try: #TODO: add retry loop in case we don't get any results (YouTube API bug) OR consider using different YT search API
-        # Calculate the date 12 months ago in UTC for more comprehensive results
+    try:
+        # Calculate the date 7 days ago in UTC for recent results
         now_utc = datetime.now(timezone.utc)
         seven_days_ago = now_utc - timedelta(days=7)
         # Format as RFC 3339 timestamp (required by YouTube API)
         published_after_time = seven_days_ago.strftime('%Y-%m-%dT%H:%M:%SZ')
 
+        # Initialize competitor_videos list
+        competitor_videos = []
+        
         # Search using both the generated query (if available) and the category ID
         search_args = {
             "part": "id,snippet",
@@ -165,66 +167,106 @@ def search_competitors(client: object, user_id: int, video_data: dict):
         if topic_id:
             search_args["topicId"] = topic_id
 
-        for _ in range(3):
+        # Retry loop with proper initialization
+        for attempt in range(3):
             try:
                 search_response = client.search().list(**search_args).execute()
-
-                competitor_videos = search_response.get("items", [])
-                if not competitor_videos:
-                    raise Exception("No competitors found")
-                logger.info(f"Found {len(competitor_videos)} raw competitors published after {published_after_time} for user {user_id}...")
+                videos = search_response.get("items", [])
+                
+                if not videos:
+                    if attempt < 2:  # Don't raise on last attempt
+                        logger.warning(f"No competitors found on attempt {attempt + 1}, retrying...")
+                        continue
+                    else:
+                        logger.warning("No competitors found after 3 attempts")
+                        break
+                
+                competitor_videos = videos
+                logger.info(f"Found {len(competitor_videos)} raw competitors published after {published_after_time} for user {user_id}")
                 break
+                
             except Exception as e:
-                logger.error(f"Error fetching competitors for user {user_id}: {e}")
+                logger.error(f"Error fetching competitors for user {user_id} on attempt {attempt + 1}: {e}")
+                if attempt == 2:  # Last attempt
+                    logger.error("All retry attempts failed")
 
-        # Search using query if available
-        if query:
-            search_args["q"] = query
-            search_response = client.search().list(**search_args).execute()
-            competitor_videos += search_response.get("items", [])
-            logger.info(f"Found {len(competitor_videos)} raw competitors published after {published_after_time} for user {user_id}...")
+        # Search using query if available (append results)
+        if query and competitor_videos:  # Only search with query if we have initial results
+            try:
+                query_search_args = search_args.copy()
+                query_search_args["q"] = query
+                search_response = client.search().list(**query_search_args).execute()
+                additional_videos = search_response.get("items", [])
+                competitor_videos.extend(additional_videos)
+                logger.info(f"Added {len(additional_videos)} videos from query search, total: {len(competitor_videos)}")
+            except Exception as e:
+                logger.error(f"Error in query-based search: {e}")
 
         if not competitor_videos:
-             return []
+            logger.warning(f"No competitor videos found for user {user_id}")
+            return []
+
+        # Deduplicate videos by video_id
+        seen_video_ids = set()
+        deduplicated_videos = []
+        for video in competitor_videos:
+            try:
+                if "snippet" not in video or "id" not in video or "videoId" not in video["id"]:
+                    logger.warning(f"Skipping competitor video due to missing data")
+                    continue
+                
+                video_id = video["id"]["videoId"]
+                
+                # Skip if we've already seen this video
+                if video_id in seen_video_ids:
+                    continue
+                    
+                seen_video_ids.add(video_id)
+                deduplicated_videos.append(video)
+                
+            except Exception as e:
+                logger.error(f"Error processing video in deduplication: {e}")
+                continue
+        
+        competitor_videos = deduplicated_videos
+        logger.info(f"After deduplication: {len(competitor_videos)} unique videos")
 
         # Initial formatting & collecting IDs
         formatted_competitor_video_data = []
         channel_ids_to_fetch = set()
-        video_ids_to_fetch = [] # Use a list for video IDs as they are the primary key
+        video_ids_to_fetch = []  # Use a list for video IDs as they are the primary key
+        
         for video in competitor_videos:
-             try:
-                 if "snippet" not in video or "id" not in video or "videoId" not in video["id"]:
-                     logger.warning(f"Skipping competitor video due to missing data: {video.get('id')}")
-                     continue
+            try:
+                video_id = video["id"]["videoId"]
+                channel_id = video['snippet']['channelId']
 
-                 video_id = video["id"]["videoId"]
-                 channel_id = video['snippet']['channelId']
-
-                 formatted_data = {
-                     "video_id": video_id,
-                     "title": video["snippet"].get("title", "N/A"),
-                     "description": video["snippet"].get("description", ""),
-                     "thumbnail_urls": video["snippet"].get("thumbnails", {}),
-                     "published_at": video["snippet"].get("publishedAt"),
-                     'channel_id': channel_id,
-                     'channel_title': video['snippet'].get('channelTitle', "N/A"),
-                     # Placeholders for counts to be added later
-                     'view_count': None,
-                     'subscriber_count': None
-                 }
-                 formatted_competitor_video_data.append(formatted_data)
-                 if channel_id:
-                      channel_ids_to_fetch.add(channel_id)
-                 video_ids_to_fetch.append(video_id) # Collect video ID
-             except KeyError as e:
-                 logger.error(f"KeyError processing competitor video snippet: {e} - Video: {video.get('id')}")
-                 continue
+                formatted_data = {
+                    "video_id": video_id,
+                    "title": video["snippet"].get("title", "N/A"),
+                    "description": video["snippet"].get("description", ""),
+                    "thumbnail_urls": video["snippet"].get("thumbnails", {}),
+                    "published_at": video["snippet"].get("publishedAt"),
+                    'channel_id': channel_id,
+                    'channel_title': video['snippet'].get('channelTitle', "N/A"),
+                    # Placeholders for counts to be added later
+                    'view_count': None,
+                    'subscriber_count': None
+                }
+                formatted_competitor_video_data.append(formatted_data)
+                if channel_id:
+                    channel_ids_to_fetch.add(channel_id)
+                video_ids_to_fetch.append(video_id)
+                
+            except KeyError as e:
+                logger.error(f"KeyError processing competitor video snippet: {e}")
+                continue
 
         # --- Fetch additional data ---
         subscriber_map = {}
         if channel_ids_to_fetch:
-             logger.info(f"Fetching subscriber counts for {len(channel_ids_to_fetch)} unique channels...")
-             subscriber_map = get_channel_subscriber_counts(client, list(channel_ids_to_fetch))
+            logger.info(f"Fetching subscriber counts for {len(channel_ids_to_fetch)} unique channels...")
+            subscriber_map = get_channel_subscriber_counts(client, list(channel_ids_to_fetch))
 
         # Fetch detailed video stats (views, likes, comments)
         video_stats_map = {}
@@ -243,28 +285,29 @@ def search_competitors(client: object, user_id: int, video_data: dict):
                     statistics = video_item.get("statistics", {})
                     snippet = video_item.get("snippet", {})
                     
-                    # Check if the video is in English
-                    is_english = snippet.get("defaultLanguage", "").startswith("en") or snippet.get("defaultAudioLanguage", "").startswith("en")
+                    # Check if the video is in English using API language fields
+                    default_lang = snippet.get("defaultLanguage", "")
+                    audio_lang = snippet.get("defaultAudioLanguage", "")
+                    is_english = default_lang.startswith("en") or audio_lang.startswith("en")
                     
-                    # If language info is missing, we'll include it and filter later based on content
                     video_stats_map[video_id] = {
                         "view_count": int(statistics.get("viewCount", 0)),
                         "like_count": int(statistics.get("likeCount", 0)),
                         "comment_count": int(statistics.get("commentCount", 0)),
-                        "duration": video_item.get("contentDetails", {}).get("duration", ""),  # ISO 8601 duration
+                        "duration": video_item.get("contentDetails", {}).get("duration", ""),
                         "full_title": snippet.get("title", ""),
                         "full_description": snippet.get("description", ""),
                         "tags": snippet.get("tags", []),
                         "is_english": is_english,
-                        "default_language": snippet.get("defaultLanguage", ""),
-                        "default_audio_language": snippet.get("defaultAudioLanguage", "")
+                        "default_language": default_lang,
+                        "default_audio_language": audio_lang
                     }
             except Exception as e:
                 logger.error(f"Error fetching detailed video stats: {e}")
 
         # --- Augment the data and filter for channels with >100K subscribers ---
         filtered_competitor_data = []
-        min_subscriber_threshold = 100000 # Increase to 100K for production
+        min_subscriber_threshold = 100000
         
         for video_data_item in formatted_competitor_video_data:
             ch_id = video_data_item.get('channel_id')
@@ -275,78 +318,90 @@ def search_competitors(client: object, user_id: int, video_data: dict):
             video_data_item['subscriber_count'] = subscriber_count
             
             # Only process videos from channels with >100K subscribers
-            if subscriber_count is not None and subscriber_count > min_subscriber_threshold:
-                # Add video stats
-                video_stats = video_stats_map.get(vid_id, {})
-                view_count = video_stats.get("view_count", 0)
-                like_count = video_stats.get("like_count", 0)
-                comment_count = video_stats.get("comment_count", 0)
-                
-                # Get title and check for English content if language flag is not set
-                title = video_stats.get("full_title", video_data_item['title'])
-                description = video_stats.get("full_description", video_data_item['description'])
-                
-                # Check if video is in English
-                is_english = video_stats.get("is_english", False)
-                
-                # If language flag not set, perform basic language check on title
-                if not is_english:
-                    # Basic check for non-English characters in title
-                    try:
-                        title.encode('ascii')
-                        
-                        common_english_words = ['the', 'and', 'for', 'to', 'in', 'of', 'a', 'how', 'what', 'why']
-                        title_words = title.lower().split()
-                        desc_words = description.lower().split()
-                        
-                        english_word_count = sum(1 for word in title_words if word in common_english_words)
-                        english_word_count += sum(1 for word in desc_words[:50] if word in common_english_words)
-                        
-                        is_english = english_word_count >= 2
-                    except UnicodeEncodeError:
-                        is_english = False
-                
-                # Skip non-English videos
-                if not is_english:
-                    continue
-                
-                # Update with full details from the videos.list API call
-                video_data_item['view_count'] = view_count
-                video_data_item['like_count'] = like_count
-                video_data_item['comment_count'] = comment_count
-                
-                # Add full title, description and tags from the detailed API response
-                video_data_item['title'] = video_stats.get("full_title", video_data_item['title'])
-                video_data_item['description'] = video_stats.get("full_description", video_data_item['description'])
-                video_data_item['tags'] = video_stats.get("tags", [])
-                video_data_item['duration'] = video_stats.get("duration", "")
-                
-                # View/Subscriber ratio
-                video_data_item['view_to_subscriber_ratio'] = round(view_count / subscriber_count, 4) if subscriber_count else 0
-                
-                # Engagement rates (likes + comments per view)
-                engagement_count = like_count + comment_count
-                video_data_item['engagement_count'] = engagement_count
-                video_data_item['engagement_rate'] = round(engagement_count / view_count * 100, 2) if view_count else 0
-                
-                # Average views per day
-                # Calculate days since upload
+            if subscriber_count is None or subscriber_count <= min_subscriber_threshold:
+                continue
+            
+            # Add video stats
+            video_stats = video_stats_map.get(vid_id, {})
+            view_count = video_stats.get("view_count", 0)
+            like_count = video_stats.get("like_count", 0)
+            comment_count = video_stats.get("comment_count", 0)
+            
+            # Get title and check for English content if language flag is not set
+            title = video_stats.get("full_title", video_data_item['title'])
+            description = video_stats.get("full_description", video_data_item['description'])
+            
+            # Check if video is in English
+            is_english = video_stats.get("is_english", False)
+            
+            # If language flag not set, perform enhanced language check
+            if not is_english:
+                # Try ASCII encoding check
                 try:
-                    published_at = video_data_item.get("published_at")
-                    if published_at:
-                        published_date = datetime.strptime(published_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-                        days_since_upload = max(1, (now_utc - published_date).days)  # Ensure at least 1 day
-                        video_data_item['days_since_upload'] = days_since_upload
-                        video_data_item['views_per_day'] = round(view_count / days_since_upload, 2)
-                    else:
-                        video_data_item['days_since_upload'] = None
-                        video_data_item['views_per_day'] = None
-                except Exception as date_error:
-                    logger.error(f"Error calculating days since upload: {date_error}")
+                    # Check for mostly ASCII characters (allows some accented chars)
+                    ascii_chars = sum(1 for c in title if ord(c) < 128)
+                    ascii_ratio = ascii_chars / len(title) if len(title) > 0 else 0
+                    
+                    # Check for common English words
+                    common_english_words = [
+                        'the', 'and', 'for', 'to', 'in', 'of', 'a', 'how', 'what', 'why',
+                        'with', 'on', 'this', 'that', 'my', 'your', 'best', 'top', 'new'
+                    ]
+                    title_words = title.lower().split()
+                    desc_words = description.lower().split()
+                    
+                    english_word_count = sum(1 for word in title_words if word in common_english_words)
+                    english_word_count += sum(1 for word in desc_words[:50] if word in common_english_words)
+                    
+                    # Consider it English if:
+                    # - High ASCII ratio (>80%) AND has English words, OR
+                    # - Has multiple (3+) common English words
+                    is_english = (ascii_ratio > 0.8 and english_word_count >= 2) or english_word_count >= 3
+                    
+                except Exception as lang_check_error:
+                    logger.debug(f"Language check failed for video {vid_id}: {lang_check_error}")
+                    is_english = False
+            
+            # Skip non-English videos
+            if not is_english:
+                continue
+            
+            # Update with full details from the videos.list API call
+            video_data_item['view_count'] = view_count
+            video_data_item['like_count'] = like_count
+            video_data_item['comment_count'] = comment_count
+            
+            # Add full title, description and tags from the detailed API response
+            video_data_item['title'] = video_stats.get("full_title", video_data_item['title'])
+            video_data_item['description'] = video_stats.get("full_description", video_data_item['description'])
+            video_data_item['tags'] = video_stats.get("tags", [])
+            video_data_item['duration'] = video_stats.get("duration", "")
+            
+            # View/Subscriber ratio
+            video_data_item['view_to_subscriber_ratio'] = round(view_count / subscriber_count, 4) if subscriber_count else 0
+            
+            # Engagement rates (likes + comments per view)
+            engagement_count = like_count + comment_count
+            video_data_item['engagement_count'] = engagement_count
+            video_data_item['engagement_rate'] = round(engagement_count / view_count * 100, 2) if view_count else 0
+            
+            # Average views per day
+            try:
+                published_at = video_data_item.get("published_at")
+                if published_at:
+                    published_date = datetime.strptime(published_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                    days_since_upload = max(1, (now_utc - published_date).days)  # Ensure at least 1 day
+                    video_data_item['days_since_upload'] = days_since_upload
+                    video_data_item['views_per_day'] = round(view_count / days_since_upload, 2)
+                else:
                     video_data_item['days_since_upload'] = None
                     video_data_item['views_per_day'] = None
-                
-                filtered_competitor_data.append(video_data_item)
+            except Exception as date_error:
+                logger.error(f"Error calculating days since upload: {date_error}")
+                video_data_item['days_since_upload'] = None
+                video_data_item['views_per_day'] = None
+            
+            filtered_competitor_data.append(video_data_item)
         
         # Limit to top 20 if we have more than that
         filtered_competitor_data = filtered_competitor_data[:20]
@@ -385,7 +440,12 @@ def sort_competitors_by_performance(competitor_videos):
         # Combined score - view/sub ratio is given highest weight
         # The formula prioritizes videos that significantly outperform their channel's typical reach
         # while still giving credit to larger channels
-        performance_score = (view_sub_ratio * 0.6) + (sub_score * 0.2) + (engagement_rate * 0.1) + (views_per_day / 1000000 * 0.1)
+        performance_score = (
+            view_sub_ratio * 0.6 + 
+            sub_score * 0.2 + 
+            engagement_rate * 0.1 + 
+            (views_per_day / 1000000 * 0.1 if views_per_day else 0)
+        )
         
         return performance_score
     
