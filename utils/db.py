@@ -1,24 +1,17 @@
 """
-Database Utilities Module - COMPLETE FIXED VERSION
-===================================================
-36 Critical Errors Fixed - Production Ready
+Database Utilities Module - FIXED VERSION
+==========================================
+Error Corrected: Added missing timedelta import
 
-Key Fixes Applied:
-1. Connection Pool Management - Prevents leaks
-2. Transaction Support - ACID compliance  
-3. SQL Injection Prevention - Parameterized queries only
-4. Encrypted Token Storage - Security hardening
-5. Performance Indexes - Query optimization
-6. Comprehensive Error Handling
-7. Connection Context Managers
-8. Proper async/await patterns
+All 36 Original Fixes Plus:
+✅ NEW: Added timedelta import for cache_analytics function
 """
 
 import logging
 import asyncpg
 import json
 from typing import Dict, Any, List, Optional
-from datetime import datetime
+from datetime import datetime, timedelta  # ✅ FIXED: Added timedelta
 from cryptography.fernet import Fernet
 import os
 
@@ -463,6 +456,7 @@ async def cache_analytics(
         True if successful, False otherwise
     """
     try:
+        # ✅ FIXED: timedelta now imported and works correctly
         expires_at = datetime.utcnow() + timedelta(hours=cache_duration_hours)
         
         async with _pool.acquire() as conn:
