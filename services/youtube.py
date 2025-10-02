@@ -2655,7 +2655,10 @@ async def fetch_and_store_youtube_data_async(
     max_videos: int = 1000
 ) -> Dict:
     """
-    Async wrapper for fetch_and_store_youtube_data to prevent blocking.
+    Async wrapper for fetch_and_store_youtube_data.
+    
+    Since the original function is already async, we simply await it directly
+    rather than using run_in_executor (which only works with sync functions).
     
     Args:
         user_id: User ID for credentials
@@ -2664,13 +2667,8 @@ async def fetch_and_store_youtube_data_async(
     Returns:
         dict: Data fetch results with success status
     """
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(
-        None,
-        fetch_and_store_youtube_data,
-        user_id,
-        max_videos
-    )
+    # ✅ FIXED: Direct await since fetch_and_store_youtube_data is already async
+    return await fetch_and_store_youtube_data(user_id, max_videos)
 
 
 async def build_youtube_client_async(credentials: Credentials):
