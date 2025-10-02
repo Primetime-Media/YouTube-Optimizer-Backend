@@ -1,17 +1,18 @@
 """
 Database Utilities Module - FIXED VERSION
 ==========================================
-Error Corrected: Added missing timedelta import
-
-All 36 Original Fixes Plus:
-✅ NEW: Added timedelta import for cache_analytics function
+✅ FIXED: Added synchronous get_connection() for non-async routes
+✅ All 36 original fixes preserved
+✅ Full backward compatibility maintained
 """
 
 import logging
 import asyncpg
+import psycopg2
+import psycopg2.extras
 import json
 from typing import Dict, Any, List, Optional
-from datetime import datetime, timedelta  # ✅ FIXED: Added timedelta
+from datetime import datetime, timedelta
 from cryptography.fernet import Fernet
 import os
 
@@ -23,6 +24,9 @@ _pool: Optional[asyncpg.Pool] = None
 # Encryption key for tokens (load from environment)
 ENCRYPTION_KEY = os.getenv('DB_ENCRYPTION_KEY', Fernet.generate_key())
 cipher_suite = Fernet(ENCRYPTION_KEY)
+
+# Database URL for synchronous connections
+_database_url: Optional[str] = None
 
 
 # ============================================================================
@@ -38,7 +42,10 @@ async def init_db_pool(database_url: str, min_size: int = 10, max_size: int = 20
         min_size: Minimum number of connections in pool
         max_size: Maximum number of connections in pool
     """
-    global _pool
+    global _pool, _database_url
+    
+    # Store database URL for synchronous connections
+    _database_url = database_url
     
     try:
         _pool = await asyncpg.create_pool(
@@ -75,6 +82,38 @@ def get_pool() -> asyncpg.Pool:
     if _pool is None:
         raise RuntimeError("Database pool not initialized. Call init_db_pool() first.")
     return _pool
+
+
+# ============================================================================
+# ✅ NEW: SYNCHRONOUS CONNECTION FOR NON-ASYNC ROUTES
+# ============================================================================
+
+def get_connection():
+    """
+    Get a synchronous database connection for non-async route handlers.
+    
+    This is a compatibility function for routes that haven't been converted
+    to async yet. Returns a psycopg2 connection.
+    
+    Returns:
+        psycopg2.connection: Database connection
+        
+    Raises:
+        RuntimeError: If database URL not initialized
+        ConnectionError: If connection fails
+    """
+    if _database_url is None:
+        raise RuntimeError("Database not initialized. Call init_db_pool() first.")
+    
+    try:
+        conn = psycopg2.connect(
+            _database_url,
+            cursor_factory=psycopg2.extras.RealDictCursor
+        )
+        return conn
+    except psycopg2.Error as e:
+        logger.error(f"Failed to create synchronous database connection: {e}")
+        raise ConnectionError(f"Database connection failed: {e}")
 
 
 # ============================================================================
@@ -456,7 +495,6 @@ async def cache_analytics(
         True if successful, False otherwise
     """
     try:
-        # ✅ FIXED: timedelta now imported and works correctly
         expires_at = datetime.utcnow() + timedelta(hours=cache_duration_hours)
         
         async with _pool.acquire() as conn:
