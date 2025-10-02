@@ -1,4 +1,4 @@
-# YouTube Optimizer - Flask Authentication Service
+[# YouTube Optimizer - Flask Authentication Service
 
 A lightweight Flask service for handling user authentication and onboarding for the YouTube Optimizer platform.
 
@@ -44,4 +44,4 @@ python main.py
 
 - **Independent service** - Can scale and deploy separately from FastAPI service
 - **Fault isolation** - Auth failures don't affect video optimization
-- **Cost efficient** - Smaller container, lower resource usage
+- **Cost efficient** - Smaller container, lower resource usage](https://claude.ai/chat/fc262d4b-1c34-4406-ac9d-837eb2309b54)
