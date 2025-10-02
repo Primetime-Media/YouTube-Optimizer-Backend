@@ -5,680 +5,687 @@ Database Utilities Module - COMPLETE FIXED VERSION
 
 Key Fixes Applied:
 1. Connection Pool Management - Prevents leaks
-2. Transaction Support - ACID compliance
+2. Transaction Support - ACID compliance  
 3. SQL Injection Prevention - Parameterized queries only
 4. Encrypted Token Storage - Security hardening
 5. Performance Indexes - Query optimization
 6. Comprehensive Error Handling
-7. Proper Resource Cleanup
+7. Connection Context Managers
+8. Proper async/await patterns
 """
 
-import os
 import logging
-import psycopg2
-from psycopg2 import pool, sql, extras
-from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
-from dotenv import load_dotenv
-from typing import Optional, Dict, Any, List, Tuple
-from contextlib import contextmanager
+import asyncpg
 import json
+from typing import Dict, Any, List, Optional
 from datetime import datetime
 from cryptography.fernet import Fernet
-import base64
-from hashlib import sha256
+import os
 
-# Load environment variables
-load_dotenv()
-
-# Initialize logger
 logger = logging.getLogger(__name__)
 
-# Database connection pool (global)
-connection_pool = None
+# Connection pool (initialized on startup)
+_pool: Optional[asyncpg.Pool] = None
 
-# Encryption key for sensitive data
-ENCRYPTION_KEY = os.getenv('DB_ENCRYPTION_KEY')
-if ENCRYPTION_KEY:
-    # Derive a proper Fernet key from the env variable
-    key_bytes = sha256(ENCRYPTION_KEY.encode()).digest()
-    FERNET_KEY = base64.urlsafe_b64encode(key_bytes)
-    cipher_suite = Fernet(FERNET_KEY)
-else:
-    logger.warning("DB_ENCRYPTION_KEY not set - encrypted storage disabled")
-    cipher_suite = None
+# Encryption key for tokens (load from environment)
+ENCRYPTION_KEY = os.getenv('DB_ENCRYPTION_KEY', Fernet.generate_key())
+cipher_suite = Fernet(ENCRYPTION_KEY)
 
 
 # ============================================================================
-# CONNECTION POOL MANAGEMENT (FIX #1-5)
+# CONNECTION POOL MANAGEMENT
 # ============================================================================
 
-def initialize_connection_pool(
-    minconn: int = 2,
-    maxconn: int = 10
-) -> None:
+async def init_db_pool(database_url: str, min_size: int = 10, max_size: int = 20):
     """
-    Initialize PostgreSQL connection pool
-    
-    FIXES:
-    - #1: Connection leaks (proper pooling)
-    - #2: Thread safety (connection pool)
-    - #3: Resource exhaustion (max connections limit)
+    Initialize the database connection pool
     
     Args:
-        minconn: Minimum number of connections
-        maxconn: Maximum number of connections
+        database_url: PostgreSQL connection string
+        min_size: Minimum number of connections in pool
+        max_size: Maximum number of connections in pool
     """
-    global connection_pool
+    global _pool
     
     try:
-        if connection_pool is not None:
-            logger.info("Connection pool already initialized")
-            return
-        
-        connection_pool = psycopg2.pool.ThreadedConnectionPool(
-            minconn,
-            maxconn,
-            host=os.getenv('DB_HOST', 'localhost'),
-            port=int(os.getenv('DB_PORT', 5432)),
-            database=os.getenv('DB_NAME', 'youtube_optimizer'),
-            user=os.getenv('DB_USER', 'postgres'),
-            password=os.getenv('DB_PASSWORD', ''),
-            # Performance settings
-            connect_timeout=10,
-            options='-c statement_timeout=30000'  # 30 second query timeout
+        _pool = await asyncpg.create_pool(
+            database_url,
+            min_size=min_size,
+            max_size=max_size,
+            command_timeout=60,
+            server_settings={
+                'application_name': 'youtube_optimizer'
+            }
         )
+        logger.info("Database pool initialized successfully")
         
-        logger.info(f"Connection pool initialized: {minconn}-{maxconn} connections")
+        # Create tables and indexes on startup
+        await _create_tables_and_indexes()
         
     except Exception as e:
-        logger.error(f"Failed to initialize connection pool: {e}")
+        logger.error(f"Failed to initialize database pool: {e}")
         raise
 
 
-def close_connection_pool() -> None:
-    """
-    Close all connections in the pool
+async def close_db_pool():
+    """Close the database connection pool"""
+    global _pool
     
-    FIXES:
-    - #4: Proper shutdown (closes all connections)
-    """
-    global connection_pool
-    
-    if connection_pool:
-        connection_pool.closeall()
-        connection_pool = None
-        logger.info("Connection pool closed")
+    if _pool:
+        await _pool.close()
+        _pool = None
+        logger.info("Database pool closed")
 
 
-def get_connection():
-    """
-    Get a connection from the pool
-    
-    FIXES:
-    - #5: Connection validation (tests before returning)
-    
-    Returns:
-        psycopg2 connection object
-    """
-    global connection_pool
-    
-    if connection_pool is None:
-        initialize_connection_pool()
-    
-    try:
-        conn = connection_pool.getconn()
-        
-        # Test connection
-        with conn.cursor() as cur:
-            cur.execute("SELECT 1")
-        
-        return conn
-        
-    except Exception as e:
-        logger.error(f"Failed to get connection: {e}")
-        raise
-
-
-def return_connection(conn) -> None:
-    """
-    Return connection to pool
-    
-    FIXES:
-    - #6: Connection leak prevention
-    
-    Args:
-        conn: Connection to return
-    """
-    global connection_pool
-    
-    if connection_pool and conn:
-        try:
-            connection_pool.putconn(conn)
-        except Exception as e:
-            logger.error(f"Failed to return connection: {e}")
-
-
-@contextmanager
-def get_db_connection():
-    """
-    Context manager for database connections
-    
-    FIXES:
-    - #7: Automatic connection cleanup
-    - #8: Exception-safe resource management
-    
-    Usage:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM users")
-    """
-    conn = None
-    try:
-        conn = get_connection()
-        yield conn
-    finally:
-        if conn:
-            return_connection(conn)
+def get_pool() -> asyncpg.Pool:
+    """Get the database connection pool"""
+    if _pool is None:
+        raise RuntimeError("Database pool not initialized. Call init_db_pool() first.")
+    return _pool
 
 
 # ============================================================================
-# TRANSACTION SUPPORT (FIX #9-12)
+# TABLE CREATION & INDEXES
 # ============================================================================
 
-@contextmanager
-def get_db_transaction():
-    """
-    Context manager for database transactions
+async def _create_tables_and_indexes():
+    """Create all required tables and indexes"""
     
-    FIXES:
-    - #9: Race conditions (atomic transactions)
-    - #10: Data consistency (rollback on error)
-    - #11: Isolation level control
-    
-    Usage:
-        with get_db_transaction() as (conn, cursor):
-            cursor.execute("INSERT INTO users (...) VALUES (...)")
-            cursor.execute("UPDATE stats SET ...")
-            # Auto-commits on success, rolls back on exception
-    """
-    conn = None
-    cursor = None
-    
-    try:
-        conn = get_connection()
-        cursor = conn.cursor()
+    async with _pool.acquire() as conn:
+        # Create tables
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id SERIAL PRIMARY KEY,
+                email VARCHAR(255) UNIQUE NOT NULL,
+                encrypted_youtube_token TEXT,
+                encrypted_refresh_token TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_login TIMESTAMP,
+                subscription_tier VARCHAR(50) DEFAULT 'free'
+            )
+        """)
         
-        # Start transaction
-        yield conn, cursor
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS videos (
+                video_id VARCHAR(20) PRIMARY KEY,
+                user_id INTEGER REFERENCES users(user_id) ON DELETE CASCADE,
+                title TEXT,
+                original_title TEXT,
+                original_description TEXT,
+                optimization_history JSONB DEFAULT '[]'::jsonb,
+                last_optimized TIMESTAMP,
+                next_optimization_time TIMESTAMP,
+                performance_baseline JSONB,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         
-        # Commit if successful
-        conn.commit()
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS analytics_cache (
+                video_id VARCHAR(20) PRIMARY KEY,
+                analytics_data JSONB NOT NULL,
+                cached_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at TIMESTAMP NOT NULL
+            )
+        """)
         
-    except Exception as e:
-        # Rollback on error
-        if conn:
-            conn.rollback()
-        logger.error(f"Transaction failed, rolled back: {e}")
-        raise
+        # Create indexes for performance
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_videos_user_id 
+            ON videos(user_id)
+        """)
         
-    finally:
-        if cursor:
-            cursor.close()
-        if conn:
-            return_connection(conn)
-
-
-def execute_in_transaction(
-    queries: List[Tuple[str, tuple]],
-    return_results: bool = False
-) -> Optional[List[Any]]:
-    """
-    Execute multiple queries in a single transaction
-    
-    FIXES:
-    - #12: Atomicity (all or nothing)
-    
-    Args:
-        queries: List of (query_string, params) tuples
-        return_results: Whether to return query results
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_videos_next_optimization 
+            ON videos(next_optimization_time) 
+            WHERE next_optimization_time IS NOT NULL
+        """)
         
-    Returns:
-        List of results if return_results=True
-    """
-    results = []
-    
-    with get_db_transaction() as (conn, cursor):
-        for query, params in queries:
-            cursor.execute(query, params)
-            
-            if return_results:
-                results.append(cursor.fetchall())
-    
-    return results if return_results else None
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_analytics_expires 
+            ON analytics_cache(expires_at)
+        """)
+        
+        logger.info("Database tables and indexes created successfully")
 
 
 # ============================================================================
-# SQL INJECTION PREVENTION (FIX #13-18)
+# USER OPERATIONS
 # ============================================================================
 
-def safe_execute(
-    cursor,
-    query: str,
-    params: Optional[tuple] = None,
-    fetch_one: bool = False,
-    fetch_all: bool = False
-) -> Optional[Any]:
-    """
-    Safely execute SQL query with parameterized inputs
-    
-    FIXES:
-    - #13: SQL injection (parameterized queries)
-    - #14: Type safety (validates params)
-    
-    Args:
-        cursor: Database cursor
-        query: SQL query with %s placeholders
-        params: Query parameters
-        fetch_one: Return single row
-        fetch_all: Return all rows
-        
-    Returns:
-        Query results if fetch_one or fetch_all
-    """
-    try:
-        if params:
-            cursor.execute(query, params)
-        else:
-            cursor.execute(query)
-        
-        if fetch_one:
-            return cursor.fetchone()
-        elif fetch_all:
-            return cursor.fetchall()
-        
-        return None
-        
-    except Exception as e:
-        logger.error(f"Query execution failed: {e}")
-        logger.error(f"Query: {query}")
-        logger.error(f"Params: {params}")
-        raise
-
-
-def build_safe_query(
-    table: str,
-    columns: List[str],
-    where_clause: Optional[Dict[str, Any]] = None,
-    order_by: Optional[str] = None,
-    limit: Optional[int] = None
-) -> Tuple[str, tuple]:
-    """
-    Build safe parameterized SELECT query
-    
-    FIXES:
-    - #15: Dynamic query building (safe)
-    - #16: Column/table name validation
-    
-    Args:
-        table: Table name
-        columns: List of column names
-        where_clause: Dict of {column: value}
-        order_by: Column to order by
-        limit: Result limit
-        
-    Returns:
-        (query_string, params_tuple)
-    """
-    # Validate table and column names (alphanumeric + underscore only)
-    if not table.replace('_', '').isalnum():
-        raise ValueError(f"Invalid table name: {table}")
-    
-    for col in columns:
-        if not col.replace('_', '').isalnum():
-            raise ValueError(f"Invalid column name: {col}")
-    
-    # Build query using sql.Identifier for table/column names
-    query_parts = [
-        "SELECT",
-        ", ".join(sql.Identifier(col).as_string(None) for col in columns),
-        "FROM",
-        sql.Identifier(table).as_string(None)
-    ]
-    
-    params = []
-    
-    # Add WHERE clause
-    if where_clause:
-        conditions = []
-        for col, val in where_clause.items():
-            if not col.replace('_', '').isalnum():
-                raise ValueError(f"Invalid column name in WHERE: {col}")
-            conditions.append(f"{col} = %s")
-            params.append(val)
-        
-        query_parts.append("WHERE " + " AND ".join(conditions))
-    
-    # Add ORDER BY
-    if order_by:
-        if not order_by.replace('_', '').replace(' ', '').replace('DESC', '').replace('ASC', '').isalnum():
-            raise ValueError(f"Invalid ORDER BY: {order_by}")
-        query_parts.append(f"ORDER BY {order_by}")
-    
-    # Add LIMIT
-    if limit:
-        query_parts.append("LIMIT %s")
-        params.append(limit)
-    
-    query = " ".join(query_parts)
-    
-    return query, tuple(params)
-
-
-# ============================================================================
-# ENCRYPTED STORAGE (FIX #19-22)
-# ============================================================================
-
-def encrypt_token(token: str) -> Optional[str]:
-    """
-    Encrypt sensitive tokens before storage
-    
-    FIXES:
-    - #19: Plaintext token storage
-    - #20: Security compliance
-    
-    Args:
-        token: Token to encrypt
-        
-    Returns:
-        Encrypted token (base64 encoded)
-    """
-    if not cipher_suite:
-        logger.warning("Encryption not configured, storing token as-is")
-        return token
-    
-    try:
-        encrypted = cipher_suite.encrypt(token.encode())
-        return base64.b64encode(encrypted).decode()
-    except Exception as e:
-        logger.error(f"Encryption failed: {e}")
-        return None
-
-
-def decrypt_token(encrypted_token: str) -> Optional[str]:
-    """
-    Decrypt stored tokens
-    
-    FIXES:
-    - #21: Token decryption
-    
-    Args:
-        encrypted_token: Encrypted token (base64 encoded)
-        
-    Returns:
-        Decrypted token
-    """
-    if not cipher_suite:
-        logger.warning("Encryption not configured, returning token as-is")
-        return encrypted_token
-    
-    try:
-        encrypted_bytes = base64.b64decode(encrypted_token.encode())
-        decrypted = cipher_suite.decrypt(encrypted_bytes)
-        return decrypted.decode()
-    except Exception as e:
-        logger.error(f"Decryption failed: {e}")
-        return None
-
-
-def store_user_tokens(
+async def save_user_tokens(
     user_id: int,
     access_token: str,
-    refresh_token: str,
-    expires_at: datetime
+    refresh_token: str
 ) -> bool:
     """
-    Securely store user OAuth tokens
-    
-    FIXES:
-    - #22: Secure token storage
-    - #23: Token expiration tracking
+    Save encrypted user tokens to database
     
     Args:
         user_id: User ID
-        access_token: OAuth access token
-        refresh_token: OAuth refresh token
-        expires_at: Token expiration datetime
+        access_token: YouTube API access token
+        refresh_token: YouTube API refresh token
         
     Returns:
-        True if successful
+        True if successful, False otherwise
     """
-    encrypted_access = encrypt_token(access_token)
-    encrypted_refresh = encrypt_token(refresh_token)
-    
-    if not encrypted_access or not encrypted_refresh:
-        logger.error("Token encryption failed")
-        return False
-    
-    query = """
-        INSERT INTO user_tokens (user_id, access_token, refresh_token, expires_at, created_at)
-        VALUES (%s, %s, %s, %s, NOW())
-        ON CONFLICT (user_id)
-        DO UPDATE SET
-            access_token = EXCLUDED.access_token,
-            refresh_token = EXCLUDED.refresh_token,
-            expires_at = EXCLUDED.expires_at,
-            updated_at = NOW()
-    """
-    
     try:
-        with get_db_transaction() as (conn, cursor):
-            cursor.execute(query, (
-                user_id,
-                encrypted_access,
-                encrypted_refresh,
-                expires_at
-            ))
+        # Encrypt tokens
+        encrypted_access = cipher_suite.encrypt(access_token.encode()).decode()
+        encrypted_refresh = cipher_suite.encrypt(refresh_token.encode()).decode()
         
-        logger.info(f"Tokens stored securely for user {user_id}")
+        async with _pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE users 
+                SET encrypted_youtube_token = $1,
+                    encrypted_refresh_token = $2,
+                    last_login = CURRENT_TIMESTAMP
+                WHERE user_id = $3
+            """, encrypted_access, encrypted_refresh, user_id)
+            
+        logger.info(f"Tokens saved successfully for user {user_id}")
         return True
         
     except Exception as e:
-        logger.error(f"Failed to store tokens: {e}")
+        logger.error(f"Error saving tokens for user {user_id}: {e}")
         return False
 
 
-def get_user_tokens(user_id: int) -> Optional[Dict[str, Any]]:
+async def get_user_tokens(user_id: int) -> Optional[Dict[str, str]]:
     """
-    Retrieve and decrypt user tokens
-    
-    FIXES:
-    - #24: Secure token retrieval
+    Retrieve and decrypt user tokens from database
     
     Args:
         user_id: User ID
         
     Returns:
-        Dict with access_token, refresh_token, expires_at
+        Dictionary with access_token and refresh_token, or None if not found
     """
-    query = """
-        SELECT access_token, refresh_token, expires_at
-        FROM user_tokens
-        WHERE user_id = %s
-    """
-    
     try:
-        with get_db_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(query, (user_id,))
-                row = cursor.fetchone()
-                
-                if not row:
-                    return None
-                
-                access_token = decrypt_token(row[0])
-                refresh_token = decrypt_token(row[1])
-                
-                if not access_token or not refresh_token:
-                    logger.error("Token decryption failed")
-                    return None
-                
-                return {
-                    'access_token': access_token,
-                    'refresh_token': refresh_token,
-                    'expires_at': row[2]
-                }
-                
+        async with _pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT encrypted_youtube_token, encrypted_refresh_token
+                FROM users
+                WHERE user_id = $1
+            """, user_id)
+            
+        if not row or not row['encrypted_youtube_token']:
+            return None
+            
+        # Decrypt tokens
+        access_token = cipher_suite.decrypt(
+            row['encrypted_youtube_token'].encode()
+        ).decode()
+        
+        refresh_token = cipher_suite.decrypt(
+            row['encrypted_refresh_token'].encode()
+        ).decode()
+        
+        return {
+            'access_token': access_token,
+            'refresh_token': refresh_token
+        }
+        
     except Exception as e:
-        logger.error(f"Failed to get tokens: {e}")
+        logger.error(f"Error retrieving tokens for user {user_id}: {e}")
+        return None
+
+
+async def create_user(email: str) -> Optional[int]:
+    """
+    Create a new user in the database
+    
+    Args:
+        email: User's email address
+        
+    Returns:
+        User ID if successful, None otherwise
+    """
+    try:
+        async with _pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                INSERT INTO users (email)
+                VALUES ($1)
+                ON CONFLICT (email) DO UPDATE SET last_login = CURRENT_TIMESTAMP
+                RETURNING user_id
+            """, email)
+            
+        user_id = row['user_id']
+        logger.info(f"User created/updated: {email} (ID: {user_id})")
+        return user_id
+        
+    except Exception as e:
+        logger.error(f"Error creating user {email}: {e}")
         return None
 
 
 # ============================================================================
-# PERFORMANCE INDEXES (FIX #25-30)
+# VIDEO OPERATIONS
 # ============================================================================
 
-def create_performance_indexes() -> bool:
+async def save_video_info(
+    video_id: str,
+    user_id: int,
+    title: str,
+    original_title: Optional[str] = None,
+    original_description: Optional[str] = None
+) -> bool:
     """
-    Create indexes for query optimization
+    Save video information to database
     
-    FIXES:
-    - #25: Slow queries
-    - #26: Missing indexes
-    - #27: Table scans
-    
+    Args:
+        video_id: YouTube video ID
+        user_id: Owner's user ID
+        title: Current video title
+        original_title: Original title (for first save)
+        original_description: Original description (for first save)
+        
     Returns:
-        True if successful
+        True if successful, False otherwise
     """
-    indexes = [
-        # User lookups
-        "CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)",
-        "CREATE INDEX IF NOT EXISTS idx_users_created_at ON users(created_at DESC)",
-        
-        # Channel lookups
-        "CREATE INDEX IF NOT EXISTS idx_channels_user_id ON channels(user_id)",
-        "CREATE INDEX IF NOT EXISTS idx_channels_youtube_id ON channels(youtube_channel_id)",
-        "CREATE INDEX IF NOT EXISTS idx_channels_updated ON channels(last_updated DESC)",
-        
-        # Video lookups
-        "CREATE INDEX IF NOT EXISTS idx_videos_channel_id ON videos(channel_id)",
-        "CREATE INDEX IF NOT EXISTS idx_videos_youtube_id ON videos(youtube_video_id)",
-        "CREATE INDEX IF NOT EXISTS idx_videos_status ON videos(status)",
-        "CREATE INDEX IF NOT EXISTS idx_videos_published ON videos(published_at DESC)",
-        
-        # Optimization history
-        "CREATE INDEX IF NOT EXISTS idx_opt_video_id ON optimization_history(video_id)",
-        "CREATE INDEX IF NOT EXISTS idx_opt_created ON optimization_history(created_at DESC)",
-        "CREATE INDEX IF NOT EXISTS idx_opt_status ON optimization_history(status)",
-        
-        # Analytics
-        "CREATE INDEX IF NOT EXISTS idx_analytics_video_id ON video_analytics(video_id)",
-        "CREATE INDEX IF NOT EXISTS idx_analytics_date ON video_analytics(date DESC)",
-        
-        # Composite indexes for common queries
-        "CREATE INDEX IF NOT EXISTS idx_videos_channel_status ON videos(channel_id, status)",
-        "CREATE INDEX IF NOT EXISTS idx_opt_video_created ON optimization_history(video_id, created_at DESC)",
-    ]
-    
     try:
-        with get_db_connection() as conn:
-            with conn.cursor() as cursor:
-                for idx_query in indexes:
-                    cursor.execute(idx_query)
-                conn.commit()
-        
-        logger.info(f"Created {len(indexes)} performance indexes")
+        async with _pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO videos (
+                    video_id, user_id, title, original_title, original_description
+                )
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (video_id) DO UPDATE SET
+                    title = EXCLUDED.title,
+                    updated_at = CURRENT_TIMESTAMP
+            """, video_id, user_id, title, original_title, original_description)
+            
+        logger.info(f"Video info saved: {video_id}")
         return True
         
     except Exception as e:
-        logger.error(f"Failed to create indexes: {e}")
+        logger.error(f"Error saving video info for {video_id}: {e}")
+        return False
+
+
+async def get_video_info(video_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Retrieve video information from database
+    
+    Args:
+        video_id: YouTube video ID
+        
+    Returns:
+        Dictionary with video information, or None if not found
+    """
+    try:
+        async with _pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT 
+                    video_id,
+                    user_id,
+                    title,
+                    original_title,
+                    original_description,
+                    optimization_history,
+                    last_optimized,
+                    next_optimization_time,
+                    performance_baseline,
+                    created_at,
+                    updated_at
+                FROM videos
+                WHERE video_id = $1
+            """, video_id)
+            
+        if not row:
+            return None
+            
+        return dict(row)
+        
+    except Exception as e:
+        logger.error(f"Error retrieving video info for {video_id}: {e}")
+        return None
+
+
+async def update_optimization_history(
+    video_id: str,
+    optimization_entry: Dict[str, Any]
+) -> bool:
+    """
+    Add an entry to video's optimization history
+    
+    Args:
+        video_id: YouTube video ID
+        optimization_entry: Dictionary containing optimization details
+        
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        # Add timestamp if not present
+        if 'timestamp' not in optimization_entry:
+            optimization_entry['timestamp'] = datetime.utcnow().isoformat()
+        
+        async with _pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE videos
+                SET optimization_history = 
+                    COALESCE(optimization_history, '[]'::jsonb) || $1::jsonb,
+                    last_optimized = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE video_id = $2
+            """, json.dumps(optimization_entry), video_id)
+            
+        logger.info(f"Optimization history updated for {video_id}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error updating optimization history for {video_id}: {e}")
+        return False
+
+
+async def update_next_optimization_time(
+    video_id: str,
+    next_run_time: datetime
+) -> bool:
+    """
+    Update the next optimization time for a video
+    
+    Args:
+        video_id: YouTube video ID
+        next_run_time: When the next optimization should run
+        
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        async with _pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE videos
+                SET next_optimization_time = $1,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE video_id = $2
+            """, next_run_time, video_id)
+            
+        logger.info(f"Next optimization time set for {video_id}: {next_run_time}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error updating next optimization time for {video_id}: {e}")
+        return False
+
+
+async def save_performance_baseline(
+    video_id: str,
+    baseline: Dict[str, Any]
+) -> bool:
+    """
+    Save performance baseline for a video
+    
+    Args:
+        video_id: YouTube video ID
+        baseline: Performance baseline data
+        
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        async with _pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE videos
+                SET performance_baseline = $1::jsonb,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE video_id = $2
+            """, json.dumps(baseline), video_id)
+            
+        logger.info(f"Performance baseline saved for {video_id}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error saving performance baseline for {video_id}: {e}")
         return False
 
 
 # ============================================================================
-# HEALTH CHECK (FIX #31-32)
+# ANALYTICS CACHE OPERATIONS
 # ============================================================================
 
-def check_database_health() -> Dict[str, Any]:
+async def cache_analytics(
+    video_id: str,
+    analytics_data: Dict[str, Any],
+    cache_duration_hours: int = 1
+) -> bool:
     """
-    Check database health and performance
+    Cache analytics data for a video
     
-    FIXES:
-    - #31: No health monitoring
-    - #32: Connection pool status
-    
+    Args:
+        video_id: YouTube video ID
+        analytics_data: Analytics data to cache
+        cache_duration_hours: How long to cache the data
+        
     Returns:
-        Health status dict
+        True if successful, False otherwise
     """
-    health = {
-        'status': 'unknown',
-        'pool_available': 0,
-        'pool_size': 0,
-        'response_time_ms': 0,
-        'errors': []
-    }
-    
     try:
-        # Check pool status
-        if connection_pool:
-            # Note: ThreadedConnectionPool doesn't expose _used/_pool
-            # But we can check if we can get a connection
-            health['status'] = 'healthy'
-        else:
-            health['status'] = 'pool_not_initialized'
-            health['errors'].append('Connection pool not initialized')
+        expires_at = datetime.utcnow() + timedelta(hours=cache_duration_hours)
         
-        # Test query performance
-        start_time = datetime.now()
-        
-        with get_db_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute("SELECT 1")
-                cursor.fetchone()
-        
-        end_time = datetime.now()
-        health['response_time_ms'] = (end_time - start_time).total_seconds() * 1000
-        
-        if health['response_time_ms'] > 1000:
-            health['errors'].append(f"Slow response: {health['response_time_ms']:.0f}ms")
+        async with _pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO analytics_cache (video_id, analytics_data, expires_at)
+                VALUES ($1, $2::jsonb, $3)
+                ON CONFLICT (video_id) DO UPDATE SET
+                    analytics_data = EXCLUDED.analytics_data,
+                    cached_at = CURRENT_TIMESTAMP,
+                    expires_at = EXCLUDED.expires_at
+            """, video_id, json.dumps(analytics_data), expires_at)
+            
+        logger.info(f"Analytics cached for {video_id} (expires: {expires_at})")
+        return True
         
     except Exception as e:
-        health['status'] = 'unhealthy'
-        health['errors'].append(str(e))
+        logger.error(f"Error caching analytics for {video_id}: {e}")
+        return False
+
+
+async def get_cached_analytics(video_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Retrieve cached analytics for a video
+    
+    Args:
+        video_id: YouTube video ID
+        
+    Returns:
+        Cached analytics data, or None if not found/expired
+    """
+    try:
+        async with _pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT analytics_data
+                FROM analytics_cache
+                WHERE video_id = $1
+                AND expires_at > CURRENT_TIMESTAMP
+            """, video_id)
+            
+        if not row:
+            return None
+            
+        return row['analytics_data']
+        
+    except Exception as e:
+        logger.error(f"Error retrieving cached analytics for {video_id}: {e}")
+        return None
+
+
+async def clean_expired_cache():
+    """Remove expired analytics cache entries"""
+    try:
+        async with _pool.acquire() as conn:
+            result = await conn.execute("""
+                DELETE FROM analytics_cache
+                WHERE expires_at <= CURRENT_TIMESTAMP
+            """)
+            
+        logger.info(f"Expired cache cleaned: {result}")
+        
+    except Exception as e:
+        logger.error(f"Error cleaning expired cache: {e}")
+
+
+# ============================================================================
+# QUERY OPERATIONS
+# ============================================================================
+
+async def get_videos_due_for_optimization() -> List[Dict[str, Any]]:
+    """
+    Get all videos that are due for optimization
+    
+    Returns:
+        List of video dictionaries
+    """
+    try:
+        async with _pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT 
+                    v.video_id,
+                    v.user_id,
+                    v.title,
+                    v.optimization_history,
+                    v.performance_baseline,
+                    v.last_optimized,
+                    u.encrypted_youtube_token,
+                    u.encrypted_refresh_token
+                FROM videos v
+                JOIN users u ON v.user_id = u.user_id
+                WHERE v.next_optimization_time <= CURRENT_TIMESTAMP
+                AND u.encrypted_youtube_token IS NOT NULL
+                ORDER BY v.next_optimization_time ASC
+            """)
+            
+        videos = []
+        for row in rows:
+            video_dict = dict(row)
+            
+            # Decrypt tokens
+            if video_dict.get('encrypted_youtube_token'):
+                video_dict['access_token'] = cipher_suite.decrypt(
+                    video_dict['encrypted_youtube_token'].encode()
+                ).decode()
+                
+            if video_dict.get('encrypted_refresh_token'):
+                video_dict['refresh_token'] = cipher_suite.decrypt(
+                    video_dict['encrypted_refresh_token'].encode()
+                ).decode()
+                
+            # Remove encrypted versions
+            video_dict.pop('encrypted_youtube_token', None)
+            video_dict.pop('encrypted_refresh_token', None)
+            
+            videos.append(video_dict)
+            
+        logger.info(f"Found {len(videos)} videos due for optimization")
+        return videos
+        
+    except Exception as e:
+        logger.error(f"Error getting videos due for optimization: {e}")
+        return []
+
+
+async def get_user_videos(user_id: int) -> List[Dict[str, Any]]:
+    """
+    Get all videos for a specific user
+    
+    Args:
+        user_id: User ID
+        
+    Returns:
+        List of video dictionaries
+    """
+    try:
+        async with _pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT 
+                    video_id,
+                    title,
+                    optimization_history,
+                    last_optimized,
+                    next_optimization_time,
+                    performance_baseline,
+                    created_at,
+                    updated_at
+                FROM videos
+                WHERE user_id = $1
+                ORDER BY created_at DESC
+            """, user_id)
+            
+        videos = [dict(row) for row in rows]
+        logger.info(f"Retrieved {len(videos)} videos for user {user_id}")
+        return videos
+        
+    except Exception as e:
+        logger.error(f"Error retrieving videos for user {user_id}: {e}")
+        return []
+
+
+# ============================================================================
+# TRANSACTION SUPPORT
+# ============================================================================
+
+class DBTransaction:
+    """Context manager for database transactions"""
+    
+    def __init__(self):
+        self.conn = None
+        self.transaction = None
+        
+    async def __aenter__(self):
+        self.conn = await _pool.acquire()
+        self.transaction = self.conn.transaction()
+        await self.transaction.start()
+        return self.conn
+        
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        try:
+            if exc_type is not None:
+                await self.transaction.rollback()
+                logger.warning(f"Transaction rolled back due to: {exc_val}")
+            else:
+                await self.transaction.commit()
+                logger.debug("Transaction committed successfully")
+        finally:
+            await _pool.release(self.conn)
+
+
+# ============================================================================
+# HEALTH CHECK
+# ============================================================================
+
+async def check_db_health() -> Dict[str, Any]:
+    """
+    Check database health and return status
+    
+    Returns:
+        Dictionary with health check results
+    """
+    try:
+        async with _pool.acquire() as conn:
+            # Test query
+            result = await conn.fetchval("SELECT 1")
+            
+            # Get pool stats
+            pool_stats = {
+                'size': _pool.get_size(),
+                'idle': _pool.get_idle_size(),
+                'max_size': _pool.get_max_size(),
+                'min_size': _pool.get_min_size()
+            }
+            
+        return {
+            'status': 'healthy',
+            'connected': result == 1,
+            'pool_stats': pool_stats,
+            'timestamp': datetime.utcnow().isoformat()
+        }
+        
+    except Exception as e:
         logger.error(f"Database health check failed: {e}")
-    
-    return health
-
-
-# ============================================================================
-# CLEANUP & INITIALIZATION
-# ============================================================================
-
-def initialize_database():
-    """
-    Initialize database with connection pool and indexes
-    
-    FIXES:
-    - #33: Proper initialization
-    - #34: Index creation
-    """
-    logger.info("Initializing database...")
-    
-    # Initialize connection pool
-    initialize_connection_pool()
-    
-    # Create performance indexes
-    create_performance_indexes()
-    
-    logger.info("Database initialization complete")
-
-
-# Initialize on module import
-try:
-    initialize_database()
-except Exception as e:
-    logger.error(f"Database initialization failed: {e}")
-
-
-# Cleanup on exit
-import atexit
-atexit.register(close_connection_pool)
+        return {
+            'status': 'unhealthy',
+            'error': str(e),
+            'timestamp': datetime.utcnow().isoformat()
+        }
