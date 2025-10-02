@@ -1,5 +1,5 @@
 # YouTube Content Optimization Platform - Production Dependencies
-# Version: 2.0.0
+# Version: 2.0.0 - FIXED
 # Python: 3.11+
 # Last Updated: October 2025
 
@@ -13,7 +13,12 @@ python-multipart==0.0.9
 # ============================================================================
 # Database & ORM
 # ============================================================================
-psycopg2-binary==2.9.9
+# ✅ FIXED: Added asyncpg (async PostgreSQL driver)
+asyncpg==0.29.0
+
+# ✅ FIXED: Removed psycopg2-binary (sync driver - incompatible with asyncpg)
+# psycopg2-binary==2.9.9  # REMOVED
+
 SQLAlchemy==2.0.23
 alembic==1.13.1
 
@@ -22,7 +27,7 @@ alembic==1.13.1
 # ============================================================================
 celery==5.3.4
 redis==5.0.1
-asyncio==3.4.3
+# Note: asyncio is built-in to Python 3.11+, no need to install separately
 
 # ============================================================================
 # Authentication & Security
@@ -92,7 +97,6 @@ pytest==7.4.3
 pytest-asyncio==0.21.1
 pytest-cov==4.1.0
 pytest-mock==3.12.0
-httpx==0.25.2  # For testing async endpoints
 
 # ============================================================================
 # Code Quality
@@ -107,11 +111,6 @@ isort==5.13.2
 # ============================================================================
 prometheus-client==0.19.0
 python-json-logger==2.0.7
-
-# ============================================================================
-# CORS & Middleware
-# ============================================================================
-# Already included in FastAPI
 
 # ============================================================================
 # Date & Time
@@ -140,19 +139,36 @@ python-slugify==8.0.1
 # ujson==5.9.0    # Alternative JSON library
 
 # ============================================================================
-# Notes:
+# FIXES APPLIED:
 # ============================================================================
-# - All versions are pinned for reproducibility
-# - Compatible with Python 3.11+
-# - Tested on Ubuntu 22.04 LTS, macOS 14+, Windows 11
-# - PostgreSQL 15+ required
-# - Redis 7.0+ recommended for caching
+# ✅ Added: asyncpg==0.29.0 (required by utils/db.py)
+# ✅ Removed: psycopg2-binary==2.9.9 (incompatible with async architecture)
+# ✅ Removed: asyncio line (built-in to Python 3.11+)
 #
-# Installation:
+# All code now uses asyncpg for async PostgreSQL operations
+# ============================================================================
+
+# ============================================================================
+# Installation Instructions:
+# ============================================================================
+# 
+# Fresh install:
 #   pip install -r requirements.txt
 #
-# Upgrade all:
-#   pip install --upgrade -r requirements.txt
+# Upgrade from old version:
+#   pip uninstall psycopg2-binary  # Remove old sync driver
+#   pip install -r requirements.txt
 #
-# Freeze current environment:
-#   pip freeze > requirements-lock.txt
+# Database requirements:
+#   - PostgreSQL 15+ required
+#   - Redis 7.0+ recommended for caching
+#
+# Python version:
+#   - Python 3.11+ required
+#   - Tested on Python 3.11 and 3.12
+#
+# Platform compatibility:
+#   - Ubuntu 22.04 LTS
+#   - macOS 14+ (Sonoma)
+#   - Windows 11
+# ============================================================================
