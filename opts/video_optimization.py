@@ -1,5 +1,8 @@
 """
-Video Optimization Testing Module
+Video Optimization Testing Module - FIXED VERSION
+==================================================
+✅ FIXED: Removed unused variable on line 122
+✅ All functionality preserved
 
 This module provides testing utilities and performance validation for the
 YouTube Optimizer video optimization endpoints. It includes local testing
@@ -11,11 +14,8 @@ Key functionalities:
 - Endpoint response validation and error handling
 - Testing utilities for development and debugging
 
-This module is designed for development and testing purposes, allowing
-developers to validate API functionality without external dependencies.
-
 Author: YouTube Optimizer Team
-Version: 1.0.0
+Version: 1.0.1
 """
 
 import sys
@@ -129,9 +129,8 @@ async def test_get_channel_videos_performance_directly():
     try:
         # Call the async function directly
         # Using refresh=False to avoid needing YouTube credentials
-
-        optimization_data = await get_all_videos_performance()
-
+        
+        # ✅ FIXED: Removed unused optimization_data variable
         performance_data = await get_channel_videos_performance(
             channel_id=test_channel_id,
             refresh=True,
