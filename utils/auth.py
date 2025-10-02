@@ -1,13 +1,29 @@
+"""
+Authentication Utilities - COMPLETE REWRITE
+===========================================
+ALL 8 CRITICAL ERRORS FIXED
+
+Major Changes:
+✅ #1: Removed get_connection() - now uses get_pool() from asyncpg
+✅ #2: Fixed dual Request import conflict
+✅ #3: Removed non-existent client_secret_file reference
+✅ #4-8: All functions converted to async with asyncpg
+✅ All database operations now use asyncpg API
+✅ All functions properly use async/await patterns
+✅ Proper connection pool usage throughout
+"""
+
 import logging
 from google.oauth2.credentials import Credentials
 from google.oauth2 import service_account
-from google.auth.transport.requests import Request
-from utils.db import get_connection
+from google.auth.transport.requests import Request as GoogleRequest  # ✅ FIXED: Renamed import
+from utils.db import get_pool  # ✅ FIXED: Use get_pool instead of get_connection
 from typing import Dict, Optional
 import datetime
-from fastapi import Cookie, Request
+from fastapi import Cookie
 from pydantic import BaseModel
 from config import get_settings
+import re
 
 # Models for user data
 class User(BaseModel):
@@ -20,7 +36,12 @@ class User(BaseModel):
 
 logger = logging.getLogger(__name__)
 
-def get_app_credentials() -> Optional[Credentials]:
+
+# ============================================================================
+# APP CREDENTIALS
+# ============================================================================
+
+async def get_app_credentials() -> Optional[Credentials]:  # ✅ FIXED: Now async
     """
     Retrieve app-level credentials from environment variables.
     
@@ -29,15 +50,26 @@ def get_app_credentials() -> Optional[Credentials]:
     """
     try:
         settings = get_settings()
-
-        service_account_file = settings.client_secret_file
+        
+        # ✅ FIXED: Use existing config field instead of non-existent one
+        service_account_file = settings.GOOGLE_VISION_CREDENTIALS
+        
+        if not service_account_file:
+            logger.warning("No service account file configured")
+            return None
+            
         return service_account.Credentials.from_service_account_file(service_account_file)
             
     except Exception as e:
         logger.error(f"Error retrieving app credentials: {e}")
         return None
-    
-def get_user_credentials(user_id: int, auto_refresh: bool = True) -> Optional[Credentials]:
+
+
+# ============================================================================
+# USER CREDENTIALS
+# ============================================================================
+
+async def get_user_credentials(user_id: int, auto_refresh: bool = True) -> Optional[Credentials]:
     """
     Retrieve user credentials from the database and convert to a Google OAuth2 Credentials object.
     Optionally refreshes the token if it's expired or about to expire.
@@ -50,33 +82,35 @@ def get_user_credentials(user_id: int, auto_refresh: bool = True) -> Optional[Cr
         Credentials object or None if not found
     """
     try:
-        conn = get_connection()
-        
-        with conn.cursor() as cursor:
-            cursor.execute("""
+        # ✅ FIXED: Use asyncpg connection pool
+        async with get_pool().acquire() as conn:
+            # ✅ FIXED: Use asyncpg API
+            row = await conn.fetchrow("""
                 SELECT token, refresh_token, token_uri, client_id, client_secret, scopes, token_expiry
                 FROM users
-                WHERE id = %s
-            """, (user_id,))
+                WHERE id = $1
+            """, user_id)
             
-            result = cursor.fetchone()
-            
-            if not result:
+            if not row:
                 logger.warning(f"No credentials found for user {user_id}")
                 return None
-                
-            token, refresh_token, token_uri, client_id, client_secret, scopes, token_expiry = result
             
-            # Convert scopes to a Python list (handle both string and list formats)
+            # ✅ FIXED: asyncpg returns dict-like records
+            token = row['token']
+            refresh_token = row['refresh_token']
+            token_uri = row['token_uri']
+            client_id = row['client_id']
+            client_secret = row['client_secret']
+            scopes = row['scopes']
+            token_expiry = row['token_expiry']
+            
+            # Convert scopes to a Python list (asyncpg handles arrays natively)
             if scopes:
                 if isinstance(scopes, list):
-                    # Already a list, use as is
                     scopes_list = scopes
                 elif isinstance(scopes, str):
-                    # PostgreSQL array format string like "{scope1,scope2}"
                     scopes_list = scopes.replace("{", "").replace("}", "").split(",")
                 else:
-                    # Unknown format, log warning and use empty list
                     logger.warning(f"Unknown scope format for user {user_id}: {type(scopes)}")
                     scopes_list = []
             else:
@@ -105,40 +139,36 @@ def get_user_credentials(user_id: int, auto_refresh: bool = True) -> Optional[Cr
             if auto_refresh and credentials.refresh_token:
                 should_refresh = False
                 
-                # Check if expired
                 if credentials.expired:
                     logger.info(f"Token for user {user_id} is expired, refreshing")
                     should_refresh = True
-                # Check if about to expire
                 elif expiry:
                     now = datetime.datetime.now(expiry.tzinfo) if expiry.tzinfo else datetime.datetime.now()
                     time_until_expiry = expiry - now
-                    if time_until_expiry.total_seconds() < 300:  # Less than 5 minutes
+                    if time_until_expiry.total_seconds() < 300:
                         logger.info(f"Token for user {user_id} expires in {time_until_expiry.total_seconds()}s, refreshing")
                         should_refresh = True
                 
-                # Refresh the token if needed
                 if should_refresh:
                     try:
-                        request = Request()
+                        # ✅ FIXED: Use GoogleRequest (renamed import)
+                        request = GoogleRequest()
                         credentials.refresh(request)
                         
                         # Update the refreshed credentials in the database
-                        update_user_credentials(user_id, credentials)
+                        await update_user_credentials(user_id, credentials)
                         logger.info(f"Successfully refreshed token for user {user_id}")
                     except Exception as e:
                         logger.error(f"Error refreshing token for user {user_id}: {e}")
-                
+            
             return credentials
             
     except Exception as e:
         logger.error(f"Error retrieving user credentials: {e}")
         return None
-    finally:
-        conn.close()
 
 
-def update_user_credentials(user_id: int, credentials: Credentials) -> bool:
+async def update_user_credentials(user_id: int, credentials: Credentials) -> bool:
     """
     Update stored credentials after token refresh.
     
@@ -150,56 +180,51 @@ def update_user_credentials(user_id: int, credentials: Credentials) -> bool:
         bool: True if update was successful
     """
     try:
-        conn = get_connection()
-        
-        # Convert scopes list to array format for PostgreSQL
-        scopes_array = "{" + ",".join(credentials.scopes) + "}" if credentials.scopes else "{}"
+        # ✅ FIXED: asyncpg handles arrays natively
+        scopes_list = credentials.scopes if credentials.scopes else []
         
         # Format token expiry to a timestamp
         token_expiry = credentials.expiry.isoformat() if hasattr(credentials, 'expiry') and credentials.expiry else None
         
-        with conn.cursor() as cursor:
-            cursor.execute("""
-                UPDATE users SET
-                    token = %s,
-                    refresh_token = %s,
-                    token_uri = %s,
-                    client_id = %s,
-                    client_secret = %s,
-                    scopes = %s,
-                    token_expiry = %s,
-                    updated_at = NOW()
-                WHERE id = %s
-            """, (
-                credentials.token,
-                credentials.refresh_token,
-                credentials.token_uri,
-                credentials.client_id,
-                credentials.client_secret,
-                scopes_array,
-                token_expiry,
-                user_id
-            ))
-            
-            conn.commit()
-            
-            # Check if update was successful
-            if cursor.rowcount > 0:
-                logger.info(f"Updated credentials for user {user_id}")
-                return True
-            else:
-                logger.warning(f"No user found with ID {user_id}, credentials not updated")
-                return False
+        # ✅ FIXED: Use asyncpg connection pool and transaction
+        async with get_pool().acquire() as conn:
+            async with conn.transaction():  # ✅ FIXED: asyncpg transaction API
+                result = await conn.execute("""
+                    UPDATE users SET
+                        token = $1,
+                        refresh_token = $2,
+                        token_uri = $3,
+                        client_id = $4,
+                        client_secret = $5,
+                        scopes = $6,
+                        token_expiry = $7,
+                        updated_at = NOW()
+                    WHERE id = $8
+                """, 
+                    credentials.token,
+                    credentials.refresh_token,
+                    credentials.token_uri,
+                    credentials.client_id,
+                    credentials.client_secret,
+                    scopes_list,  # ✅ FIXED: asyncpg handles list natively
+                    token_expiry,
+                    user_id
+                )
+                
+                # ✅ FIXED: Check result format for asyncpg
+                if result == "UPDATE 1":
+                    logger.info(f"Updated credentials for user {user_id}")
+                    return True
+                else:
+                    logger.warning(f"No user found with ID {user_id}, credentials not updated")
+                    return False
                 
     except Exception as e:
-        conn.rollback()
         logger.error(f"Error updating credentials for user {user_id}: {e}")
         return False
-    finally:
-        conn.close()
 
 
-def get_credentials_dict(user_id: int) -> Optional[Dict]:
+async def get_credentials_dict(user_id: int) -> Optional[Dict]:
     """
     Retrieve user credentials from the database as a dictionary format
     
@@ -211,33 +236,30 @@ def get_credentials_dict(user_id: int) -> Optional[Dict]:
     """
     try:
         logger.info(f"Getting credentials data for user {user_id}")
-        conn = get_connection()
         
-        with conn.cursor() as cursor:
-            cursor.execute("""
+        # ✅ FIXED: Use asyncpg connection pool
+        async with get_pool().acquire() as conn:
+            row = await conn.fetchrow("""
                 SELECT token, refresh_token, token_uri, client_id, client_secret, scopes, token_expiry
                 FROM users
-                WHERE id = %s
-            """, (user_id,))
+                WHERE id = $1
+            """, user_id)
             
-            result = cursor.fetchone()
-            
-            if not result:
+            if not row:
                 logger.warning(f"No credentials found for user {user_id}")
                 return None
-                
-            token, refresh_token, token_uri, client_id, client_secret, scopes, token_expiry = result
             
-            # Convert scopes to a Python list (handle both string and list formats)
+            # ✅ FIXED: asyncpg returns dict-like records
+            scopes = row['scopes']
+            token_expiry = row['token_expiry']
+            
+            # Convert scopes to a Python list
             if scopes:
                 if isinstance(scopes, list):
-                    # Already a list, use as is
                     scopes_list = scopes
                 elif isinstance(scopes, str):
-                    # PostgreSQL array format string like "{scope1,scope2}"
                     scopes_list = scopes.replace("{", "").replace("}", "").split(",")
                 else:
-                    # Unknown format, log warning and use empty list
                     logger.warning(f"Unknown scope format for user {user_id}: {type(scopes)}")
                     scopes_list = []
             else:
@@ -251,13 +273,12 @@ def get_credentials_dict(user_id: int) -> Optional[Dict]:
                 else:
                     expiry_str = str(token_expiry)
             
-            # Return as dictionary
             return {
-                "token": token,
-                "refresh_token": refresh_token,
-                "token_uri": token_uri,
-                "client_id": client_id,
-                "client_secret": client_secret,
+                "token": row['token'],
+                "refresh_token": row['refresh_token'],
+                "token_uri": row['token_uri'],
+                "client_id": row['client_id'],
+                "client_secret": row['client_secret'],
                 "scopes": scopes_list,
                 "token_expiry": expiry_str
             }
@@ -265,9 +286,11 @@ def get_credentials_dict(user_id: int) -> Optional[Dict]:
     except Exception as e:
         logger.error(f"Error retrieving user credentials dict: {e}")
         return None
-    finally:
-        conn.close()
 
+
+# ============================================================================
+# SESSION MANAGEMENT
+# ============================================================================
 
 def validate_session_token(session_token: str) -> bool:
     """
@@ -282,44 +305,50 @@ def validate_session_token(session_token: str) -> bool:
     if not session_token:
         return False
     
-    # Check token length (secrets.token_urlsafe(32) produces ~43 characters)
+    # Check token length
     if len(session_token) < 32:
         return False
     
     # Check for valid characters (URL-safe base64)
-    import re
     if not re.match(r'^[A-Za-z0-9_-]+$', session_token):
         return False
     
     return True
 
-def cleanup_invalid_sessions() -> int:
+
+async def cleanup_invalid_sessions() -> int:
     """
     Clean up any invalid session tokens in the database
     
     Returns:
         int: Number of invalid sessions cleaned up
     """
-    conn = get_connection()
     try:
-        with conn.cursor() as cursor:
+        # ✅ FIXED: Use asyncpg connection pool
+        async with get_pool().acquire() as conn:
             # Get all session tokens
-            cursor.execute("SELECT id, session_token FROM users WHERE session_token IS NOT NULL")
-            users = cursor.fetchall()
+            rows = await conn.fetch(
+                "SELECT id, session_token FROM users WHERE session_token IS NOT NULL"
+            )
             
             invalid_count = 0
-            for user_id, session_token in users:
-                if not validate_session_token(session_token):
-                    # Clear invalid session token
-                    cursor.execute("""
-                        UPDATE users 
-                        SET session_token = NULL, session_expires = NULL
-                        WHERE id = %s
-                    """, (user_id,))
-                    invalid_count += 1
+            
+            # ✅ FIXED: Use asyncpg transaction
+            async with conn.transaction():
+                for row in rows:
+                    user_id = row['id']
+                    session_token = row['session_token']
+                    
+                    if not validate_session_token(session_token):
+                        # Clear invalid session token
+                        await conn.execute("""
+                            UPDATE users 
+                            SET session_token = NULL, session_expires = NULL
+                            WHERE id = $1
+                        """, user_id)
+                        invalid_count += 1
             
             if invalid_count > 0:
-                conn.commit()
                 logger.warning(f"Cleaned up {invalid_count} invalid session tokens")
             else:
                 logger.info("No invalid session tokens found")
@@ -329,10 +358,11 @@ def cleanup_invalid_sessions() -> int:
     except Exception as e:
         logger.error(f"Error during session cleanup: {e}")
         return 0
-    finally:
-        conn.close()
 
-def get_user_from_session(session_token: Optional[str] = Cookie(None, alias='youtube_optimizer_session')) -> Optional[User]:
+
+async def get_user_from_session(
+    session_token: Optional[str] = Cookie(None, alias='youtube_optimizer_session')
+) -> Optional[User]:
     """
     Retrieve user from session token with security validation
     
@@ -355,40 +385,38 @@ def get_user_from_session(session_token: Optional[str] = Cookie(None, alias='you
     if not validate_session_token(session_token):
         logger.warning(f"Invalid session token format: {session_token[:10] if session_token else None}...")
         return None
-        
-    conn = get_connection()
+    
     try:
-        with conn.cursor() as cursor:
-            cursor.execute("""
+        # ✅ FIXED: Use asyncpg connection pool
+        async with get_pool().acquire() as conn:
+            row = await conn.fetchrow("""
                 SELECT id, google_id, email, name, permission_level, is_free_trial, session_expires
                 FROM users
-                WHERE session_token = %s
-            """, (session_token,))
+                WHERE session_token = $1
+            """, session_token)
             
-            result = cursor.fetchone()
-            if not result:
+            if not row:
                 logger.info(f"No user found with session token {session_token[:10] if session_token else None}...")
                 return None
-                
+            
             # Check for session expiry
-            id, google_id, email, name, permission_level, is_free_trial, session_expires = result
+            session_expires = row['session_expires']
             
             if session_expires:
                 now = datetime.datetime.now(session_expires.tzinfo) if hasattr(session_expires, 'tzinfo') else datetime.datetime.now()
                 if now > session_expires:
-                    logger.info(f"Session expired for user {id}")
+                    logger.info(f"Session expired for user {row['id']}")
                     return None
             
             return User(
-                id=id,
-                google_id=google_id,
-                email=email,
-                name=name,
-                permission_level=permission_level or "readwrite",
-                is_free_trial=is_free_trial or False
+                id=row['id'],
+                google_id=row['google_id'],
+                email=row['email'],
+                name=row['name'],
+                permission_level=row['permission_level'] or "readwrite",
+                is_free_trial=row['is_free_trial'] or False
             )
+            
     except Exception as e:
         logger.error(f"Error retrieving user from session: {e}")
         return None
-    finally:
-        conn.close()
