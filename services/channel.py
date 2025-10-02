@@ -15,6 +15,7 @@ def get_channel_data(channel_id: int) -> Optional[Dict]:
     Returns:
         dict: The channel data including branding settings or None if not found
     """
+    conn = None
     try:
         conn = get_connection()
         with conn.cursor() as cursor:
@@ -55,7 +56,10 @@ def get_channel_data(channel_id: int) -> Optional[Dict]:
         return None
     finally:
         if conn:
-            conn.close()
+            try:
+                conn.close()
+            except Exception as e:
+                logger.warning(f"Error closing connection: {e}")
 
 def get_latest_videos_for_channel(channel_id: int, limit: int = 3) -> List[Dict]:
     """
@@ -68,6 +72,7 @@ def get_latest_videos_for_channel(channel_id: int, limit: int = 3) -> List[Dict]
     Returns:
         list: The latest videos with their metadata
     """
+    conn = None
     try:
         conn = get_connection()
         with conn.cursor() as cursor:
@@ -95,7 +100,10 @@ def get_latest_videos_for_channel(channel_id: int, limit: int = 3) -> List[Dict]
         return []
     finally:
         if conn:
-            conn.close()
+            try:
+                conn.close()
+            except Exception as e:
+                logger.warning(f"Error closing connection: {e}")
             
 def get_random_videos_for_channel(channel_id: int, limit: int = 3, exclude_ids: List[str] = None) -> List[Dict]:
     """
@@ -109,23 +117,23 @@ def get_random_videos_for_channel(channel_id: int, limit: int = 3, exclude_ids: 
     Returns:
         list: A random selection of videos with their metadata
     """
+    conn = None
     try:
         if exclude_ids is None:
             exclude_ids = []
             
         conn = get_connection()
         with conn.cursor() as cursor:
-            # Create parameterized query with dynamic exclusion
-            exclusion_clause = ""
+            # Build query with parameterized exclusion
             params = [channel_id]
             
             if exclude_ids:
-                placeholders = []
-                for i, vid_id in enumerate(exclude_ids):
-                    placeholders.append(f"%s")
-                    params.append(vid_id)
-                
-                exclusion_clause = f"AND video_id NOT IN ({', '.join(placeholders)})"
+                # Create placeholders for excluded IDs
+                placeholders = ', '.join(['%s'] * len(exclude_ids))
+                exclusion_clause = f"AND video_id NOT IN ({placeholders})"
+                params.extend(exclude_ids)
+            else:
+                exclusion_clause = ""
             
             # Use RANDOM() for true randomization
             query = f"""
@@ -155,7 +163,10 @@ def get_random_videos_for_channel(channel_id: int, limit: int = 3, exclude_ids: 
         return []
     finally:
         if conn:
-            conn.close()
+            try:
+                conn.close()
+            except Exception as e:
+                logger.warning(f"Error closing connection: {e}")
 
 def generate_channel_optimization(channel: Dict, optimization_id: int) -> Dict:
     """
@@ -301,47 +312,47 @@ def create_optimization(channel_id: int) -> int:
         channel_id: The database ID of the channel
         
     Returns:
-        int: The ID of the new optimization record
+        int: The ID of the new optimization record, or 0 on failure
     """
+    conn = None
     try:
         conn = get_connection()
-        try:
-            with conn.cursor() as cursor:
-                # Always create a new optimization record
-                cursor.execute("""
-                    INSERT INTO channel_optimizations (
-                        channel_id,
-                        status,
-                        progress,
-                        created_by
-                    ) VALUES (%s, %s, %s, %s)
-                    RETURNING id
-                """, (
+        with conn.cursor() as cursor:
+            # Always create a new optimization record
+            cursor.execute("""
+                INSERT INTO channel_optimizations (
                     channel_id,
-                    'pending',
-                    0,
-                    'youtube-optimizer-system'
-                ))
-                
-                optimization_id = cursor.fetchone()[0]
-                conn.commit()
-                
-                logger.info(f"Created new optimization record {optimization_id} for channel {channel_id}")
-                return optimization_id
-        except Exception as e:
-            # Roll back transaction on error
-            if not conn.autocommit:
-                conn.rollback()
-            raise
+                    status,
+                    progress,
+                    created_by
+                ) VALUES (%s, %s, %s, %s)
+                RETURNING id
+            """, (
+                channel_id,
+                'pending',
+                0,
+                'youtube-optimizer-system'
+            ))
+            
+            optimization_id = cursor.fetchone()[0]
+            conn.commit()
+            
+            logger.info(f"Created new optimization record {optimization_id} for channel {channel_id}")
+            return optimization_id
     except Exception as e:
         logger.error(f"Error creating optimization record: {str(e)}")
+        if conn:
+            try:
+                conn.rollback()
+            except Exception as rb_error:
+                logger.warning(f"Error rolling back transaction: {rb_error}")
         return 0
     finally:
         if conn:
             try:
                 conn.close()
-            except:
-                pass
+            except Exception as e:
+                logger.warning(f"Error closing connection: {e}")
 
 def update_optimization_progress(optimization_id: int, progress: int, status: str = None) -> bool:
     """
@@ -355,6 +366,7 @@ def update_optimization_progress(optimization_id: int, progress: int, status: st
     Returns:
         bool: Success status
     """
+    conn = None
     try:
         conn = get_connection()
         with conn.cursor() as cursor:
@@ -377,10 +389,18 @@ def update_optimization_progress(optimization_id: int, progress: int, status: st
             
     except Exception as e:
         logger.error(f"Error updating optimization progress: {str(e)}")
+        if conn:
+            try:
+                conn.rollback()
+            except Exception as rb_error:
+                logger.warning(f"Error rolling back transaction: {rb_error}")
         return False
     finally:
         if conn:
-            conn.close()
+            try:
+                conn.close()
+            except Exception as e:
+                logger.warning(f"Error closing connection: {e}")
 
 def store_optimization_results(optimization_id: int, channel_id: int, optimization_data: Dict, update_description: bool = False) -> bool:
     """
@@ -395,6 +415,7 @@ def store_optimization_results(optimization_id: int, channel_id: int, optimizati
     Returns:
         bool: Success status
     """
+    conn = None
     try:
         logger.info(f"Storing optimization results for optimization ID {optimization_id}, channel {channel_id}")
         logger.debug(f"Optimization data summary: {optimization_data}")
@@ -439,10 +460,18 @@ def store_optimization_results(optimization_id: int, channel_id: int, optimizati
             
     except Exception as e:
         logger.error(f"Error storing optimization results: {str(e)}")
+        if conn:
+            try:
+                conn.rollback()
+            except Exception as rb_error:
+                logger.warning(f"Error rolling back transaction: {rb_error}")
         return False
     finally:
         if conn:
-            conn.close()
+            try:
+                conn.close()
+            except Exception as e:
+                logger.warning(f"Error closing connection: {e}")
 
 def get_channel_optimizations(channel_id: int, limit: int = 5) -> List[Dict]:
     """
@@ -455,6 +484,7 @@ def get_channel_optimizations(channel_id: int, limit: int = 5) -> List[Dict]:
     Returns:
         list: Recent optimization records for the channel
     """
+    conn = None
     try:
         conn = get_connection()
         with conn.cursor() as cursor:
@@ -513,7 +543,10 @@ def get_channel_optimizations(channel_id: int, limit: int = 5) -> List[Dict]:
         return []
     finally:
         if conn:
-            conn.close()
+            try:
+                conn.close()
+            except Exception as e:
+                logger.warning(f"Error closing connection: {e}")
 
 def get_optimization_status(optimization_id: int) -> Dict:
     """
@@ -525,6 +558,7 @@ def get_optimization_status(optimization_id: int) -> Dict:
     Returns:
         dict: Status information including progress percentage
     """
+    conn = None
     try:
         conn = get_connection()
         with conn.cursor() as cursor:
@@ -607,7 +641,10 @@ def get_optimization_status(optimization_id: int) -> Dict:
         }
     finally:
         if conn:
-            conn.close()
+            try:
+                conn.close()
+            except Exception as e:
+                logger.warning(f"Error closing connection: {e}")
 
 def apply_channel_optimization(optimization_id: int) -> bool:
     """
@@ -619,6 +656,7 @@ def apply_channel_optimization(optimization_id: int) -> bool:
     Returns:
         bool: True if successfully applied, False otherwise
     """
+    conn = None
     try:
         conn = get_connection()
         with conn.cursor() as cursor:
@@ -642,7 +680,15 @@ def apply_channel_optimization(optimization_id: int) -> bool:
             
     except Exception as e:
         logger.error(f"Error applying channel optimization: {str(e)}")
+        if conn:
+            try:
+                conn.rollback()
+            except Exception as rb_error:
+                logger.warning(f"Error rolling back transaction: {rb_error}")
         return False
     finally:
         if conn:
-            conn.close()
+            try:
+                conn.close()
+            except Exception as e:
+                logger.warning(f"Error closing connection: {e}")
