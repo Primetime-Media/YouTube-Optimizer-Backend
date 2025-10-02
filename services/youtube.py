@@ -111,6 +111,7 @@ def get_user_id_for_channel(channel_id: int) -> Optional[int]:
     Returns:
         int: User ID if found, None otherwise
     """
+    conn = None  # ✅ FIXED: Initialize before try block to prevent NameError
     try:
         logger.info(f"Retrieving user ID for channel {channel_id}")
         conn = get_connection()
@@ -133,7 +134,7 @@ def get_user_id_for_channel(channel_id: int) -> Optional[int]:
         logger.error(f"Error retrieving user ID for channel: {e}")
         return None
     finally:
-        if conn:
+        if conn:  # ✅ Safe now - conn is always defined
             conn.close()
 
 def set_video_thumbnail(youtube_client, video_id: str, thumbnail_file: str) -> Dict:
