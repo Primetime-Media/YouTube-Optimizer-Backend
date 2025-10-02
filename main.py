@@ -1,19 +1,16 @@
 """
-Main Application Entry Point - COMPLETE FIXED VERSION
-======================================================
-15 Critical Errors Fixed - Production Ready
+Main Application Entry Point - FIXED VERSION
+=============================================
+ALL 7 CRITICAL ERRORS CORRECTED
 
-Key Fixes Applied:
-1. Async Lifespan Management - Proper startup/shutdown
-2. Rate Limiting - DDoS protection
-3. Request Tracing - Request ID tracking
-4. Security Headers - CSP, HSTS, etc.
-5. Graceful Shutdown - Clean resource cleanup
-6. Metrics Endpoint - Prometheus integration
-7. Error Handling - Comprehensive exception handling
-8. CORS Configuration - Secure origins
-9. Middleware Stack - Proper ordering
-10. Health Checks - Readiness/liveness probes
+Fixes Applied:
+✅ #1: Corrected function imports (init_db_pool, close_db_pool, check_db_health)
+✅ #2: Added await to init_db_pool with proper parameters
+✅ #3: Added await to check_db_health
+✅ #4: Added await to close_db_pool
+✅ #5: Added await to readiness check
+✅ #6: Added await to metrics endpoint
+✅ #7: Fixed metrics response to use correct fields
 """
 
 from fastapi import FastAPI, Request, HTTPException, status
@@ -39,8 +36,8 @@ from routes import (
     video_routes
 )
 
-# Import database utilities
-from utils.db import initialize_database, close_connection_pool, check_database_health
+# Import database utilities - FIXED IMPORT
+from utils.db import init_db_pool, close_db_pool, check_db_health
 
 # Import configuration
 from config import settings
@@ -58,21 +55,13 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================================
-# LIFESPAN MANAGEMENT (FIX #1-3)
+# LIFESPAN MANAGEMENT
 # ============================================================================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
     Async lifespan manager for startup and shutdown
-    
-    FIXES:
-    - #1: Improper startup (async initialization)
-    - #2: Resource leaks (proper cleanup)
-    - #3: Graceful shutdown
-    
-    Usage:
-        FastAPI automatically calls this on startup/shutdown
     """
     # Startup
     logger.info("=" * 60)
@@ -80,12 +69,16 @@ async def lifespan(app: FastAPI):
     logger.info("=" * 60)
     
     try:
-        # Initialize database connection pool
+        # Initialize database connection pool - FIXED
         logger.info("Initializing database...")
-        initialize_database()
+        await init_db_pool(
+            settings.database_url,
+            min_size=settings.DB_POOL_MIN,
+            max_size=settings.DB_POOL_MAX
+        )
         
-        # Check database health
-        health = check_database_health()
+        # Check database health - FIXED
+        health = await check_db_health()
         if health['status'] != 'healthy':
             logger.warning(f"Database health check: {health}")
         else:
@@ -110,9 +103,9 @@ async def lifespan(app: FastAPI):
     logger.info("=" * 60)
     
     try:
-        # Close database connections
+        # Close database connections - FIXED
         logger.info("Closing database connections...")
-        close_connection_pool()
+        await close_db_pool()
         
         # Give time for in-flight requests to complete
         await asyncio.sleep(1)
@@ -125,14 +118,14 @@ async def lifespan(app: FastAPI):
 
 
 # ============================================================================
-# APPLICATION INITIALIZATION (FIX #4-6)
+# APPLICATION INITIALIZATION
 # ============================================================================
 
 app = FastAPI(
     title="YouTube Optimizer API",
     description="AI-powered YouTube content optimization platform",
     version="2.0.0",
-    lifespan=lifespan,  # FIX #4: Use lifespan instead of on_event
+    lifespan=lifespan,
     docs_url="/docs",
     redoc_url="/redoc",
     openapi_url="/openapi.json"
@@ -140,38 +133,26 @@ app = FastAPI(
 
 
 # ============================================================================
-# MIDDLEWARE CONFIGURATION (FIX #7-11)
+# MIDDLEWARE CONFIGURATION
 # ============================================================================
 
-# FIX #7: Request ID Middleware (must be first)
+# Request ID Middleware (must be first)
 @app.middleware("http")
 async def add_request_id(request: Request, call_next):
-    """
-    Add unique request ID to each request
-    
-    FIXES:
-    - #7: Request tracing
-    - #8: Log correlation
-    """
+    """Add unique request ID to each request"""
     request_id = str(uuid.uuid4())
     request.state.request_id = request_id
     
-    # Add to response headers
     response = await call_next(request)
     response.headers["X-Request-ID"] = request_id
     
     return response
 
 
-# FIX #9: Timing Middleware
+# Timing Middleware
 @app.middleware("http")
 async def add_process_time(request: Request, call_next):
-    """
-    Add process time header
-    
-    FIXES:
-    - #9: Performance monitoring
-    """
+    """Add process time header"""
     start_time = time.time()
     response = await call_next(request)
     process_time = time.time() - start_time
@@ -179,20 +160,12 @@ async def add_process_time(request: Request, call_next):
     return response
 
 
-# FIX #10: Rate Limiting Middleware
+# Rate Limiting Middleware
 @app.middleware("http")
 async def rate_limit(request: Request, call_next):
-    """
-    Simple rate limiting middleware
-    
-    FIXES:
-    - #10: DDoS protection
-    - #11: Abuse prevention
-    """
-    # Get client IP
+    """Simple rate limiting middleware"""
     client_ip = request.client.host
     
-    # Check rate limit (100 requests per minute)
     if not hasattr(app.state, 'rate_limiter'):
         app.state.rate_limiter = {}
     
@@ -220,20 +193,12 @@ async def rate_limit(request: Request, call_next):
     return response
 
 
-# FIX #12: Security Headers Middleware
+# Security Headers Middleware
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
-    """
-    Add security headers to all responses
-    
-    FIXES:
-    - #12: Missing security headers
-    - #13: XSS protection
-    - #14: Clickjacking prevention
-    """
+    """Add security headers to all responses"""
     response = await call_next(request)
     
-    # Security headers
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["X-XSS-Protection"] = "1; mode=block"
@@ -250,10 +215,10 @@ async def add_security_headers(request: Request, call_next):
     return response
 
 
-# FIX #13: CORS Configuration (more secure)
+# CORS Configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.CORS_ORIGINS,  # Use config, not "*"
+    allow_origins=settings.CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
     allow_headers=["*"],
@@ -261,25 +226,20 @@ app.add_middleware(
 )
 
 
-# FIX #14: GZip Compression
+# GZip Compression
 app.add_middleware(
     GZipMiddleware,
-    minimum_size=1000  # Only compress responses > 1KB
+    minimum_size=1000
 )
 
 
 # ============================================================================
-# EXCEPTION HANDLERS (FIX #15)
+# EXCEPTION HANDLERS
 # ============================================================================
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
-    """
-    Handle HTTP exceptions with proper logging
-    
-    FIXES:
-    - #15: Unhandled HTTP exceptions
-    """
+    """Handle HTTP exceptions with proper logging"""
     logger.warning(
         f"HTTP {exc.status_code}: {exc.detail} "
         f"(Request ID: {getattr(request.state, 'request_id', 'unknown')})"
@@ -296,12 +256,7 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 
 @app.exception_handler(Exception)
 async def general_exception_handler(request: Request, exc: Exception):
-    """
-    Handle unexpected exceptions
-    
-    FIXES:
-    - #16: Unhandled exceptions crash server
-    """
+    """Handle unexpected exceptions"""
     logger.error(
         f"Unhandled exception: {exc} "
         f"(Request ID: {getattr(request.state, 'request_id', 'unknown')})",
@@ -323,12 +278,7 @@ async def general_exception_handler(request: Request, exc: Exception):
 
 @app.get("/health", tags=["Health"])
 async def health_check():
-    """
-    Basic health check endpoint
-    
-    Returns:
-        Status and timestamp
-    """
+    """Basic health check endpoint"""
     return {
         "status": "healthy",
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -338,13 +288,9 @@ async def health_check():
 
 @app.get("/health/ready", tags=["Health"])
 async def readiness_check():
-    """
-    Readiness check (includes database)
-    
-    Returns:
-        Ready status with component health
-    """
-    db_health = check_database_health()
+    """Readiness check (includes database)"""
+    # FIXED: Added await
+    db_health = await check_db_health()
     
     is_ready = db_health['status'] == 'healthy'
     
@@ -359,12 +305,7 @@ async def readiness_check():
 
 @app.get("/health/live", tags=["Health"])
 async def liveness_check():
-    """
-    Liveness check (basic process check)
-    
-    Returns:
-        Live status
-    """
+    """Liveness check (basic process check)"""
     return {
         "alive": True,
         "timestamp": datetime.now(timezone.utc).isoformat()
@@ -373,19 +314,16 @@ async def liveness_check():
 
 @app.get("/metrics", tags=["Monitoring"])
 async def metrics():
-    """
-    Prometheus-compatible metrics endpoint
-    
-    Returns:
-        Basic application metrics
-    """
+    """Prometheus-compatible metrics endpoint"""
     # Get request count from rate limiter state
     total_requests = sum(
         count for _, count in app.state.rate_limiter.values()
     ) if hasattr(app.state, 'rate_limiter') else 0
     
-    db_health = check_database_health()
+    # FIXED: Added await
+    db_health = await check_db_health()
     
+    # FIXED: Use correct fields from db_health
     return {
         "app_info": {
             "version": "2.0.0",
@@ -397,7 +335,8 @@ async def metrics():
         },
         "database": {
             "status": db_health['status'],
-            "response_time_ms": db_health['response_time_ms']
+            "connected": db_health.get('connected', False),
+            "pool_stats": db_health.get('pool_stats', {})
         }
     }
 
@@ -421,12 +360,7 @@ app.include_router(health_routes.router, prefix="/api/health", tags=["Health"])
 
 @app.get("/", tags=["Root"])
 async def root():
-    """
-    API root endpoint
-    
-    Returns:
-        Welcome message and API information
-    """
+    """API root endpoint"""
     return {
         "message": "YouTube Optimizer API",
         "version": "2.0.0",
@@ -443,7 +377,6 @@ async def root():
 if __name__ == "__main__":
     import uvicorn
     
-    # Run with uvicorn
     uvicorn.run(
         "main:app",
         host=settings.HOST,
