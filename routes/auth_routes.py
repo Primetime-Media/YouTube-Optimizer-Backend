@@ -1,549 +1,614 @@
-# auth_routes.py
 """
-Authentication Routes Module - FIXED VERSION
-=============================================
-✅ FIXED: Improved entropy security check (line 70)
-✅ All functionality preserved
+Authentication Service Layer - Production Ready
+================================================
+Business logic for authentication and session management
+
+Features:
+✅ OAuth2 token management
+✅ Session management with Redis
+✅ User CRUD operations
+✅ Security validations
+✅ Concurrent session limiting
+✅ IP-based security
 """
 
-from fastapi import APIRouter, Response, HTTPException, Request, Depends, BackgroundTasks, Cookie
-from fastapi.responses import RedirectResponse
-from typing import Optional
-from datetime import datetime, timedelta
-import logging
+import asyncio
 import secrets
+import logging
+import hashlib
 import json
-import base64
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import Flow
-from config import get_settings
-from utils.auth import validate_session_token
-from services.youtube import fetch_and_store_youtube_data
+from typing import Dict, List, Optional, Any
+from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass
 
+import httpx
+import aioredis
+import asyncpg
+from google.oauth2.credentials import Credentials
+from fastapi import Response
+
+from utils.db import DatabasePool, track_query, QueryType
+from config import get_settings
+
+settings = get_settings()
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/auth", tags=["Authentication"])
 
-# Get application settings
-settings = get_settings()
-client_secrets_file = settings.client_secret_file
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
 
-# Use redirect URI from settings
-REDIRECT_URI = settings.redirect_uri
+@dataclass
+class SecurityConfig:
+    """Security configuration"""
+    SESSION_TOKEN_BYTES: int = 32
+    SESSION_EXPIRY_DAYS: int = 14
+    MAX_SESSIONS_PER_USER: int = 5
+    SESSION_COOKIE_NAME: str = "yt_optimizer_session"
+    SECURE_COOKIE: bool = settings.is_production
+    HTTPONLY_COOKIE: bool = True
+    SAMESITE_POLICY: str = "none" if settings.is_production else "lax"
 
-# Session configuration
-SESSION_COOKIE_NAME = "youtube_optimizer_session"
-SESSION_EXPIRY_DAYS = 14  # Session validity period
 
-def get_db_connection():
-    """Database connection function"""
-    try:
-        from utils.db import get_connection as get_db_conn
-        return get_db_conn()
-    except ConnectionError as e:
-        raise HTTPException(status_code=503, detail=f"Database connection error: {str(e)}")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Unexpected database error: {str(e)}")
+# ============================================================================
+# MODELS
+# ============================================================================
 
-def create_session(user_id: int, response: Response, request: Request) -> str:
-    """Create a new session for a user and set the session cookie
+class UserInfo:
+    """User information model"""
+    def __init__(self, **kwargs):
+        self.id = kwargs.get('id')
+        self.google_id = kwargs.get('google_id')
+        self.email = kwargs.get('email')
+        self.name = kwargs.get('name')
+        self.permission_level = kwargs.get('permission_level')
+        self.is_free_trial = kwargs.get('is_free_trial', False)
+        self.created_at = kwargs.get('created_at')
+        self.last_login = kwargs.get('last_login')
+
+
+class SessionInfo:
+    """Session information model"""
+    def __init__(self, **kwargs):
+        self.session_id = kwargs.get('session_id')
+        self.user_id = kwargs.get('user_id')
+        self.created_at = kwargs.get('created_at')
+        self.expires_at = kwargs.get('expires_at')
+        self.ip_address = kwargs.get('ip_address')
+        self.user_agent = kwargs.get('user_agent')
+
+
+# ============================================================================
+# AUTHENTICATION SERVICE
+# ============================================================================
+
+class AuthService:
+    """Authentication service"""
     
-    Security features:
-    - Uses cryptographically secure random generation (secrets.token_urlsafe)
-    - Generates 32 bytes of entropy (256 bits) for session tokens
-    - Validates system entropy availability in production
-    - Implements proper token format validation
-    - Uses secure cookie settings in production (httponly, secure, samesite)
-    """
-    # Generate cryptographically secure session token
-    # Using token_urlsafe for URL-safe tokens with 32 bytes of entropy (256 bits)
-    session_token = secrets.token_urlsafe(32)
+    def __init__(self, pool: DatabasePool):
+        self.pool = pool
+        self.http_timeout = 30.0
     
-    # ✅ FIXED: Better entropy check for production environments
-    if settings.is_production:
+    async def exchange_code_for_tokens(
+        self,
+        code: str,
+        redirect_uri: str
+    ) -> Credentials:
+        """Exchange authorization code for access tokens"""
         try:
-            # Test that we can generate secure random data
-            test_entropy = secrets.token_bytes(32)
-            if len(test_entropy) != 32:
-                raise RuntimeError("System entropy generation failed - incorrect length")
+            # Load client config
+            with open(settings.client_secret_file, 'r') as f:
+                client_config = json.load(f)['web']
             
-            # Verify the data has sufficient randomness (basic check)
-            if test_entropy == b'\x00' * 32:
-                raise RuntimeError("System entropy generation failed - all zeros")
-                
-        except Exception as e:
-            raise RuntimeError(f"Insufficient system entropy for secure session generation: {e}")
-    
-    # Use timezone-aware expiration date
-    from datetime import timezone
-    expires_at = datetime.now(timezone.utc) + timedelta(days=SESSION_EXPIRY_DAYS)
-    
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute("""
-                UPDATE users 
-                SET session_token = %s, session_expires = %s
-                WHERE id = %s
-            """, (session_token, expires_at, user_id))
-            conn.commit()
-            
-        # For development, use simpler cookie settings that will work
-        # Set the session cookie - use max_age instead of expires to avoid timezone issues
-        if settings.debug:
-            logging.info(f"Creating session token for user {user_id}")
-        
-        # Set secure session cookie for cross-site requests in production
-        if settings.is_production:
-            response.set_cookie(
-                key=SESSION_COOKIE_NAME,
-                value=session_token,
-                max_age=SESSION_EXPIRY_DAYS * 24 * 60 * 60,
-                path="/",
-                httponly=True,
-                secure=True,
-                samesite="none"
-            )
-        else:
-            response.set_cookie(
-                key=SESSION_COOKIE_NAME,
-                value=session_token,
-                max_age=SESSION_EXPIRY_DAYS * 24 * 60 * 60,
-                path="/",
-                httponly=True,
-                secure=False,
-                samesite="lax"
-            )
-        
-        logging.info(f"Created session for user {user_id}")
-        return session_token
-    except Exception as e:
-        logging.error(f"Error creating session: {e}")
-        raise
-    finally:
-        conn.close()
-
-def get_user_from_session(session_token: str) -> Optional[dict]:
-    """Retrieve user from session token using auth.py function"""
-    from utils.auth import get_user_from_session as auth_get_user_from_session
-    
-    # Use the auth.py function which includes security validation
-    user = auth_get_user_from_session(session_token)
-    
-    if user:
-        # Convert User model to dict format for compatibility
-        return {
-            "id": user.id,
-            "google_id": user.google_id,
-            "email": user.email,
-            "name": user.name,
-            "permission_level": user.permission_level,
-            "is_free_trial": user.is_free_trial
-        }
-    
-    return None
-
-def delete_session(session_token: str, response: Response):
-    """Invalidate a session and clear the cookie"""
-    if not session_token:
-        return
-    
-    # Validate session token format before attempting deletion
-    if not validate_session_token(session_token):
-        logging.warning(f"Attempted to delete invalid session token format: {session_token[:10]}...")
-        return
-        
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute("""
-                UPDATE users 
-                SET session_token = NULL, session_expires = NULL
-                WHERE session_token = %s
-            """, (session_token,))
-            conn.commit()
-            
-        # Clear the session cookie securely
-        if settings.is_production:
-            response.delete_cookie(
-                key=SESSION_COOKIE_NAME,
-                path="/",
-                secure=True,
-                samesite="none"
-            )
-        else:
-            response.delete_cookie(
-                key=SESSION_COOKIE_NAME,
-                path="/",
-                secure=False,
-                samesite="lax"
-            )
-    except Exception as e:
-        logging.error(f"Error deleting session: {e}")
-    finally:
-        conn.close()
-
-async def get_current_user(session: Optional[str] = Cookie(None, alias=SESSION_COOKIE_NAME)) -> Optional[dict]:
-    """Get the current authenticated user from the session cookie"""
-    if not session:
-        return None
-    
-    user = get_user_from_session(session)
-    if settings.debug and user:
-        logging.info(f"Authenticated user: {user['id']}")
-        
-    return user
-
-def credentials_from_mock_response(client_id: str, client_secret: str, token_uri: str):
-    """Create mock credentials for testing when token exchange fails"""
-    return Credentials(
-        token="fake_token_for_testing",
-        refresh_token=None,
-        token_uri=token_uri,
-        client_id=client_id,
-        client_secret=client_secret,
-        scopes=["https://www.googleapis.com/auth/youtube.readonly"]
-    )
-
-@router.get("/scopes")
-async def get_required_scopes():
-    """Return the list of required OAuth scopes for the application."""
-    return {
-        "scopes": settings.youtube_api_scopes,
-        "required_for_analytics": [
-            "https://www.googleapis.com/auth/yt-analytics.readonly",
-            "https://www.googleapis.com/auth/youtube.readonly"
-        ],
-        "required_for_captions": [
-            "https://www.googleapis.com/auth/youtube.force-ssl"
-        ]
-    }
-
-@router.get("/me")
-async def get_current_user_info(request: Request, user: Optional[dict] = Depends(get_current_user)):
-    """Get the current authenticated user information from session cookie.
-    This endpoint can be used by the frontend to validate if the user is logged in.
-    """
-    if settings.debug:
-        logging.info(f"API /me called for user: {user['id'] if user else 'none'}")
-    
-    if not user:
-        logging.info("User not authenticated")
-        return {"authenticated": False}
-
-    logging.info(f"User {user['id']} is authenticated")
-    return {
-        "authenticated": True,
-        "user": {
-            "id": user["id"],
-            "email": user["email"],
-            "name": user["name"],
-            "permission_level": user["permission_level"],
-            "is_free_trial": user["is_free_trial"]
-        }
-    }
-
-@router.get("/login")
-async def login(permission_level: str = "readwrite", free_trial: bool = False):
-    # Store permission level in session or state
-    # You can add it to the state parameter in the OAuth flow
-    state_data = {
-        "permission_level": permission_level,
-        "free_trial": free_trial
-    }
-
-    # Convert state data to JSON and encode it
-    state_json = json.dumps(state_data)
-    state = base64.b64encode(state_json.encode()).decode()
-
-    # Define the essential scopes we need
-    basic_scopes = [
-        # Basic user info
-        "https://www.googleapis.com/auth/userinfo.email",
-        "https://www.googleapis.com/auth/userinfo.profile",
-        
-        # Core YouTube scopes
-        "https://www.googleapis.com/auth/youtube.readonly",
-        "https://www.googleapis.com/auth/youtube.force-ssl",
-        "https://www.googleapis.com/auth/yt-analytics.readonly"
-    ]
-    
-    logging.info(f"Starting OAuth flow with scopes: {basic_scopes}")
-
-    # Create flow with only the most essential scopes
-    flow = Flow.from_client_secrets_file(
-        client_secrets_file,
-        scopes=basic_scopes,
-        redirect_uri=REDIRECT_URI
-    )
-
-    # Force approval prompt to show the consent screen with all scopes
-    authorization_url, _ = flow.authorization_url(
-        access_type="offline",
-        include_granted_scopes="true",  # Include any previously granted scopes
-        prompt="consent",  # Always show the consent screen
-        state=state
-    )
-
-    logging.info(f"Authorization URL: {authorization_url}")
-    return RedirectResponse(authorization_url)
-
-@router.get("/callback")
-async def auth_callback(request: Request, response: Response, background_tasks: BackgroundTasks):
-    try:
-        # Get state parameter and decode it
-        state_param = request.query_params.get("state", "")
-        state_data = {}
-
-        if state_param:
-            try:
-                state_json = base64.b64decode(state_param).decode()
-                state_data = json.loads(state_json)
-            except:
-                logging.error("Failed to decode state parameter")
-
-        permission_level = state_data.get("permission_level", "readwrite")
-        free_trial = state_data.get("free_trial", False)
-        
-        logging.info(f"Auth callback with permission_level: {permission_level}, free_trial: {free_trial}")
-
-        # Use the Flow class directly since we're in a web application context
-        logging.info("Starting OAuth token exchange")
-        
-        # Extract the authorization code from the request
-        code = request.query_params.get("code")
-        if not code:
-            raise ValueError("No authorization code found in callback")
-            
-        # Get the actual scopes from the callback URL
-        callback_scope = request.query_params.get("scope", "")
-        logging.info(f"Received scopes in callback: {callback_scope}")
-        
-        # We need to do this manually without any Flow or scope validation
-        with open(client_secrets_file, 'r') as f:
-            client_config = json.load(f)['web']
-        
-        try:
-            # Basic fields needed for our manual token exchange
             client_id = client_config['client_id']
             client_secret = client_config['client_secret']
             token_uri = client_config['token_uri']
             
-            # Use async HTTP client to exchange the code for tokens
-            import httpx
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                token_response = await client.post(
+            # Exchange code for tokens
+            async with httpx.AsyncClient(timeout=self.http_timeout) as client:
+                response = await client.post(
                     token_uri,
                     data={
                         'code': code,
                         'client_id': client_id,
                         'client_secret': client_secret,
-                        'redirect_uri': REDIRECT_URI,
+                        'redirect_uri': redirect_uri,
                         'grant_type': 'authorization_code'
                     }
                 )
             
-            # Check for success
-            if token_response.status_code != 200:
-                logging.error(f"Token exchange failed with status {token_response.status_code}")
-                logging.error(f"Response: {token_response.text}")
-                
-                # Create a mock credentials object for testing session management
-                credentials = credentials_from_mock_response(client_id, client_secret, token_uri)
-                logging.warning("Using mock credentials for testing - API calls will fail")
-            else:
-                # We got a successful token response
-                token_data = token_response.json()
-                logging.info(f"Token exchange successful: {token_data.keys()}")
-                
-                # Create a proper credentials object
-                credentials = Credentials(
-                    token=token_data.get('access_token'),
-                    refresh_token=token_data.get('refresh_token'),
-                    token_uri=token_uri,
-                    client_id=client_id,
-                    client_secret=client_secret,
-                    scopes=callback_scope.split()
-                )
-                
-                logging.info(f"Created credentials with token: {credentials.token[:10] if credentials.token else 'None'}")
-                logging.info(f"Has refresh token: {bool(credentials.refresh_token)}")
-                
-        except Exception as e:
-            logging.error(f"Error in manual token exchange: {e}")
-            # Fall back to creating a fake token just to test the session management
+            if response.status_code != 200:
+                logger.error(f"Token exchange failed: {response.text}")
+                raise ValueError(f"Token exchange failed: {response.status_code}")
+            
+            token_data = response.json()
+            
+            # Create credentials object
             credentials = Credentials(
-                token="fake_token_for_testing",
-                refresh_token=None,
+                token=token_data.get('access_token'),
+                refresh_token=token_data.get('refresh_token'),
                 token_uri=token_uri,
                 client_id=client_id,
                 client_secret=client_secret,
-                scopes=callback_scope.split()
+                scopes=token_data.get('scope', '').split()
             )
-            logging.warning("Using mock credentials due to error - API calls will fail")
-        
-        # Store credentials as a dictionary for the background task
-        credentials_dict = {
-            'token': credentials.token,
-            'refresh_token': credentials.refresh_token,
-            'token_uri': credentials.token_uri,
-            'client_id': credentials.client_id,
-            'client_secret': credentials.client_secret,
-            'scopes': credentials.scopes
-        }
-
-        # Fetch user info asynchronously
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            userinfo_response = await client.get(
-                "https://www.googleapis.com/oauth2/v1/userinfo",
-                headers={"Authorization": f"Bearer {credentials.token}"}
-            )
-            userinfo = userinfo_response.json()
-
-        logging.info(f"User authenticated: {userinfo.get('email')}")
-
-        # Save user info and credentials to database
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        # Convert scopes to PostgreSQL array format
-        if hasattr(credentials, 'scopes') and credentials.scopes:
-            # Make sure scopes is a list
-            if isinstance(credentials.scopes, str):
-                scopes_list = credentials.scopes.split()
-            else:
-                scopes_list = list(credentials.scopes)
-            scopes_array = "{" + ",".join(scopes_list) + "}"
-        else:
-            # Extract scopes from the callback URL if credentials doesn't have them
-            callback_scopes = request.query_params.get("scope", "").replace("+", " ").split()
-            scopes_array = "{" + ",".join(callback_scopes) + "}" if callback_scopes else "{}"
-        
-        # Format token expiry to a timestamp
-        token_expiry = credentials.expiry.isoformat() if hasattr(credentials, 'expiry') and credentials.expiry else None
-        
-        cursor.execute("""
-            INSERT INTO users (
-                google_id, email, name, permission_level, is_free_trial,
-                token, refresh_token, token_uri, client_id, client_secret, scopes, token_expiry
-            )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (google_id) DO UPDATE SET
-                email = EXCLUDED.email,
-                name = EXCLUDED.name,
-                permission_level = EXCLUDED.permission_level,
-                is_free_trial = EXCLUDED.is_free_trial,
-                token = EXCLUDED.token,
-                refresh_token = EXCLUDED.refresh_token,
-                token_uri = EXCLUDED.token_uri,
-                client_id = EXCLUDED.client_id,
-                client_secret = EXCLUDED.client_secret,
-                scopes = EXCLUDED.scopes,
-                token_expiry = EXCLUDED.token_expiry,
-                updated_at = NOW()
-            RETURNING id
-        """, (
-            userinfo["id"], 
-            userinfo["email"], 
-            userinfo["name"], 
-            permission_level, 
-            free_trial,
-            credentials.token,
-            credentials.refresh_token,
-            credentials.token_uri,
-            credentials.client_id,
-            credentials.client_secret,
-            scopes_array,
-            token_expiry
-        ))
-        user_id = cursor.fetchone()[0]
-        conn.commit()
-        cursor.close()
-        conn.close()
-        
-        # Log that credentials were stored
-        logging.info(f"User {user_id} credentials stored in database (token expiry: {token_expiry})")
-        
-        # Create a session and set the session cookie
-        try:
-            session_token = create_session(user_id, response, request)
-            logging.info(f"Created session for user {user_id} with token {session_token[:10]}...")
             
-            # Log cookie for debugging
-            logging.info(f"Session cookie set with name: {SESSION_COOKIE_NAME}")
-            logging.info(f"Response cookies: {response.headers.get('set-cookie', 'None')}")
+            return credentials
+            
         except Exception as e:
-            logging.error(f"Error creating session: {e}")
-            logging.exception("Session creation exception")
-        
-        # Add background task to fetch YouTube data - no need to pass credentials
-        # since they are now stored in the database and can be retrieved by user_id
-        background_tasks.add_task(
-            fetch_and_store_youtube_data,
-            user_id=user_id,
-            max_videos=1000  # Limit to 10000 most recent videos to save quota
-        )
+            logger.error(f"Error exchanging code: {e}")
+            raise
+    
+    async def get_user_info(self, credentials: Credentials) -> Dict[str, Any]:
+        """Get user info from Google"""
+        try:
+            async with httpx.AsyncClient(timeout=self.http_timeout) as client:
+                response = await client.get(
+                    "https://www.googleapis.com/oauth2/v1/userinfo",
+                    headers={"Authorization": f"Bearer {credentials.token}"}
+                )
+            
+            if response.status_code != 200:
+                raise ValueError(f"Failed to get user info: {response.status_code}")
+            
+            return response.json()
+            
+        except Exception as e:
+            logger.error(f"Error getting user info: {e}")
+            raise
+    
+    @track_query(QueryType.INSERT, 'create_user')
+    async def create_or_update_user(
+        self,
+        google_id: str,
+        email: str,
+        name: str,
+        credentials: Credentials,
+        permission_level: str,
+        free_trial: bool
+    ) -> UserInfo:
+        """Create or update user"""
+        try:
+            # Prepare scopes
+            scopes = credentials.scopes if hasattr(credentials, 'scopes') else []
+            scopes_array = "{" + ",".join(scopes) + "}" if scopes else "{}"
+            
+            # Prepare token expiry
+            token_expiry = (
+                credentials.expiry.isoformat()
+                if hasattr(credentials, 'expiry') and credentials.expiry
+                else None
+            )
+            
+            async with self.pool.transaction() as conn:
+                row = await conn.fetchrow("""
+                    INSERT INTO users (
+                        google_id,
+                        email,
+                        name,
+                        permission_level,
+                        is_free_trial,
+                        token,
+                        refresh_token,
+                        token_uri,
+                        client_id,
+                        client_secret,
+                        scopes,
+                        token_expiry,
+                        last_login,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW(), NOW(), NOW())
+                    ON CONFLICT (google_id) DO UPDATE SET
+                        email = EXCLUDED.email,
+                        name = EXCLUDED.name,
+                        permission_level = EXCLUDED.permission_level,
+                        is_free_trial = EXCLUDED.is_free_trial,
+                        token = EXCLUDED.token,
+                        refresh_token = EXCLUDED.refresh_token,
+                        token_uri = EXCLUDED.token_uri,
+                        client_id = EXCLUDED.client_id,
+                        client_secret = EXCLUDED.client_secret,
+                        scopes = EXCLUDED.scopes,
+                        token_expiry = EXCLUDED.token_expiry,
+                        last_login = NOW(),
+                        updated_at = NOW()
+                    RETURNING id, google_id, email, name, permission_level, 
+                              is_free_trial, created_at, last_login
+                """,
+                    google_id,
+                    email,
+                    name,
+                    permission_level,
+                    free_trial,
+                    credentials.token,
+                    credentials.refresh_token,
+                    credentials.token_uri,
+                    credentials.client_id,
+                    credentials.client_secret,
+                    scopes_array,
+                    token_expiry
+                )
+            
+            return UserInfo(**dict(row))
+            
+        except Exception as e:
+            logger.error(f"Error creating/updating user: {e}")
+            raise
+    
+    async def health_check(self) -> bool:
+        """Check service health"""
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.fetchval('SELECT 1')
+            return True
+        except Exception as e:
+            logger.error(f"Auth service health check failed: {e}")
+            return False
 
-        # Encode user info as JSON to pass to frontend
-        user_data = {
-            "id": user_id,
-            "email": userinfo.get("email"),
-            "name": userinfo.get("name"),
-            "is_free_trial": free_trial
-        }
-        encoded_user_data = base64.b64encode(json.dumps(user_data).encode()).decode()
 
-        # Redirect to frontend dashboard with user data encoded in URL
-        # The frontend will store this in local storage, but the session cookie
-        # is the source of truth for authentication
-        frontend_dashboard_url = f"{settings.frontend_url}/dashboard"
+# ============================================================================
+# SESSION SERVICE
+# ============================================================================
+
+class SessionService:
+    """Session management service"""
+    
+    def __init__(
+        self,
+        pool: DatabasePool,
+        redis_client: Optional[aioredis.Redis] = None
+    ):
+        self.pool = pool
+        self.redis = redis_client
+        self.config = SecurityConfig()
+    
+    @track_query(QueryType.INSERT, 'create_session')
+    async def create_session(
+        self,
+        user_id: int,
+        ip_address: str,
+        user_agent: str
+    ) -> str:
+        """
+        Create new session with security features
         
-        # Log the redirect URL and cookie information
-        logging.info(f"Redirecting to: {frontend_dashboard_url}?user_data={encoded_user_data[:10]}...")
-        logging.info(f"Response headers: {dict(response.headers)}")
-        
-        # Set cache control headers to ensure nothing gets cached
-        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
-        response.headers["Pragma"] = "no-cache"
-        response.headers["Expires"] = "0"
-        
-        # Create redirect response with status code 307 to ensure cookies are preserved
-        # Add use_session=true to indicate we want to use session auth
-        redirect_url = f"{frontend_dashboard_url}?user_data={encoded_user_data}&use_session=true"
-        redirect_response = RedirectResponse(url=redirect_url, status_code=307)
-        
-        # Copy cookies from original response to redirect response
-        for header_name, header_value in response.headers.items():
-            if header_name.lower() == "set-cookie":
-                redirect_response.headers.append(header_name, header_value)
+        Security:
+        - Limits concurrent sessions per user
+        - Tracks IP and user agent
+        - Cryptographically secure tokens
+        """
+        try:
+            # Generate secure session token
+            session_token = secrets.token_urlsafe(
+                self.config.SESSION_TOKEN_BYTES
+            )
+            
+            # Calculate expiry
+            expires_at = datetime.now(timezone.utc) + timedelta(
+                days=self.config.SESSION_EXPIRY_DAYS
+            )
+            
+            # Create session ID
+            session_id = hashlib.sha256(session_token.encode()).hexdigest()
+            
+            async with self.pool.transaction() as conn:
+                # Check existing session count
+                session_count = await conn.fetchval("""
+                    SELECT COUNT(*)
+                    FROM user_sessions
+                    WHERE user_id = $1
+                      AND expires_at > NOW()
+                      AND is_valid = TRUE
+                """, user_id)
                 
-        logging.info(f"Final redirect response headers: {dict(redirect_response.headers)}")
+                # Remove oldest session if at limit
+                if session_count >= self.config.MAX_SESSIONS_PER_USER:
+                    await conn.execute("""
+                        UPDATE user_sessions
+                        SET is_valid = FALSE,
+                            invalidated_at = NOW(),
+                            invalidation_reason = 'max_sessions_exceeded'
+                        WHERE id = (
+                            SELECT id
+                            FROM user_sessions
+                            WHERE user_id = $1
+                              AND is_valid = TRUE
+                            ORDER BY created_at ASC
+                            LIMIT 1
+                        )
+                    """, user_id)
+                
+                # Create new session
+                await conn.execute("""
+                    INSERT INTO user_sessions (
+                        session_id,
+                        session_token,
+                        user_id,
+                        ip_address,
+                        user_agent,
+                        created_at,
+                        expires_at,
+                        is_valid
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE)
+                """,
+                    session_id,
+                    session_token,
+                    user_id,
+                    ip_address,
+                    user_agent,
+                    datetime.now(timezone.utc),
+                    expires_at
+                )
+            
+            # Cache in Redis if available
+            if self.redis:
+                await self._cache_session(session_token, user_id, expires_at)
+            
+            logger.info(f"Created session for user {user_id}")
+            return session_token
+            
+        except Exception as e:
+            logger.error(f"Error creating session: {e}")
+            raise
+    
+    async def validate_session(
+        self,
+        token: str,
+        ip_address: str,
+        user_agent: str
+    ) -> Optional[SessionInfo]:
+        """
+        Validate session with security checks
         
-        return redirect_response
-    except Exception as e:
-        logging.error(f"Authentication error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Authentication error: {str(e)}")
-
-@router.post("/logout")
-async def logout(response: Response, session: Optional[str] = Cookie(None, alias=SESSION_COOKIE_NAME)):
-    try:
-        # Clear session in database and remove cookie
-        if session:
-            delete_session(session, response)
-            logging.info("User session deleted successfully")
+        Security:
+        - Token validation
+        - Expiry check
+        - IP address verification (warning only)
+        - User agent verification (warning only)
+        """
+        try:
+            # Check Redis cache first
+            if self.redis:
+                cached = await self._get_cached_session(token)
+                if cached:
+                    return SessionInfo(**cached)
+            
+            session_id = hashlib.sha256(token.encode()).hexdigest()
+            
+            async with self.pool.acquire() as conn:
+                row = await conn.fetchrow("""
+                    SELECT 
+                        session_id,
+                        user_id,
+                        ip_address,
+                        user_agent,
+                        created_at,
+                        expires_at
+                    FROM user_sessions
+                    WHERE session_id = $1
+                      AND expires_at > NOW()
+                      AND is_valid = TRUE
+                """, session_id)
+                
+                if not row:
+                    return None
+                
+                session = SessionInfo(**dict(row))
+                
+                # Security checks (warning only, don't block)
+                if session.ip_address != ip_address:
+                    logger.warning(
+                        f"IP mismatch for session {session_id}: "
+                        f"{session.ip_address} vs {ip_address}"
+                    )
+                
+                if session.user_agent != user_agent:
+                    logger.warning(
+                        f"User agent mismatch for session {session_id}"
+                    )
+                
+                return session
+                
+        except Exception as e:
+            logger.error(f"Error validating session: {e}")
+            return None
+    
+    async def get_user_from_session(
+        self,
+        token: str
+    ) -> Optional[UserInfo]:
+        """Get user from session token"""
+        try:
+            session_id = hashlib.sha256(token.encode()).hexdigest()
+            
+            async with self.pool.acquire() as conn:
+                row = await conn.fetchrow("""
+                    SELECT 
+                        u.id,
+                        u.google_id,
+                        u.email,
+                        u.name,
+                        u.permission_level,
+                        u.is_free_trial,
+                        u.created_at,
+                        u.last_login
+                    FROM users u
+                    INNER JOIN user_sessions s ON u.id = s.user_id
+                    WHERE s.session_id = $1
+                      AND s.expires_at > NOW()
+                      AND s.is_valid = TRUE
+                """, session_id)
+                
+                if not row:
+                    return None
+                
+                return UserInfo(**dict(row))
+                
+        except Exception as e:
+            logger.error(f"Error getting user from session: {e}")
+            return None
+    
+    async def invalidate_session(
+        self,
+        token: str,
+        reason: str
+    ) -> bool:
+        """Invalidate a session"""
+        try:
+            session_id = hashlib.sha256(token.encode()).hexdigest()
+            
+            async with self.pool.acquire() as conn:
+                await conn.execute("""
+                    UPDATE user_sessions
+                    SET is_valid = FALSE,
+                        invalidated_at = NOW(),
+                        invalidation_reason = $2
+                    WHERE session_id = $1
+                """, session_id, reason)
+            
+            # Remove from Redis
+            if self.redis:
+                await self.redis.delete(f"session:{session_id}")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error invalidating session: {e}")
+            return False
+    
+    async def set_session_cookie(
+        self,
+        response: Response,
+        session_token: str
+    ) -> None:
+        """Set session cookie"""
+        response.set_cookie(
+            key=self.config.SESSION_COOKIE_NAME,
+            value=session_token,
+            max_age=self.config.SESSION_EXPIRY_DAYS * 24 * 60 * 60,
+            path="/",
+            httponly=self.config.HTTPONLY_COOKIE,
+            secure=self.config.SECURE_COOKIE,
+            samesite=self.config.SAMESITE_POLICY
+        )
+    
+    async def clear_session_cookie(self, response: Response) -> None:
+        """Clear session cookie"""
+        response.delete_cookie(
+            key=self.config.SESSION_COOKIE_NAME,
+            path="/",
+            secure=self.config.SECURE_COOKIE,
+            samesite=self.config.SAMESITE_POLICY
+        )
+    
+    async def get_user_sessions(self, user_id: int) -> List[Dict[str, Any]]:
+        """Get all active sessions for a user"""
+        try:
+            async with self.pool.acquire() as conn:
+                rows = await conn.fetch("""
+                    SELECT 
+                        session_id,
+                        ip_address,
+                        user_agent,
+                        created_at,
+                        expires_at
+                    FROM user_sessions
+                    WHERE user_id = $1
+                      AND expires_at > NOW()
+                      AND is_valid = TRUE
+                    ORDER BY created_at DESC
+                """, user_id)
+                
+                return [dict(row) for row in rows]
+                
+        except Exception as e:
+            logger.error(f"Error getting user sessions: {e}")
+            return []
+    
+    async def revoke_user_session(
+        self,
+        user_id: int,
+        session_id: str
+    ) -> bool:
+        """Revoke a specific user session"""
+        try:
+            async with self.pool.acquire() as conn:
+                result = await conn.execute("""
+                    UPDATE user_sessions
+                    SET is_valid = FALSE,
+                        invalidated_at = NOW(),
+                        invalidation_reason = 'user_revoked'
+                    WHERE session_id = $1
+                      AND user_id = $2
+                """, session_id, user_id)
+                
+                return result != "UPDATE 0"
+                
+        except Exception as e:
+            logger.error(f"Error revoking session: {e}")
+            return False
+    
+    async def count_active_sessions(self) -> int:
+        """Count all active sessions"""
+        try:
+            async with self.pool.acquire() as conn:
+                count = await conn.fetchval("""
+                    SELECT COUNT(*)
+                    FROM user_sessions
+                    WHERE expires_at > NOW()
+                      AND is_valid = TRUE
+                """)
+                return count or 0
+        except Exception as e:
+            logger.error(f"Error counting sessions: {e}")
+            return 0
+    
+    async def _cache_session(
+        self,
+        token: str,
+        user_id: int,
+        expires_at: datetime
+    ) -> None:
+        """Cache session in Redis"""
+        if not self.redis:
+            return
         
-        return {
-            "message": "Logged out successfully",
-            "external_home_url": settings.external_home_url
-        }
-    except Exception as e:
-        logging.error(f"Error during logout: {e}")
-        return {
-            "message": "Logout completed, but with errors",
-            "external_home_url": settings.external_home_url
-        }
-
-@router.get("/config/external-home-url")
-async def get_external_home_url():
-    """Get the external home page URL for logout redirects."""
-    return {"external_home_url": settings.external_home_url}
+        try:
+            session_id = hashlib.sha256(token.encode()).hexdigest()
+            ttl = int((expires_at - datetime.now(timezone.utc)).total_seconds())
+            
+            await self.redis.setex(
+                f"session:{session_id}",
+                ttl,
+                json.dumps({'user_id': user_id})
+            )
+        except Exception as e:
+            logger.warning(f"Error caching session: {e}")
+    
+    async def _get_cached_session(self, token: str) -> Optional[Dict]:
+        """Get session from Redis cache"""
+        if not self.redis:
+            return None
+        
+        try:
+            session_id = hashlib.sha256(token.encode()).hexdigest()
+            cached = await self.redis.get(f"session:{session_id}")
+            
+            if cached:
+                return json.loads(cached)
+        except Exception as e:
+            logger.warning(f"Error getting cached session: {e}")
+        
+        return None
+    
+    async def health_check(self) -> bool:
+        """Check service health"""
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.fetchval('SELECT 1')
+            return True
+        except Exception as e:
+            logger.error(f"Session service health check failed: {e}")
+            return False
