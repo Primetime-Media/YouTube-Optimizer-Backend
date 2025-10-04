@@ -1,422 +1,473 @@
+# utils/auth.py
 """
-Authentication Utilities - COMPLETE REWRITE
-===========================================
-ALL 8 CRITICAL ERRORS FIXED
+Authentication and authorization utilities.
 
-Major Changes:
-✅ #1: Removed get_connection() - now uses get_pool() from asyncpg
-✅ #2: Fixed dual Request import conflict
-✅ #3: Removed non-existent client_secret_file reference
-✅ #4-8: All functions converted to async with asyncpg
-✅ All database operations now use asyncpg API
-✅ All functions properly use async/await patterns
-✅ Proper connection pool usage throughout
+Provides JWT-based authentication, permission checking, and user management.
 """
 
+from typing import Optional, List, Dict, Any
+from datetime import datetime, timedelta
+from functools import wraps
+
+from fastapi import Depends, HTTPException, status, Request
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from jose import JWTError, jwt
+from passlib.context import CryptContext
 import logging
-from google.oauth2.credentials import Credentials
-from google.oauth2 import service_account
-from google.auth.transport.requests import Request as GoogleRequest  # ✅ FIXED: Renamed import
-from utils.db import get_pool  # ✅ FIXED: Use get_pool instead of get_connection
-from typing import Dict, Optional
-import datetime
-from fastapi import Cookie
-from pydantic import BaseModel
-from config import get_settings
-import re
 
-# Models for user data
-class User(BaseModel):
-    id: int
-    google_id: str
-    email: str
-    name: Optional[str] = None
-    permission_level: Optional[str] = "readwrite"
-    is_free_trial: Optional[bool] = False
+from utils.db import get_connection
+from utils.exceptions import UnauthorizedError
 
 logger = logging.getLogger(__name__)
 
+# Configuration (should come from environment variables)
+SECRET_KEY = "your-secret-key-change-in-production"  # Use env var
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+REFRESH_TOKEN_EXPIRE_DAYS = 7
 
-# ============================================================================
-# APP CREDENTIALS
-# ============================================================================
+# Password hashing
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-async def get_app_credentials() -> Optional[Credentials]:  # ✅ FIXED: Now async
-    """
-    Retrieve app-level credentials from environment variables.
+# HTTP Bearer token security
+security = HTTPBearer()
+
+
+class TokenData:
+    """Data extracted from JWT token."""
     
+    def __init__(self, user_id: int, email: str, permissions: List[str]):
+        self.user_id = user_id
+        self.email = email
+        self.permissions = permissions
+
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """
+    Verify a password against its hash.
+    
+    Args:
+        plain_password: Plain text password
+        hashed_password: Bcrypt hashed password
+        
     Returns:
-        Credentials object or None if not found
+        bool: True if password matches
+    """
+    return pwd_context.verify(plain_password, hashed_password)
+
+
+def get_password_hash(password: str) -> str:
+    """
+    Hash a password using bcrypt.
+    
+    Args:
+        password: Plain text password
+        
+    Returns:
+        str: Hashed password
+    """
+    return pwd_context.hash(password)
+
+
+def create_access_token(
+    data: Dict[str, Any],
+    expires_delta: Optional[timedelta] = None
+) -> str:
+    """
+    Create a JWT access token.
+    
+    Args:
+        data: Data to encode in the token
+        expires_delta: Optional custom expiration time
+        
+    Returns:
+        str: Encoded JWT token
+    """
+    to_encode = data.copy()
+    
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    
+    to_encode.update({
+        "exp": expire,
+        "iat": datetime.utcnow(),
+        "type": "access"
+    })
+    
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+
+def create_refresh_token(data: Dict[str, Any]) -> str:
+    """
+    Create a JWT refresh token.
+    
+    Args:
+        data: Data to encode in the token
+        
+    Returns:
+        str: Encoded JWT refresh token
+    """
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+    
+    to_encode.update({
+        "exp": expire,
+        "iat": datetime.utcnow(),
+        "type": "refresh"
+    })
+    
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+
+def decode_token(token: str) -> Dict[str, Any]:
+    """
+    Decode and validate a JWT token.
+    
+    Args:
+        token: JWT token string
+        
+    Returns:
+        dict: Decoded token payload
+        
+    Raises:
+        JWTError: If token is invalid or expired
     """
     try:
-        settings = get_settings()
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        return payload
+    except JWTError as e:
+        logger.warning(f"Invalid token: {e}")
+        raise
+
+
+async def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security)
+) -> Dict[str, Any]:
+    """
+    Get the current authenticated user from JWT token.
+    
+    Dependency for FastAPI endpoints requiring authentication.
+    
+    Args:
+        credentials: HTTP bearer credentials
         
-        # ✅ FIXED: Use existing config field instead of non-existent one
-        service_account_file = settings.GOOGLE_VISION_CREDENTIALS
+    Returns:
+        dict: User information
         
-        if not service_account_file:
-            logger.warning("No service account file configured")
-            return None
-            
-        return service_account.Credentials.from_service_account_file(service_account_file)
-            
+    Raises:
+        HTTPException 401: If authentication fails
+    """
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    
+    try:
+        token = credentials.credentials
+        payload = decode_token(token)
+        
+        # Validate token type
+        if payload.get("type") != "access":
+            raise credentials_exception
+        
+        user_id: int = payload.get("sub")
+        email: str = payload.get("email")
+        
+        if user_id is None or email is None:
+            raise credentials_exception
+        
+        # Fetch user from database
+        user = get_user_by_id(user_id)
+        if user is None:
+            raise credentials_exception
+        
+        # Check if user is active
+        if not user.get("is_active", False):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Inactive user account"
+            )
+        
+        return user
+        
+    except JWTError:
+        raise credentials_exception
     except Exception as e:
-        logger.error(f"Error retrieving app credentials: {e}")
+        logger.error(f"Error in authentication: {e}")
+        raise credentials_exception
+
+
+async def get_optional_user(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
+) -> Optional[Dict[str, Any]]:
+    """
+    Get the current user if authenticated, None otherwise.
+    
+    Useful for endpoints that work both with and without authentication.
+    
+    Args:
+        request: FastAPI request
+        credentials: HTTP bearer credentials (optional)
+        
+    Returns:
+        Optional[dict]: User information or None
+    """
+    if not credentials:
+        return None
+    
+    try:
+        return await get_current_user(credentials)
+    except HTTPException:
         return None
 
 
-# ============================================================================
-# USER CREDENTIALS
-# ============================================================================
-
-async def get_user_credentials(user_id: int, auto_refresh: bool = True) -> Optional[Credentials]:
+def get_user_by_id(user_id: int) -> Optional[Dict[str, Any]]:
     """
-    Retrieve user credentials from the database and convert to a Google OAuth2 Credentials object.
-    Optionally refreshes the token if it's expired or about to expire.
+    Fetch user from database by ID.
     
     Args:
-        user_id: Database user ID
-        auto_refresh: Whether to automatically refresh the token if needed
+        user_id: User's database ID
         
     Returns:
-        Credentials object or None if not found
+        Optional[dict]: User data or None if not found
     """
+    conn = None
     try:
-        # ✅ FIXED: Use asyncpg connection pool
-        async with get_pool().acquire() as conn:
-            # ✅ FIXED: Use asyncpg API
-            row = await conn.fetchrow("""
-                SELECT token, refresh_token, token_uri, client_id, client_secret, scopes, token_expiry
+        conn = get_connection()
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT 
+                    id,
+                    email,
+                    is_active,
+                    created_at,
+                    last_login
                 FROM users
-                WHERE id = $1
-            """, user_id)
-            
-            if not row:
-                logger.warning(f"No credentials found for user {user_id}")
-                return None
-            
-            # ✅ FIXED: asyncpg returns dict-like records
-            token = row['token']
-            refresh_token = row['refresh_token']
-            token_uri = row['token_uri']
-            client_id = row['client_id']
-            client_secret = row['client_secret']
-            scopes = row['scopes']
-            token_expiry = row['token_expiry']
-            
-            # Convert scopes to a Python list (asyncpg handles arrays natively)
-            if scopes:
-                if isinstance(scopes, list):
-                    scopes_list = scopes
-                elif isinstance(scopes, str):
-                    scopes_list = scopes.replace("{", "").replace("}", "").split(",")
-                else:
-                    logger.warning(f"Unknown scope format for user {user_id}: {type(scopes)}")
-                    scopes_list = []
-            else:
-                scopes_list = []
-            
-            # Parse token expiry if available
-            expiry = None
-            if token_expiry:
-                if isinstance(token_expiry, str):
-                    expiry = datetime.datetime.fromisoformat(token_expiry)
-                else:
-                    expiry = token_expiry
-            
-            # Create credentials object
-            credentials = Credentials(
-                token=token,
-                refresh_token=refresh_token,
-                token_uri=token_uri,
-                client_id=client_id,
-                client_secret=client_secret,
-                scopes=scopes_list,
-                expiry=expiry
+                WHERE id = %s
+                """,
+                (user_id,)
             )
             
-            # Check if token is expired or about to expire (within 5 minutes)
-            if auto_refresh and credentials.refresh_token:
-                should_refresh = False
-                
-                if credentials.expired:
-                    logger.info(f"Token for user {user_id} is expired, refreshing")
-                    should_refresh = True
-                elif expiry:
-                    now = datetime.datetime.now(expiry.tzinfo) if expiry.tzinfo else datetime.datetime.now()
-                    time_until_expiry = expiry - now
-                    if time_until_expiry.total_seconds() < 300:
-                        logger.info(f"Token for user {user_id} expires in {time_until_expiry.total_seconds()}s, refreshing")
-                        should_refresh = True
-                
-                if should_refresh:
-                    try:
-                        # ✅ FIXED: Use GoogleRequest (renamed import)
-                        request = GoogleRequest()
-                        credentials.refresh(request)
-                        
-                        # Update the refreshed credentials in the database
-                        await update_user_credentials(user_id, credentials)
-                        logger.info(f"Successfully refreshed token for user {user_id}")
-                    except Exception as e:
-                        logger.error(f"Error refreshing token for user {user_id}: {e}")
-            
-            return credentials
-            
-    except Exception as e:
-        logger.error(f"Error retrieving user credentials: {e}")
-        return None
-
-
-async def update_user_credentials(user_id: int, credentials: Credentials) -> bool:
-    """
-    Update stored credentials after token refresh.
-    
-    Args:
-        user_id: Database user ID
-        credentials: Updated credentials object
-        
-    Returns:
-        bool: True if update was successful
-    """
-    try:
-        # ✅ FIXED: asyncpg handles arrays natively
-        scopes_list = credentials.scopes if credentials.scopes else []
-        
-        # Format token expiry to a timestamp
-        token_expiry = credentials.expiry.isoformat() if hasattr(credentials, 'expiry') and credentials.expiry else None
-        
-        # ✅ FIXED: Use asyncpg connection pool and transaction
-        async with get_pool().acquire() as conn:
-            async with conn.transaction():  # ✅ FIXED: asyncpg transaction API
-                result = await conn.execute("""
-                    UPDATE users SET
-                        token = $1,
-                        refresh_token = $2,
-                        token_uri = $3,
-                        client_id = $4,
-                        client_secret = $5,
-                        scopes = $6,
-                        token_expiry = $7,
-                        updated_at = NOW()
-                    WHERE id = $8
-                """, 
-                    credentials.token,
-                    credentials.refresh_token,
-                    credentials.token_uri,
-                    credentials.client_id,
-                    credentials.client_secret,
-                    scopes_list,  # ✅ FIXED: asyncpg handles list natively
-                    token_expiry,
-                    user_id
-                )
-                
-                # ✅ FIXED: Check result format for asyncpg
-                if result == "UPDATE 1":
-                    logger.info(f"Updated credentials for user {user_id}")
-                    return True
-                else:
-                    logger.warning(f"No user found with ID {user_id}, credentials not updated")
-                    return False
-                
-    except Exception as e:
-        logger.error(f"Error updating credentials for user {user_id}: {e}")
-        return False
-
-
-async def get_credentials_dict(user_id: int) -> Optional[Dict]:
-    """
-    Retrieve user credentials from the database as a dictionary format
-    
-    Args:
-        user_id: Database user ID
-        
-    Returns:
-        dict: Credentials as a dictionary or None if not found
-    """
-    try:
-        logger.info(f"Getting credentials data for user {user_id}")
-        
-        # ✅ FIXED: Use asyncpg connection pool
-        async with get_pool().acquire() as conn:
-            row = await conn.fetchrow("""
-                SELECT token, refresh_token, token_uri, client_id, client_secret, scopes, token_expiry
-                FROM users
-                WHERE id = $1
-            """, user_id)
-            
+            row = cursor.fetchone()
             if not row:
-                logger.warning(f"No credentials found for user {user_id}")
                 return None
             
-            # ✅ FIXED: asyncpg returns dict-like records
-            scopes = row['scopes']
-            token_expiry = row['token_expiry']
+            return {
+                "id": row[0],
+                "email": row[1],
+                "is_active": row[2],
+                "created_at": row[3],
+                "last_login": row[4]
+            }
+    except Exception as e:
+        logger.error(f"Error fetching user {user_id}: {e}")
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+
+def get_user_permissions(user_id: int) -> List[str]:
+    """
+    Get list of permissions for a user.
+    
+    Args:
+        user_id: User's database ID
+        
+    Returns:
+        List[str]: List of permission names
+    """
+    conn = None
+    try:
+        conn = get_connection()
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT DISTINCT p.name
+                FROM permissions p
+                JOIN role_permissions rp ON rp.permission_id = p.id
+                JOIN user_roles ur ON ur.role_id = rp.role_id
+                WHERE ur.user_id = %s
+                """,
+                (user_id,)
+            )
             
-            # Convert scopes to a Python list
-            if scopes:
-                if isinstance(scopes, list):
-                    scopes_list = scopes
-                elif isinstance(scopes, str):
-                    scopes_list = scopes.replace("{", "").replace("}", "").split(",")
-                else:
-                    logger.warning(f"Unknown scope format for user {user_id}: {type(scopes)}")
-                    scopes_list = []
-            else:
-                scopes_list = []
+            return [row[0] for row in cursor.fetchall()]
+    except Exception as e:
+        logger.error(f"Error fetching permissions for user {user_id}: {e}")
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+
+def has_permission(user: Dict[str, Any], permission: str) -> bool:
+    """
+    Check if user has a specific permission.
+    
+    Args:
+        user: User object
+        permission: Permission name to check
+        
+    Returns:
+        bool: True if user has the permission
+    """
+    user_permissions = get_user_permissions(user["id"])
+    return permission in user_permissions or "admin" in user_permissions
+
+
+def require_permissions(*permissions: str):
+    """
+    Decorator to require specific permissions for an endpoint.
+    
+    Args:
+        *permissions: Permission names required
+        
+    Example:
+        @router.post("/admin/users")
+        @require_permissions("user:create", "admin")
+        async def create_user():
+            ...
+    """
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            # Extract current_user from kwargs (injected by Depends)
+            current_user = kwargs.get("current_user")
             
-            # Convert token_expiry to string if needed
-            expiry_str = None
-            if token_expiry:
-                if isinstance(token_expiry, datetime.datetime):
-                    expiry_str = token_expiry.isoformat()
-                else:
-                    expiry_str = str(token_expiry)
+            if not current_user:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Authentication required"
+                )
+            
+            # Check if user has any of the required permissions
+            user_has_permission = any(
+                has_permission(current_user, perm)
+                for perm in permissions
+            )
+            
+            if not user_has_permission:
+                logger.warning(
+                    f"Permission denied for user {current_user['id']}",
+                    extra={
+                        "user_id": current_user["id"],
+                        "required_permissions": permissions,
+                        "endpoint": func.__name__
+                    }
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"Missing required permission. Required: {', '.join(permissions)}"
+                )
+            
+            return await func(*args, **kwargs)
+        
+        return wrapper
+    return decorator
+
+
+def authenticate_user(email: str, password: str) -> Optional[Dict[str, Any]]:
+    """
+    Authenticate a user with email and password.
+    
+    Args:
+        email: User's email
+        password: Plain text password
+        
+    Returns:
+        Optional[dict]: User data if authentication succeeds, None otherwise
+    """
+    conn = None
+    try:
+        conn = get_connection()
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT 
+                    id,
+                    email,
+                    password_hash,
+                    is_active
+                FROM users
+                WHERE email = %s
+                """,
+                (email,)
+            )
+            
+            row = cursor.fetchone()
+            if not row:
+                logger.warning(f"Authentication failed: user not found - {email}")
+                return None
+            
+            user_id, email, password_hash, is_active = row
+            
+            if not is_active:
+                logger.warning(f"Authentication failed: inactive user - {email}")
+                return None
+            
+            if not verify_password(password, password_hash):
+                logger.warning(f"Authentication failed: invalid password - {email}")
+                return None
+            
+            # Update last login
+            cursor.execute(
+                """
+                UPDATE users
+                SET last_login = NOW()
+                WHERE id = %s
+                """,
+                (user_id,)
+            )
+            conn.commit()
+            
+            logger.info(f"User authenticated successfully: {email}")
             
             return {
-                "token": row['token'],
-                "refresh_token": row['refresh_token'],
-                "token_uri": row['token_uri'],
-                "client_id": row['client_id'],
-                "client_secret": row['client_secret'],
-                "scopes": scopes_list,
-                "token_expiry": expiry_str
+                "id": user_id,
+                "email": email,
+                "is_active": is_active
             }
             
     except Exception as e:
-        logger.error(f"Error retrieving user credentials dict: {e}")
+        logger.error(f"Error during authentication: {e}")
         return None
+    finally:
+        if conn:
+            conn.close()
 
 
-# ============================================================================
-# SESSION MANAGEMENT
-# ============================================================================
-
-def validate_session_token(session_token: str) -> bool:
+# Middleware to attach user to request state
+async def auth_middleware(request: Request, call_next):
     """
-    Validate session token format and security requirements
-    
-    Security checks:
-    - Ensures token is not empty
-    - Validates minimum length (32+ characters)
-    - Checks for valid URL-safe base64 characters only
-    - Prevents injection attacks through malformed tokens
-    """
-    if not session_token:
-        return False
-    
-    # Check token length
-    if len(session_token) < 32:
-        return False
-    
-    # Check for valid characters (URL-safe base64)
-    if not re.match(r'^[A-Za-z0-9_-]+$', session_token):
-        return False
-    
-    return True
-
-
-async def cleanup_invalid_sessions() -> int:
-    """
-    Clean up any invalid session tokens in the database
-    
-    Returns:
-        int: Number of invalid sessions cleaned up
-    """
-    try:
-        # ✅ FIXED: Use asyncpg connection pool
-        async with get_pool().acquire() as conn:
-            # Get all session tokens
-            rows = await conn.fetch(
-                "SELECT id, session_token FROM users WHERE session_token IS NOT NULL"
-            )
-            
-            invalid_count = 0
-            
-            # ✅ FIXED: Use asyncpg transaction
-            async with conn.transaction():
-                for row in rows:
-                    user_id = row['id']
-                    session_token = row['session_token']
-                    
-                    if not validate_session_token(session_token):
-                        # Clear invalid session token
-                        await conn.execute("""
-                            UPDATE users 
-                            SET session_token = NULL, session_expires = NULL
-                            WHERE id = $1
-                        """, user_id)
-                        invalid_count += 1
-            
-            if invalid_count > 0:
-                logger.warning(f"Cleaned up {invalid_count} invalid session tokens")
-            else:
-                logger.info("No invalid session tokens found")
-            
-            return invalid_count
-                
-    except Exception as e:
-        logger.error(f"Error during session cleanup: {e}")
-        return 0
-
-
-async def get_user_from_session(
-    session_token: Optional[str] = Cookie(None, alias='youtube_optimizer_session')
-) -> Optional[User]:
-    """
-    Retrieve user from session token with security validation
-    
-    Security features:
-    - Validates session token format before database lookup
-    - Checks session expiry
-    - Uses secure token validation
-    - Prevents injection attacks
+    Middleware to extract and validate authentication for all requests.
     
     Args:
-        session_token: The session token cookie value
-        
-    Returns:
-        User object or None if session is invalid
+        request: FastAPI request
+        call_next: Next middleware/handler
     """
-    if not session_token:
-        return None
+    # Try to get user from bearer token
+    auth_header = request.headers.get("Authorization")
     
-    # Validate session token format before database lookup
-    if not validate_session_token(session_token):
-        logger.warning(f"Invalid session token format: {session_token[:10] if session_token else None}...")
-        return None
+    if auth_header and auth_header.startswith("Bearer "):
+        token = auth_header.split(" ")[1]
+        try:
+            payload = decode_token(token)
+            user_id = payload.get("sub")
+            
+            if user_id:
+                user = get_user_by_id(user_id)
+                if user:
+                    request.state.user = user
+        except Exception as e:
+            logger.debug(f"Failed to extract user from token: {e}")
     
-    try:
-        # ✅ FIXED: Use asyncpg connection pool
-        async with get_pool().acquire() as conn:
-            row = await conn.fetchrow("""
-                SELECT id, google_id, email, name, permission_level, is_free_trial, session_expires
-                FROM users
-                WHERE session_token = $1
-            """, session_token)
-            
-            if not row:
-                logger.info(f"No user found with session token {session_token[:10] if session_token else None}...")
-                return None
-            
-            # Check for session expiry
-            session_expires = row['session_expires']
-            
-            if session_expires:
-                now = datetime.datetime.now(session_expires.tzinfo) if hasattr(session_expires, 'tzinfo') else datetime.datetime.now()
-                if now > session_expires:
-                    logger.info(f"Session expired for user {row['id']}")
-                    return None
-            
-            return User(
-                id=row['id'],
-                google_id=row['google_id'],
-                email=row['email'],
-                name=row['name'],
-                permission_level=row['permission_level'] or "readwrite",
-                is_free_trial=row['is_free_trial'] or False
-            )
-            
-    except Exception as e:
-        logger.error(f"Error retrieving user from session: {e}")
-        return None
+    response = await call_next(request)
+    return response
