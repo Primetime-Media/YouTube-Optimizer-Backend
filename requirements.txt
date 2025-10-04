@@ -1,174 +1,124 @@
-# YouTube Content Optimization Platform - Production Dependencies
-# Version: 2.0.0 - FIXED
-# Python: 3.11+
-# Last Updated: October 2025
+# requirements.txt
+# YouTube Channel Optimizer API - Production Dependencies
 
 # ============================================================================
-# Core Web Framework
+# Core Framework
 # ============================================================================
-fastapi==0.115.0
-uvicorn[standard]==0.30.6
-python-multipart==0.0.9
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+pydantic==2.5.3
+pydantic-settings==2.1.0
 
 # ============================================================================
 # Database & ORM
 # ============================================================================
-# ✅ FIXED: Added asyncpg (async PostgreSQL driver)
-asyncpg==0.29.0
-
-# ✅ FIXED: Removed psycopg2-binary (sync driver - incompatible with asyncpg)
-# psycopg2-binary==2.9.9  # REMOVED
-
-SQLAlchemy==2.0.23
-alembic==1.13.1
+psycopg2-binary==2.9.9
+sqlalchemy==2.0.25
+alembic==1.13.1  # For database migrations
 
 # ============================================================================
-# Async & Task Queue
+# Redis & Caching
 # ============================================================================
-celery==5.3.4
 redis==5.0.1
-# Note: asyncio is built-in to Python 3.11+, no need to install separately
+hiredis==2.3.2  # Performance boost for Redis
 
 # ============================================================================
 # Authentication & Security
 # ============================================================================
 python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
-python-dotenv==1.0.0
-cryptography==41.0.7
+python-multipart==0.0.6
+bcrypt==4.1.2
 
 # ============================================================================
-# AI & Machine Learning
+# HTTP & API Clients
 # ============================================================================
-# Anthropic Claude API (latest - Sept 29, 2025)
-anthropic==0.34.2
+httpx==0.26.0
+aiohttp==3.9.1
+requests==2.31.0
 
-# OpenAI API (GPT-4.1 support - May 2025)
-openai==1.42.0
-
-# Google Cloud Services
-google-cloud-vision==3.7.3
-google-api-python-client==2.108.0
-google-auth==2.25.2
+# ============================================================================
+# Google & YouTube APIs
+# ============================================================================
+google-api-python-client==2.115.0
+google-auth==2.26.2
 google-auth-oauthlib==1.2.0
 google-auth-httplib2==0.2.0
 
 # ============================================================================
-# Data Processing & Analytics
+# Monitoring & Metrics
 # ============================================================================
-pandas==2.1.4
-numpy==1.26.2
-scipy==1.11.4
+prometheus-client==0.19.0
+sentry-sdk[fastapi]==1.39.2
+python-json-logger==2.0.7
+loguru==0.7.2
 
 # ============================================================================
-# HTTP Clients
+# Background Tasks & Scheduling
 # ============================================================================
-httpx==0.25.2
-requests==2.31.0
-aiohttp==3.9.1
+celery==5.3.6
+flower==2.0.1  # Celery monitoring
+apscheduler==3.10.4
 
 # ============================================================================
-# Validation & Serialization
+# Data Processing & Validation
 # ============================================================================
-pydantic==2.5.2
-pydantic-settings==2.1.0
+python-dateutil==2.8.2
+pytz==2024.1
+email-validator==2.1.0
 
 # ============================================================================
-# Image Processing
+# AWS Services (Optional)
 # ============================================================================
-Pillow==10.1.0
-opencv-python==4.8.1.78
+boto3==1.34.24  # For S3, CloudWatch, etc.
+aioboto3==12.3.0  # Async AWS SDK
 
 # ============================================================================
-# Text Processing
+# Development & Testing
 # ============================================================================
-textblob==0.17.1
-nltk==3.8.1
-
-# ============================================================================
-# SEO & Trends
-# ============================================================================
-google-search-results==2.4.2  # SerpAPI
-
-# ============================================================================
-# Testing
-# ============================================================================
-pytest==7.4.3
-pytest-asyncio==0.21.1
+pytest==7.4.4
+pytest-asyncio==0.23.3
 pytest-cov==4.1.0
-pytest-mock==3.12.0
+httpx==0.26.0  # For testing
+faker==22.5.0  # Test data generation
 
 # ============================================================================
 # Code Quality
 # ============================================================================
-black==23.12.1
-flake8==6.1.0
-mypy==1.7.1
+black==24.1.1
+flake8==7.0.0
 isort==5.13.2
+mypy==1.8.0
+pylint==3.0.3
 
 # ============================================================================
-# Monitoring & Logging
+# Documentation
 # ============================================================================
-prometheus-client==0.19.0
-python-json-logger==2.0.7
-
-# ============================================================================
-# Date & Time
-# ============================================================================
-python-dateutil==2.8.2
-pytz==2023.3.post1
+mkdocs==1.5.3
+mkdocs-material==9.5.6
 
 # ============================================================================
 # Utilities
 # ============================================================================
+python-dotenv==1.0.0
+click==8.1.7
+rich==13.7.0  # Beautiful terminal output
 tenacity==8.2.3  # Retry logic
-schedule==1.2.0  # Task scheduling
-python-slugify==8.0.1
 
 # ============================================================================
-# Development Only (optional)
+# Performance
 # ============================================================================
-# ipython==8.18.1
-# jupyter==1.0.0
-# ipdb==0.13.13
+orjson==3.9.12  # Fast JSON serialization
+msgpack==1.0.7  # Fast serialization
 
 # ============================================================================
-# Optional: Performance
+# Production Server
 # ============================================================================
-# orjson==3.9.10  # Faster JSON serialization
-# ujson==5.9.0    # Alternative JSON library
+gunicorn==21.2.0
+gevent==24.2.1
 
 # ============================================================================
-# FIXES APPLIED:
+# Optional: ML/AI for Advanced Optimization
 # ============================================================================
-# ✅ Added: asyncpg==0.29.0 (required by utils/db.py)
-# ✅ Removed: psycopg2-binary==2.9.9 (incompatible with async architecture)
-# ✅ Removed: asyncio line (built-in to Python 3.11+)
-#
-# All code now uses asyncpg for async PostgreSQL operations
-# ============================================================================
-
-# ============================================================================
-# Installation Instructions:
-# ============================================================================
-# 
-# Fresh install:
-#   pip install -r requirements.txt
-#
-# Upgrade from old version:
-#   pip uninstall psycopg2-binary  # Remove old sync driver
-#   pip install -r requirements.txt
-#
-# Database requirements:
-#   - PostgreSQL 15+ required
-#   - Redis 7.0+ recommended for caching
-#
-# Python version:
-#   - Python 3.11+ required
-#   - Tested on Python 3.11 and 3.12
-#
-# Platform compatibility:
-#   - Ubuntu 22.04 LTS
-#   - macOS 14+ (Sonoma)
-#   - Windows 11
-# ============================================================================
+# openai==1.10.0  # If using OpenAI for optimization
+# anthropic==0.8.1  # If using Claude for optimization
