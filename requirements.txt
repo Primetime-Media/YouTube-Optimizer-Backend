@@ -1,5 +1,6 @@
 # requirements.txt
 # YouTube Channel Optimizer API - Production Dependencies
+# Updated with AI/ML and production-ready packages
 
 # ============================================================================
 # Core Framework
@@ -8,6 +9,7 @@ fastapi==0.109.0
 uvicorn[standard]==0.27.0
 pydantic==2.5.3
 pydantic-settings==2.1.0
+python-multipart==0.0.6
 
 # ============================================================================
 # Database & ORM
@@ -27,8 +29,8 @@ hiredis==2.3.2  # Performance boost for Redis
 # ============================================================================
 python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
-python-multipart==0.0.6
 bcrypt==4.1.2
+cryptography==42.0.2
 
 # ============================================================================
 # HTTP & API Clients
@@ -36,6 +38,16 @@ bcrypt==4.1.2
 httpx==0.26.0
 aiohttp==3.9.1
 requests==2.31.0
+urllib3==2.1.0
+
+# ============================================================================
+# AI/ML Libraries (Anthropic Claude + Google Trends)
+# ============================================================================
+anthropic==0.18.1  # Anthropic Claude API client
+numpy==1.26.3  # For statistical analysis
+scipy==1.12.0  # Advanced statistical functions
+pandas==2.2.0  # Data manipulation (optional but useful)
+papaparse==0.1.0  # CSV parsing
 
 # ============================================================================
 # Google & YouTube APIs
@@ -51,7 +63,6 @@ google-auth-httplib2==0.2.0
 prometheus-client==0.19.0
 sentry-sdk[fastapi]==1.39.2
 python-json-logger==2.0.7
-loguru==0.7.2
 
 # ============================================================================
 # Background Tasks & Scheduling
@@ -59,6 +70,7 @@ loguru==0.7.2
 celery==5.3.6
 flower==2.0.1  # Celery monitoring
 apscheduler==3.10.4
+redis==5.0.1  # Already listed above but needed for Celery
 
 # ============================================================================
 # Data Processing & Validation
@@ -66,6 +78,7 @@ apscheduler==3.10.4
 python-dateutil==2.8.2
 pytz==2024.1
 email-validator==2.1.0
+python-dotenv==1.0.0
 
 # ============================================================================
 # AWS Services (Optional)
@@ -74,42 +87,24 @@ boto3==1.34.24  # For S3, CloudWatch, etc.
 aioboto3==12.3.0  # Async AWS SDK
 
 # ============================================================================
-# Development & Testing
+# Text Processing & NLP
 # ============================================================================
-pytest==7.4.4
-pytest-asyncio==0.23.3
-pytest-cov==4.1.0
-httpx==0.26.0  # For testing
-faker==22.5.0  # Test data generation
+beautifulsoup4==4.12.3  # HTML parsing
+lxml==5.1.0  # XML/HTML processing
+regex==2023.12.25  # Advanced regex
 
 # ============================================================================
-# Code Quality
+# Rate Limiting & Circuit Breaker
 # ============================================================================
-black==24.1.1
-flake8==7.0.0
-isort==5.13.2
-mypy==1.8.0
-pylint==3.0.3
-
-# ============================================================================
-# Documentation
-# ============================================================================
-mkdocs==1.5.3
-mkdocs-material==9.5.6
-
-# ============================================================================
-# Utilities
-# ============================================================================
-python-dotenv==1.0.0
-click==8.1.7
-rich==13.7.0  # Beautiful terminal output
-tenacity==8.2.3  # Retry logic
+tenacity==8.2.3  # Retry logic with exponential backoff
+limits==3.7.0  # Rate limiting utilities
 
 # ============================================================================
 # Performance
 # ============================================================================
 orjson==3.9.12  # Fast JSON serialization
 msgpack==1.0.7  # Fast serialization
+ujson==5.9.0  # Ultra-fast JSON
 
 # ============================================================================
 # Production Server
@@ -118,7 +113,51 @@ gunicorn==21.2.0
 gevent==24.2.1
 
 # ============================================================================
-# Optional: ML/AI for Advanced Optimization
+# Utilities
 # ============================================================================
-# openai==1.10.0  # If using OpenAI for optimization
-# anthropic==0.8.1  # If using Claude for optimization
+click==8.1.7  # CLI utilities
+rich==13.7.0  # Beautiful terminal output
+python-multipart==0.0.6  # Already listed but critical
+
+# ============================================================================
+# Development & Testing (Optional - remove in production)
+# ============================================================================
+pytest==7.4.4
+pytest-asyncio==0.23.3
+pytest-cov==4.1.0
+faker==22.5.0  # Test data generation
+httpx==0.26.0  # Already listed but needed for testing
+
+# ============================================================================
+# Code Quality (Optional - dev only)
+# ============================================================================
+# black==24.1.1
+# flake8==7.0.0
+# isort==5.13.2
+# mypy==1.8.0
+# pylint==3.0.3
+
+# ============================================================================
+# Documentation (Optional)
+# ============================================================================
+# mkdocs==1.5.3
+# mkdocs-material==9.5.6
+
+# ============================================================================
+# Environment-Specific
+# ============================================================================
+# Production optimizations
+aiofiles==23.2.1  # Async file operations
+cachetools==5.3.2  # Caching utilities
+
+# Monitoring and APM
+opentelemetry-api==1.22.0  # Optional: OpenTelemetry
+opentelemetry-sdk==1.22.0
+opentelemetry-instrumentation-fastapi==0.43b0
+
+# ============================================================================
+# Notes
+# ============================================================================
+# Install with: pip install -r requirements.txt
+# For development: pip install -r requirements.txt -r requirements-dev.txt
+# For minimal install: pip install -r requirements-minimal.txt
