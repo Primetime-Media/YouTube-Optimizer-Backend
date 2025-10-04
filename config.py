@@ -1,339 +1,189 @@
+# config.py
 """
-Configuration Settings Module - Production Ready
-================================================
-Enterprise-grade configuration with comprehensive validation
+Application Configuration Management
+====================================
+Centralized configuration with environment variable support,
+validation, and type safety using Pydantic Settings.
 
-Features:
-- Pydantic v2 settings with strict validation
-- Environment-based configuration
-- Type safety with enums
-- Secure defaults
-- Comprehensive validation
-- Sensitive data handling
+Environment variables can be set in .env file or system environment.
 """
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import Field, field_validator, model_validator, SecretStr, PostgresDsn, RedisDsn
-from typing import List, Optional, Dict, Any
-from enum import Enum
+from pydantic import Field, field_validator
+from typing import Optional, List, Dict, Any
 from functools import lru_cache
-import secrets
+import os
 import logging
+from pathlib import Path
 
-logger = logging.getLogger(__name__)
-
-
-# ============================================================================
-# ENUMS FOR CONSTRAINED CHOICES
-# ============================================================================
-
-class Environment(str, Enum):
-    """Application environment"""
-    DEVELOPMENT = "development"
-    STAGING = "staging"
-    PRODUCTION = "production"
-    TESTING = "testing"
-
-
-class LogLevel(str, Enum):
-    """Logging levels"""
-    DEBUG = "DEBUG"
-    INFO = "INFO"
-    WARNING = "WARNING"
-    ERROR = "ERROR"
-    CRITICAL = "CRITICAL"
-
-
-class JWTAlgorithm(str, Enum):
-    """Supported JWT algorithms"""
-    HS256 = "HS256"
-    HS384 = "HS384"
-    HS512 = "HS512"
-    RS256 = "RS256"
-
-
-# ============================================================================
-# MAIN SETTINGS CLASS
-# ============================================================================
 
 class Settings(BaseSettings):
     """
-    Application settings with comprehensive validation
+    Application settings with environment variable support.
     
     All settings can be overridden via environment variables.
-    Required fields will raise validation errors if not provided.
+    For nested configs, use double underscore notation (e.g., DATABASE__HOST)
     """
     
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
-        case_sensitive=True,
-        extra="ignore",  # Ignore extra fields in .env
-        validate_default=True,
-        str_strip_whitespace=True
-    )
-    
-    # ========================================================================
+    # ============================================================================
     # APPLICATION SETTINGS
-    # ========================================================================
-    
+    # ============================================================================
     APP_NAME: str = Field(
-        default="YouTube Optimizer",
+        default="YouTube Channel Optimizer API",
         description="Application name"
     )
     APP_VERSION: str = Field(
-        default="2.0.0",
+        default="1.0.0",
         description="Application version"
     )
     DEBUG: bool = Field(
         default=False,
-        description="Debug mode - should be False in production"
+        description="Enable debug mode"
     )
-    ENVIRONMENT: Environment = Field(
-        default=Environment.PRODUCTION,
-        description="Application environment"
+    ENVIRONMENT: str = Field(
+        default="production",
+        description="Environment: development, staging, production"
+    )
+    BASE_DIR: Path = Field(
+        default_factory=lambda: Path(__file__).resolve().parent,
+        description="Base directory of the application"
     )
     
+    # ============================================================================
+    # API CONFIGURATION
+    # ============================================================================
+    API_V1_PREFIX: str = Field(
+        default="/api/v1",
+        description="API version 1 prefix"
+    )
     HOST: str = Field(
         default="0.0.0.0",
-        description="Server host"
+        description="Host to bind the server"
     )
     PORT: int = Field(
         default=8000,
         ge=1,
         le=65535,
-        description="Server port"
+        description="Port to bind the server"
+    )
+    WORKERS: int = Field(
+        default=4,
+        ge=1,
+        description="Number of worker processes"
+    )
+    ALLOWED_HOSTS: List[str] = Field(
+        default=["*"],
+        description="Allowed hosts for the application"
+    )
+    CORS_ORIGINS: List[str] = Field(
+        default=[
+            "http://localhost:3000",
+            "http://localhost:8000",
+            "https://localhost:3000"
+        ],
+        description="Allowed CORS origins"
+    )
+    CORS_CREDENTIALS: bool = Field(
+        default=True,
+        description="Allow credentials in CORS requests"
+    )
+    CORS_METHODS: List[str] = Field(
+        default=["*"],
+        description="Allowed CORS methods"
+    )
+    CORS_HEADERS: List[str] = Field(
+        default=["*"],
+        description="Allowed CORS headers"
     )
     
-    # ========================================================================
-    # DATABASE SETTINGS
-    # ========================================================================
+    # ============================================================================
+    # SECURITY SETTINGS
+    # ============================================================================
+    SECRET_KEY: str = Field(
+        ...,  # Required field
+        min_length=32,
+        description="Secret key for JWT and encryption (MUST be set in environment)"
+    )
+    JWT_ALGORITHM: str = Field(
+        default="HS256",
+        description="JWT algorithm"
+    )
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = Field(
+        default=30,
+        ge=1,
+        description="Access token expiration in minutes"
+    )
+    REFRESH_TOKEN_EXPIRE_DAYS: int = Field(
+        default=7,
+        ge=1,
+        description="Refresh token expiration in days"
+    )
+    PASSWORD_MIN_LENGTH: int = Field(
+        default=8,
+        ge=6,
+        description="Minimum password length"
+    )
+    CLOUD_SCHEDULER_SECRET: str = Field(
+        default="your-secret-key-here",
+        description="Secret for Cloud Scheduler authentication"
+    )
     
-    DB_HOST: str = Field(
+    # ============================================================================
+    # DATABASE CONFIGURATION
+    # ============================================================================
+    DATABASE_HOST: str = Field(
         default="localhost",
-        min_length=1,
         description="Database host"
     )
-    DB_PORT: int = Field(
+    DATABASE_PORT: int = Field(
         default=5432,
         ge=1,
         le=65535,
         description="Database port"
     )
-    DB_NAME: str = Field(
+    DATABASE_NAME: str = Field(
         default="youtube_optimizer",
-        min_length=1,
         description="Database name"
     )
-    DB_USER: str = Field(
+    DATABASE_USER: str = Field(
         default="postgres",
-        min_length=1,
         description="Database user"
     )
-    DB_PASSWORD: SecretStr = Field(
-        ...,  # Required in production
-        description="Database password (required)"
+    DATABASE_PASSWORD: str = Field(
+        ...,  # Required field
+        description="Database password (MUST be set in environment)"
     )
-    
-    # Connection pool settings
-    DB_POOL_MIN: int = Field(
-        default=2,
-        ge=1,
-        le=100,
-        description="Minimum database pool size"
-    )
-    DB_POOL_MAX: int = Field(
+    DATABASE_POOL_SIZE: int = Field(
         default=10,
         ge=1,
-        le=100,
-        description="Maximum database pool size"
+        description="Database connection pool size"
     )
-    DB_TIMEOUT: int = Field(
+    DATABASE_MAX_OVERFLOW: int = Field(
+        default=20,
+        ge=0,
+        description="Database connection pool max overflow"
+    )
+    DATABASE_POOL_TIMEOUT: int = Field(
         default=30,
-        ge=5,
-        le=300,
-        description="Database timeout in seconds"
-    )
-    
-    # Encryption key for sensitive data
-    DB_ENCRYPTION_KEY: Optional[SecretStr] = Field(
-        default=None,
-        min_length=32,
-        description="32+ character encryption key for sensitive data"
-    )
-    
-    @field_validator("DB_POOL_MAX")
-    @classmethod
-    def validate_pool_max(cls, v: int, info) -> int:
-        """Ensure max pool size >= min pool size"""
-        if "DB_POOL_MIN" in info.data and v < info.data["DB_POOL_MIN"]:
-            raise ValueError("DB_POOL_MAX must be >= DB_POOL_MIN")
-        return v
-    
-    # ========================================================================
-    # SECURITY SETTINGS
-    # ========================================================================
-    
-    SECRET_KEY: SecretStr = Field(
-        ...,  # Required
-        min_length=32,
-        description="Application secret key (min 32 characters)"
-    )
-    JWT_SECRET_KEY: SecretStr = Field(
-        ...,  # Required
-        min_length=32,
-        description="JWT secret key (min 32 characters)"
-    )
-    JWT_ALGORITHM: JWTAlgorithm = Field(
-        default=JWTAlgorithm.HS256,
-        description="JWT signing algorithm"
-    )
-    JWT_EXPIRATION_MINUTES: int = Field(
-        default=60,
-        ge=5,
-        le=43200,  # Max 30 days
-        description="JWT token expiration in minutes"
-    )
-    
-    # Password requirements
-    PASSWORD_MIN_LENGTH: int = Field(
-        default=8,
-        ge=8,
-        le=128,
-        description="Minimum password length"
-    )
-    PASSWORD_REQUIRE_SPECIAL: bool = Field(
-        default=True,
-        description="Require special characters in passwords"
-    )
-    
-    # ========================================================================
-    # CORS SETTINGS
-    # ========================================================================
-    
-    CORS_ORIGINS: List[str] = Field(
-        default=["http://localhost:3000"],
-        description="Allowed CORS origins"
-    )
-    
-    @field_validator("CORS_ORIGINS", mode="before")
-    @classmethod
-    def parse_cors_origins(cls, v):
-        """Parse CORS origins from comma-separated string or list"""
-        if isinstance(v, str):
-            return [origin.strip() for origin in v.split(",") if origin.strip()]
-        return v
-    
-    @field_validator("CORS_ORIGINS")
-    @classmethod
-    def validate_cors_origins(cls, v: List[str]) -> List[str]:
-        """Validate CORS origins format"""
-        for origin in v:
-            if not origin.startswith(("http://", "https://")):
-                raise ValueError(f"Invalid CORS origin: {origin}. Must start with http:// or https://")
-        return v
-    
-    # ========================================================================
-    # API KEYS
-    # ========================================================================
-    
-    # YouTube Data API
-    YOUTUBE_API_KEY: Optional[SecretStr] = Field(
-        default=None,
-        description="YouTube Data API key"
-    )
-    
-    # Anthropic Claude API
-    ANTHROPIC_API_KEY: Optional[SecretStr] = Field(
-        default=None,
-        description="Anthropic API key"
-    )
-    CLAUDE_MODEL: str = Field(
-        default="claude-sonnet-4-5-20250929",
-        description="Claude model identifier"
-    )
-    CLAUDE_MAX_TOKENS: int = Field(
-        default=4096,
         ge=1,
-        le=200000,
-        description="Maximum tokens for Claude responses"
+        description="Database connection pool timeout in seconds"
+    )
+    DATABASE_SSL_MODE: str = Field(
+        default="prefer",
+        description="Database SSL mode: disable, allow, prefer, require, verify-ca, verify-full"
     )
     
-    # OpenAI API (fallback)
-    OPENAI_API_KEY: Optional[SecretStr] = Field(
-        default=None,
-        description="OpenAI API key"
-    )
-    OPENAI_MODEL: str = Field(
-        default="gpt-4-turbo",
-        description="OpenAI model identifier"
-    )
+    @property
+    def DATABASE_URL(self) -> str:
+        """Construct database URL from components."""
+        return (
+            f"postgresql://{self.DATABASE_USER}:{self.DATABASE_PASSWORD}"
+            f"@{self.DATABASE_HOST}:{self.DATABASE_PORT}/{self.DATABASE_NAME}"
+        )
     
-    # Google Cloud Vision API
-    GOOGLE_VISION_CREDENTIALS: Optional[str] = Field(
-        default=None,
-        description="Path to Google Cloud credentials JSON"
-    )
-    
-    # Stripe (payments)
-    STRIPE_API_KEY: Optional[SecretStr] = Field(
-        default=None,
-        description="Stripe API key"
-    )
-    STRIPE_WEBHOOK_SECRET: Optional[SecretStr] = Field(
-        default=None,
-        description="Stripe webhook secret"
-    )
-    
-    # SendGrid (emails)
-    SENDGRID_API_KEY: Optional[SecretStr] = Field(
-        default=None,
-        description="SendGrid API key"
-    )
-    SENDGRID_FROM_EMAIL: str = Field(
-        default="noreply@youtubeoptimizer.com",
-        description="SendGrid from email address"
-    )
-    
-    @field_validator("SENDGRID_FROM_EMAIL")
-    @classmethod
-    def validate_email(cls, v: str) -> str:
-        """Basic email validation"""
-        if "@" not in v or "." not in v.split("@")[1]:
-            raise ValueError("Invalid email address format")
-        return v.lower()
-    
-    # SerpAPI (Google Trends)
-    SERPAPI_KEY: Optional[SecretStr] = Field(
-        default=None,
-        description="SerpAPI key"
-    )
-    
-    # ========================================================================
-    # RATE LIMITING
-    # ========================================================================
-    
-    RATE_LIMIT_ENABLED: bool = Field(
-        default=True,
-        description="Enable rate limiting"
-    )
-    RATE_LIMIT_REQUESTS: int = Field(
-        default=100,
-        ge=1,
-        le=10000,
-        description="Max requests per window"
-    )
-    RATE_LIMIT_WINDOW: int = Field(
-        default=60,
-        ge=1,
-        le=3600,
-        description="Rate limit window in seconds"
-    )
-    
-    # ========================================================================
-    # CACHING (REDIS)
-    # ========================================================================
-    
+    # ============================================================================
+    # REDIS CONFIGURATION
+    # ============================================================================
     REDIS_HOST: str = Field(
         default="localhost",
         description="Redis host"
@@ -347,419 +197,513 @@ class Settings(BaseSettings):
     REDIS_DB: int = Field(
         default=0,
         ge=0,
-        le=15,
         description="Redis database number"
     )
-    REDIS_PASSWORD: Optional[SecretStr] = Field(
+    REDIS_PASSWORD: Optional[str] = Field(
         default=None,
-        description="Redis password"
+        description="Redis password (optional)"
     )
+    REDIS_SSL: bool = Field(
+        default=False,
+        description="Use SSL for Redis connection"
+    )
+    
+    @property
+    def REDIS_URL(self) -> str:
+        """Construct Redis URL from components."""
+        protocol = "rediss" if self.REDIS_SSL else "redis"
+        auth = f":{self.REDIS_PASSWORD}@" if self.REDIS_PASSWORD else ""
+        return f"{protocol}://{auth}{self.REDIS_HOST}:{self.REDIS_PORT}/{self.REDIS_DB}"
+    
     CACHE_TTL: int = Field(
-        default=3600,
-        ge=60,
-        le=86400,
-        description="Cache TTL in seconds"
+        default=300,
+        ge=0,
+        description="Default cache TTL in seconds"
     )
     
-    # ========================================================================
-    # BACKGROUND JOBS (CELERY)
-    # ========================================================================
-    
-    CELERY_BROKER_URL: str = Field(
-        default="redis://localhost:6379/0",
-        description="Celery broker URL"
-    )
-    CELERY_RESULT_BACKEND: str = Field(
-        default="redis://localhost:6379/0",
-        description="Celery result backend URL"
-    )
-    
-    # ========================================================================
-    # LOGGING
-    # ========================================================================
-    
-    LOG_LEVEL: LogLevel = Field(
-        default=LogLevel.INFO,
-        description="Logging level"
-    )
-    LOG_FILE: str = Field(
-        default="app.log",
-        description="Log file path"
-    )
-    LOG_MAX_BYTES: int = Field(
-        default=10485760,  # 10MB
-        ge=1048576,  # Min 1MB
-        le=104857600,  # Max 100MB
-        description="Max log file size in bytes"
-    )
-    LOG_BACKUP_COUNT: int = Field(
-        default=5,
-        ge=1,
-        le=50,
-        description="Number of log backups to keep"
-    )
-    
-    # ========================================================================
-    # FEATURE FLAGS
-    # ========================================================================
-    
-    FEATURE_A_B_TESTING: bool = Field(
+    # ============================================================================
+    # RATE LIMITING
+    # ============================================================================
+    RATE_LIMITING_ENABLED: bool = Field(
         default=True,
-        description="Enable A/B testing features"
+        description="Enable rate limiting"
     )
-    FEATURE_COMPETITOR_ANALYSIS: bool = Field(
-        default=True,
-        description="Enable competitor analysis"
+    RATE_LIMIT_STORAGE: str = Field(
+        default="redis",
+        description="Rate limit storage backend: redis or memory"
     )
-    FEATURE_THUMBNAIL_OPTIMIZATION: bool = Field(
-        default=True,
-        description="Enable thumbnail optimization"
-    )
-    FEATURE_HASHTAG_OPTIMIZATION: bool = Field(
-        default=True,
-        description="Enable hashtag optimization"
+    DEFAULT_RATE_LIMIT: str = Field(
+        default="100/minute",
+        description="Default rate limit for endpoints"
     )
     
-    # ========================================================================
-    # OPTIMIZATION SETTINGS
-    # ========================================================================
-    
-    CONFIDENCE_THRESHOLD: float = Field(
-        default=0.6,
-        ge=0.0,
-        le=1.0,
-        description="Statistical confidence threshold"
+    # ============================================================================
+    # LOGGING CONFIGURATION
+    # ============================================================================
+    LOG_LEVEL: str = Field(
+        default="INFO",
+        description="Logging level: DEBUG, INFO, WARNING, ERROR, CRITICAL"
     )
-    UPLIFT_THRESHOLD: float = Field(
-        default=0.03,
-        ge=0.0,
-        le=1.0,
-        description="Minimum uplift threshold (3%)"
+    LOG_FORMAT: str = Field(
+        default="json",
+        description="Log format: json or text"
     )
-    
-    # Cooling-off periods (days)
-    COOLOFF_FIRST_OPT: int = Field(
-        default=7,
-        ge=1,
-        le=365,
-        description="First optimization cooloff in days"
+    LOG_FILE: Optional[str] = Field(
+        default=None,
+        description="Log file path (optional, logs to stdout if not set)"
     )
-    COOLOFF_REPEAT_OPT: int = Field(
-        default=14,
-        ge=1,
-        le=365,
-        description="Repeat optimization cooloff in days"
+    LOG_ROTATION: str = Field(
+        default="1 day",
+        description="Log rotation interval"
     )
-    COOLOFF_NO_OPT: int = Field(
-        default=7,
-        ge=1,
-        le=365,
-        description="No optimization cooloff in days"
+    LOG_RETENTION: str = Field(
+        default="30 days",
+        description="Log retention period"
     )
     
-    # View thresholds
-    LOW_VIEW_THRESHOLD: int = Field(
-        default=100,
-        ge=1,
-        description="Low view count threshold"
-    )
-    MEDIUM_VIEW_THRESHOLD: int = Field(
-        default=1000,
-        ge=1,
-        description="Medium view count threshold"
-    )
-    
-    @field_validator("MEDIUM_VIEW_THRESHOLD")
-    @classmethod
-    def validate_view_thresholds(cls, v: int, info) -> int:
-        """Ensure medium threshold > low threshold"""
-        if "LOW_VIEW_THRESHOLD" in info.data and v <= info.data["LOW_VIEW_THRESHOLD"]:
-            raise ValueError("MEDIUM_VIEW_THRESHOLD must be > LOW_VIEW_THRESHOLD")
-        return v
-    
-    # ========================================================================
-    # EMAIL SETTINGS
-    # ========================================================================
-    
-    EMAIL_ENABLED: bool = Field(
-        default=True,
-        description="Enable email functionality"
-    )
-    EMAIL_NOTIFICATIONS_ENABLED: bool = Field(
-        default=True,
-        description="Enable email notifications"
-    )
-    
-    # ========================================================================
-    # MONITORING
-    # ========================================================================
-    
+    # ============================================================================
+    # METRICS & MONITORING
+    # ============================================================================
     METRICS_ENABLED: bool = Field(
         default=True,
         description="Enable metrics collection"
     )
-    HEALTH_CHECK_ENABLED: bool = Field(
-        default=True,
-        description="Enable health check endpoints"
+    METRICS_BACKEND: str = Field(
+        default="prometheus",
+        description="Metrics backend: prometheus, statsd, cloudwatch, datadog, console"
+    )
+    METRICS_PORT: int = Field(
+        default=9090,
+        ge=1,
+        le=65535,
+        description="Metrics endpoint port"
+    )
+    METRICS_NAMESPACE: str = Field(
+        default="youtube_optimizer",
+        description="Metrics namespace/prefix"
     )
     
-    # ========================================================================
-    # MODEL VALIDATORS
-    # ========================================================================
+    # ============================================================================
+    # AI/LLM CONFIGURATION (ANTHROPIC CLAUDE)
+    # ============================================================================
+    ANTHROPIC_API_KEY: Optional[str] = Field(
+        default=None,
+        description="Anthropic API key for Claude AI"
+    )
+    ANTHROPIC_DEFAULT_MODEL: str = Field(
+        default="claude-3-5-haiku-20241022",
+        description="Default Claude model to use"
+    )
+    ANTHROPIC_FALLBACK_MODELS: List[str] = Field(
+        default=[
+            "claude-3-5-haiku-20241022",
+            "claude-3-7-sonnet-20250219",
+            "claude-3-5-sonnet-20241022"
+        ],
+        description="Fallback models if primary fails"
+    )
+    ANTHROPIC_MAX_RETRIES: int = Field(
+        default=3,
+        ge=1,
+        description="Maximum retry attempts for Anthropic API"
+    )
+    ANTHROPIC_TIMEOUT: int = Field(
+        default=60,
+        ge=10,
+        description="Anthropic API timeout in seconds"
+    )
     
-    @model_validator(mode="after")
-    def validate_production_settings(self) -> "Settings":
-        """Validate critical production settings"""
-        if self.ENVIRONMENT == Environment.PRODUCTION:
-            # Production must not be in debug mode
-            if self.DEBUG:
-                raise ValueError("DEBUG must be False in production environment")
-            
-            # Production must have HTTPS in CORS origins
-            for origin in self.CORS_ORIGINS:
-                if origin.startswith("http://") and "localhost" not in origin:
-                    logger.warning(
-                        f"Non-HTTPS CORS origin in production: {origin}"
-                    )
-        
-        return self
+    # ============================================================================
+    # GOOGLE TRENDS & SERPAPI CONFIGURATION
+    # ============================================================================
+    SERPAPI_API_KEY: Optional[str] = Field(
+        default=None,
+        description="SerpAPI key for Google Trends data"
+    )
+    SERPAPI_TIMEOUT: int = Field(
+        default=30,
+        ge=5,
+        description="SerpAPI timeout in seconds"
+    )
+    TRENDS_DEFAULT_TIMEFRAME: str = Field(
+        default="now 7-d",
+        description="Default timeframe for Google Trends queries"
+    )
+    TRENDS_MAX_KEYWORDS_PER_BATCH: int = Field(
+        default=5,
+        ge=1,
+        le=10,
+        description="Maximum keywords per Google Trends batch"
+    )
     
-    @model_validator(mode="after")
-    def validate_api_keys(self) -> "Settings":
-        """Warn about missing critical API keys"""
-        critical_keys = {
-            "YOUTUBE_API_KEY": self.YOUTUBE_API_KEY,
-            "ANTHROPIC_API_KEY": self.ANTHROPIC_API_KEY,
-        }
-        
-        missing = [name for name, value in critical_keys.items() if not value]
-        
-        if missing and self.ENVIRONMENT == Environment.PRODUCTION:
-            logger.warning(
-                f"Missing critical API keys in production: {', '.join(missing)}"
-            )
-        
-        return self
+    # ============================================================================
+    # YOUTUBE API CONFIGURATION
+    # ============================================================================
+    YOUTUBE_API_KEY: Optional[str] = Field(
+        default=None,
+        description="YouTube Data API key"
+    )
+    YOUTUBE_CLIENT_ID: Optional[str] = Field(
+        default=None,
+        description="YouTube OAuth client ID"
+    )
+    YOUTUBE_CLIENT_SECRET: Optional[str] = Field(
+        default=None,
+        description="YouTube OAuth client secret"
+    )
+    YOUTUBE_REDIRECT_URI: Optional[str] = Field(
+        default=None,
+        description="YouTube OAuth redirect URI"
+    )
+    YOUTUBE_QUOTA_PER_DAY: int = Field(
+        default=10000,
+        ge=0,
+        description="YouTube API daily quota limit"
+    )
+    YOUTUBE_API_SERVICE_NAME: str = Field(
+        default="youtube",
+        description="YouTube API service name"
+    )
+    YOUTUBE_API_VERSION: str = Field(
+        default="v3",
+        description="YouTube API version"
+    )
     
-    # ========================================================================
-    # COMPUTED PROPERTIES
-    # ========================================================================
+    # ============================================================================
+    # OPTIMIZATION SETTINGS
+    # ============================================================================
+    MAX_OPTIMIZATION_RETRIES: int = Field(
+        default=3,
+        ge=0,
+        description="Maximum optimization retries on failure"
+    )
+    OPTIMIZATION_TIMEOUT: int = Field(
+        default=300,
+        ge=1,
+        description="Optimization timeout in seconds"
+    )
+    AUTO_APPLY_OPTIMIZATIONS: bool = Field(
+        default=False,
+        description="Automatically apply optimizations to YouTube"
+    )
+    BATCH_OPTIMIZATION_LIMIT: int = Field(
+        default=50,
+        ge=1,
+        le=100,
+        description="Maximum videos per batch optimization"
+    )
+    USE_STATISTICAL_ANALYSIS: bool = Field(
+        default=True,
+        description="Use statistical analysis for optimization decisions"
+    )
+    MIN_OPTIMIZATION_CONFIDENCE: float = Field(
+        default=0.7,
+        ge=0.0,
+        le=1.0,
+        description="Minimum confidence score to apply optimization"
+    )
+    OPTIMIZATION_COOLING_PERIOD_DAYS: int = Field(
+        default=7,
+        ge=1,
+        description="Days to wait between optimizations for same video"
+    )
+    MAX_HASHTAGS_PER_VIDEO: int = Field(
+        default=15,
+        ge=1,
+        le=30,
+        description="Maximum number of hashtags per video"
+    )
+    MAINTAIN_ORIGINAL_DESCRIPTION: bool = Field(
+        default=True,
+        description="Keep original description and append optimizations"
+    )
     
-    @property
-    def database_url(self) -> str:
-        """Get full database URL (with exposed password)"""
-        return (
-            f"postgresql://{self.DB_USER}:{self.DB_PASSWORD.get_secret_value()}"
-            f"@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
-        )
+    # ============================================================================
+    # BACKGROUND TASKS & CELERY
+    # ============================================================================
+    CELERY_BROKER_URL: Optional[str] = Field(
+        default=None,
+        description="Celery broker URL (e.g., Redis or RabbitMQ)"
+    )
+    CELERY_RESULT_BACKEND: Optional[str] = Field(
+        default=None,
+        description="Celery result backend URL"
+    )
+    CELERY_TASK_TIME_LIMIT: int = Field(
+        default=3600,
+        ge=1,
+        description="Celery task time limit in seconds"
+    )
+    CELERY_TASK_SOFT_TIME_LIMIT: int = Field(
+        default=3000,
+        ge=1,
+        description="Celery task soft time limit in seconds"
+    )
     
-    @property
-    def database_url_safe(self) -> str:
-        """Get database URL with masked password for logging"""
-        return (
-            f"postgresql://{self.DB_USER}:****"
-            f"@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
-        )
+    # ============================================================================
+    # SCHEDULER SETTINGS
+    # ============================================================================
+    SCHEDULER_ENABLED: bool = Field(
+        default=True,
+        description="Enable scheduled tasks"
+    )
+    MONTHLY_OPTIMIZATION_DAY: int = Field(
+        default=1,
+        ge=1,
+        le=28,
+        description="Day of month to run monthly optimizations"
+    )
+    SCHEDULER_TIMEZONE: str = Field(
+        default="UTC",
+        description="Timezone for scheduled tasks"
+    )
     
-    @property
-    def redis_url(self) -> str:
-        """Get full Redis URL"""
-        if self.REDIS_PASSWORD:
-            password = self.REDIS_PASSWORD.get_secret_value()
-            return f"redis://:{password}@{self.REDIS_HOST}:{self.REDIS_PORT}/{self.REDIS_DB}"
-        return f"redis://{self.REDIS_HOST}:{self.REDIS_PORT}/{self.REDIS_DB}"
+    # ============================================================================
+    # ERROR TRACKING (SENTRY)
+    # ============================================================================
+    SENTRY_DSN: Optional[str] = Field(
+        default=None,
+        description="Sentry DSN for error tracking"
+    )
+    SENTRY_ENVIRONMENT: Optional[str] = Field(
+        default=None,
+        description="Sentry environment name"
+    )
+    SENTRY_TRACES_SAMPLE_RATE: float = Field(
+        default=0.1,
+        ge=0.0,
+        le=1.0,
+        description="Sentry traces sample rate"
+    )
+    SENTRY_PROFILES_SAMPLE_RATE: float = Field(
+        default=0.1,
+        ge=0.0,
+        le=1.0,
+        description="Sentry profiles sample rate"
+    )
     
-    @property
-    def redis_url_safe(self) -> str:
-        """Get Redis URL with masked password for logging"""
-        if self.REDIS_PASSWORD:
-            return f"redis://:****@{self.REDIS_HOST}:{self.REDIS_PORT}/{self.REDIS_DB}"
-        return f"redis://{self.REDIS_HOST}:{self.REDIS_PORT}/{self.REDIS_DB}"
+    # ============================================================================
+    # FEATURE FLAGS
+    # ============================================================================
+    ENABLE_SWAGGER_UI: bool = Field(
+        default=True,
+        description="Enable Swagger UI documentation"
+    )
+    ENABLE_REDOC: bool = Field(
+        default=True,
+        description="Enable ReDoc documentation"
+    )
+    ENABLE_RATE_LIMITING: bool = Field(
+        default=True,
+        description="Enable rate limiting globally"
+    )
+    ENABLE_METRICS: bool = Field(
+        default=True,
+        description="Enable metrics collection"
+    )
+    ENABLE_CACHING: bool = Field(
+        default=True,
+        description="Enable caching"
+    )
+    ENABLE_COMPRESSION: bool = Field(
+        default=True,
+        description="Enable response compression"
+    )
+    ENABLE_CSRF_PROTECTION: bool = Field(
+        default=False,
+        description="Enable CSRF protection"
+    )
+    ENABLE_LLM_OPTIMIZATION: bool = Field(
+        default=True,
+        description="Enable AI-powered LLM optimization"
+    )
+    ENABLE_MULTILINGUAL_SUPPORT: bool = Field(
+        default=True,
+        description="Enable multilingual content optimization"
+    )
     
-    @property
+    # ============================================================================
+    # AWS CONFIGURATION (for CloudWatch, S3, etc.)
+    # ============================================================================
+    AWS_REGION: Optional[str] = Field(
+        default=None,
+        description="AWS region"
+    )
+    AWS_ACCESS_KEY_ID: Optional[str] = Field(
+        default=None,
+        description="AWS access key ID"
+    )
+    AWS_SECRET_ACCESS_KEY: Optional[str] = Field(
+        default=None,
+        description="AWS secret access key"
+    )
+    S3_BUCKET_NAME: Optional[str] = Field(
+        default=None,
+        description="S3 bucket for file storage"
+    )
+    
+    # ============================================================================
+    # EMAIL CONFIGURATION
+    # ============================================================================
+    SMTP_HOST: Optional[str] = Field(
+        default=None,
+        description="SMTP host for sending emails"
+    )
+    SMTP_PORT: int = Field(
+        default=587,
+        ge=1,
+        le=65535,
+        description="SMTP port"
+    )
+    SMTP_USER: Optional[str] = Field(
+        default=None,
+        description="SMTP username"
+    )
+    SMTP_PASSWORD: Optional[str] = Field(
+        default=None,
+        description="SMTP password"
+    )
+    SMTP_TLS: bool = Field(
+        default=True,
+        description="Use TLS for SMTP"
+    )
+    EMAIL_FROM: Optional[str] = Field(
+        default=None,
+        description="Default sender email address"
+    )
+    
+    # ============================================================================
+    # VALIDATORS
+    # ============================================================================
+    @field_validator('ENVIRONMENT')
+    @classmethod
+    def validate_environment(cls, v: str) -> str:
+        """Validate environment value."""
+        allowed = ['development', 'staging', 'production']
+        if v not in allowed:
+            raise ValueError(f"Environment must be one of {allowed}")
+        return v
+    
+    @field_validator('LOG_LEVEL')
+    @classmethod
+    def validate_log_level(cls, v: str) -> str:
+        """Validate log level."""
+        allowed = ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']
+        v_upper = v.upper()
+        if v_upper not in allowed:
+            raise ValueError(f"Log level must be one of {allowed}")
+        return v_upper
+    
+    @field_validator('METRICS_BACKEND')
+    @classmethod
+    def validate_metrics_backend(cls, v: str) -> str:
+        """Validate metrics backend."""
+        allowed = ['prometheus', 'statsd', 'cloudwatch', 'datadog', 'console']
+        v_lower = v.lower()
+        if v_lower not in allowed:
+            raise ValueError(f"Metrics backend must be one of {allowed}")
+        return v_lower
+    
+    # ============================================================================
+    # PYDANTIC CONFIGURATION
+    # ============================================================================
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=True,
+        extra="ignore",  # Ignore extra fields in .env
+        validate_default=True
+    )
+    
+    # ============================================================================
+    # HELPER METHODS
+    # ============================================================================
     def is_production(self) -> bool:
-        """Check if running in production"""
-        return self.ENVIRONMENT == Environment.PRODUCTION
+        """Check if running in production environment."""
+        return self.ENVIRONMENT == "production"
     
-    @property
     def is_development(self) -> bool:
-        """Check if running in development"""
-        return self.ENVIRONMENT in [Environment.DEVELOPMENT, Environment.TESTING]
+        """Check if running in development environment."""
+        return self.ENVIRONMENT == "development"
     
-    # ========================================================================
-    # UTILITY METHODS
-    # ========================================================================
+    def is_staging(self) -> bool:
+        """Check if running in staging environment."""
+        return self.ENVIRONMENT == "staging"
     
-    def get_required_api_keys(self) -> Dict[str, bool]:
-        """
-        Get status of required API keys
-        
-        Returns:
-            Dict mapping key names to their configured status
-        """
-        return {
-            "YOUTUBE_API_KEY": self.YOUTUBE_API_KEY is not None,
-            "ANTHROPIC_API_KEY": self.ANTHROPIC_API_KEY is not None,
-            "SECRET_KEY": True,  # Always present (required)
-            "JWT_SECRET_KEY": True,  # Always present (required)
-            "DB_PASSWORD": True,  # Always present (required)
+    def get_database_url(self, driver: str = "postgresql") -> str:
+        """Get database URL with custom driver."""
+        return (
+            f"{driver}://{self.DATABASE_USER}:{self.DATABASE_PASSWORD}"
+            f"@{self.DATABASE_HOST}:{self.DATABASE_PORT}/{self.DATABASE_NAME}"
+        )
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert settings to dictionary (excluding sensitive data)."""
+        sensitive_fields = {
+            'SECRET_KEY', 'DATABASE_PASSWORD', 'REDIS_PASSWORD',
+            'YOUTUBE_API_KEY', 'YOUTUBE_CLIENT_SECRET',
+            'AWS_SECRET_ACCESS_KEY', 'SMTP_PASSWORD',
+            'SENTRY_DSN', 'CLOUD_SCHEDULER_SECRET',
+            'ANTHROPIC_API_KEY', 'SERPAPI_API_KEY'
         }
-    
-    def get_optional_api_keys(self) -> Dict[str, bool]:
-        """
-        Get status of optional API keys
         
-        Returns:
-            Dict mapping key names to their configured status
-        """
         return {
-            "OPENAI_API_KEY": self.OPENAI_API_KEY is not None,
-            "STRIPE_API_KEY": self.STRIPE_API_KEY is not None,
-            "SENDGRID_API_KEY": self.SENDGRID_API_KEY is not None,
-            "SERPAPI_KEY": self.SERPAPI_KEY is not None,
-            "GOOGLE_VISION_CREDENTIALS": self.GOOGLE_VISION_CREDENTIALS is not None,
+            key: '***REDACTED***' if key in sensitive_fields else value
+            for key, value in self.model_dump().items()
         }
-    
-    def log_configuration(self) -> None:
-        """Log current configuration (safe - no secrets)"""
-        logger.info("=" * 70)
-        logger.info("Configuration Loaded")
-        logger.info("=" * 70)
-        logger.info(f"Environment: {self.ENVIRONMENT.value}")
-        logger.info(f"Debug Mode: {self.DEBUG}")
-        logger.info(f"Host: {self.HOST}:{self.PORT}")
-        logger.info(f"Database: {self.database_url_safe}")
-        logger.info(f"Redis: {self.redis_url_safe}")
-        logger.info(f"Claude Model: {self.CLAUDE_MODEL}")
-        logger.info(f"Rate Limiting: {self.RATE_LIMIT_ENABLED} ({self.RATE_LIMIT_REQUESTS}/{self.RATE_LIMIT_WINDOW}s)")
-        logger.info(f"Log Level: {self.LOG_LEVEL.value}")
-        logger.info("")
-        
-        # API Keys Status
-        logger.info("Required API Keys:")
-        for key, status in self.get_required_api_keys().items():
-            logger.info(f"  {key}: {'✓ Configured' if status else '✗ Missing'}")
-        
-        logger.info("")
-        logger.info("Optional API Keys:")
-        for key, status in self.get_optional_api_keys().items():
-            logger.info(f"  {key}: {'✓ Configured' if status else '- Not set'}")
-        
-        logger.info("")
-        logger.info("Feature Flags:")
-        logger.info(f"  A/B Testing: {self.FEATURE_A_B_TESTING}")
-        logger.info(f"  Competitor Analysis: {self.FEATURE_COMPETITOR_ANALYSIS}")
-        logger.info(f"  Thumbnail Optimization: {self.FEATURE_THUMBNAIL_OPTIMIZATION}")
-        logger.info(f"  Hashtag Optimization: {self.FEATURE_HASHTAG_OPTIMIZATION}")
-        
-        logger.info("=" * 70)
-    
-    def validate_configuration(self) -> List[str]:
-        """
-        Validate configuration and return list of warnings/errors
-        
-        Returns:
-            List of validation messages
-        """
-        warnings = []
-        
-        # Check production settings
-        if self.is_production:
-            if self.DEBUG:
-                warnings.append("⚠️  DEBUG is enabled in production")
-            
-            if not self.YOUTUBE_API_KEY:
-                warnings.append("⚠️  YOUTUBE_API_KEY not set in production")
-            
-            if not self.ANTHROPIC_API_KEY:
-                warnings.append("⚠️  ANTHROPIC_API_KEY not set in production")
-            
-            # Check CORS
-            for origin in self.CORS_ORIGINS:
-                if origin.startswith("http://") and "localhost" not in origin:
-                    warnings.append(f"⚠️  Non-HTTPS CORS origin: {origin}")
-        
-        # Check pool settings
-        if self.DB_POOL_MAX < self.DB_POOL_MIN:
-            warnings.append("⚠️  DB_POOL_MAX is less than DB_POOL_MIN")
-        
-        # Check thresholds
-        if self.MEDIUM_VIEW_THRESHOLD <= self.LOW_VIEW_THRESHOLD:
-            warnings.append("⚠️  MEDIUM_VIEW_THRESHOLD should be > LOW_VIEW_THRESHOLD")
-        
-        return warnings
 
-
-# ============================================================================
-# SETTINGS INSTANCE (CACHED)
-# ============================================================================
 
 @lru_cache()
 def get_settings() -> Settings:
     """
-    Get cached settings instance
+    Get cached settings instance.
+    
+    Using lru_cache ensures settings are loaded only once.
     
     Returns:
-        Validated Settings instance
-    
-    Raises:
-        ValidationError: If configuration is invalid
+        Settings: Application settings instance
     """
-    try:
-        settings_instance = Settings()
-        
-        # Log configuration (only in non-production or when explicitly enabled)
-        if settings_instance.is_development or settings_instance.DEBUG:
-            settings_instance.log_configuration()
-        
-        # Validate and show warnings
-        warnings = settings_instance.validate_configuration()
-        if warnings:
-            logger.warning("Configuration warnings:")
-            for warning in warnings:
-                logger.warning(f"  {warning}")
-        
-        return settings_instance
-        
-    except Exception as e:
-        logger.error(f"Failed to load configuration: {e}")
-        raise
+    return Settings()
 
 
-# Create global settings instance
-# Note: This will be created when first accessed, not at import time
-def create_settings() -> Settings:
-    """Create settings instance (call this explicitly in your app startup)"""
+# Convenience function to reload settings (useful for testing)
+def reload_settings() -> Settings:
+    """
+    Reload settings by clearing cache.
+    
+    Returns:
+        Settings: Fresh settings instance
+    """
+    get_settings.cache_clear()
     return get_settings()
 
 
-# ============================================================================
-# EXAMPLE USAGE
-# ============================================================================
+# Export settings instance
+settings = get_settings()
 
-if __name__ == "__main__":
-    # This runs only when the file is executed directly
-    print("Loading configuration...")
+
+# Logging setup
+def setup_logging(settings: Settings):
+    """
+    Configure application logging based on settings.
     
-    try:
-        settings = get_settings()
-        settings.log_configuration()
-        
-        print("\nConfiguration loaded successfully!")
-        print(f"Environment: {settings.ENVIRONMENT.value}")
-        print(f"Database URL: {settings.database_url_safe}")
-        print(f"Redis URL: {settings.redis_url_safe}")
-        
-        # Check for warnings
-        warnings = settings.validate_configuration()
-        if warnings:
-            print("\n⚠️  Configuration Warnings:")
-            for warning in warnings:
-                print(f"  {warning}")
-        else:
-            print("\n✓ No configuration warnings")
-            
-    except Exception as e:
-        print(f"\n❌ Configuration Error: {e}")
-        import sys
-        sys.exit(1)
+    Args:
+        settings: Application settings
+    """
+    import sys
+    
+    # Standard Python logging configuration
+    log_format = (
+        '%(asctime)s - %(name)s - %(levelname)s - '
+        '%(filename)s:%(lineno)d - %(message)s'
+    )
+    
+    logging.basicConfig(
+        level=getattr(logging, settings.LOG_LEVEL),
+        format=log_format,
+        handlers=[logging.StreamHandler(sys.stdout)]
+    )
+    
+    # Set third-party loggers to WARNING
+    for logger_name in ['urllib3', 'googleapiclient', 'google', 'asyncio', 'anthropic']:
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
