@@ -1,623 +1,372 @@
-# utils/auth.py
+# main.py
 """
-Production-Ready Authentication & Authorization
-Handles OAuth2, JWT tokens, and user permissions
+Production-Ready FastAPI Application
+YouTube Video Optimization SaaS Platform
 """
 
-from typing import Optional, Dict, List, Any
-from datetime import datetime, timedelta, timezone
-from jose import JWTError, jwt
-from passlib.context import CryptContext
-from fastapi import Depends, HTTPException, status
-from fastapi.security import OAuth2PasswordBearer, HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel, EmailStr, validator
+from fastapi import FastAPI, Request, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
+from contextlib import asynccontextmanager
 import logging
-import secrets
-import hashlib
+from logging.handlers import RotatingFileHandler
+import time
+from typing import Dict, Any
+import os
 
-from utils.db import get_db_connection, execute_query
 from config import settings
+from utils.db import init_database, cleanup_database, check_database_health
+from utils.logging_config import setup_logging
+
+# Import routers
+from routes import (
+    video_routes,
+    channel_routes,
+    analytics_routes,
+    auth_routes,
+    health_routes,
+    scheduler_routes
+)
 
 # ============================================================================
-# CONFIGURATION
+# LOGGING SETUP
 # ============================================================================
 
+setup_logging()
 logger = logging.getLogger(__name__)
 
-# Password hashing
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
-# JWT configuration
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60  # 1 hour
-REFRESH_TOKEN_EXPIRE_DAYS = 30  # 30 days
-
-# OAuth2 schemes
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
-bearer_scheme = HTTPBearer()
-
 
 # ============================================================================
-# MODELS
+# LIFESPAN CONTEXT MANAGER
 # ============================================================================
 
-class Token(BaseModel):
-    """Token response model"""
-    access_token: str
-    refresh_token: str
-    token_type: str = "bearer"
-    expires_in: int
-
-
-class TokenData(BaseModel):
-    """Token payload data"""
-    user_id: Optional[int] = None
-    email: Optional[str] = None
-    scopes: List[str] = []
-
-
-class User(BaseModel):
-    """User model"""
-    id: int
-    email: EmailStr
-    full_name: Optional[str] = None
-    is_active: bool = True
-    is_admin: bool = False
-    created_at: datetime
-    
-    @validator('email')
-    def email_must_be_lowercase(cls, v):
-        return v.lower()
-
-
-class UserCreate(BaseModel):
-    """User creation model"""
-    email: EmailStr
-    password: str
-    full_name: Optional[str] = None
-    
-    @validator('password')
-    def password_strength(cls, v):
-        if len(v) < 8:
-            raise ValueError('Password must be at least 8 characters')
-        if not any(c.isupper() for c in v):
-            raise ValueError('Password must contain uppercase letter')
-        if not any(c.islower() for c in v):
-            raise ValueError('Password must contain lowercase letter')
-        if not any(c.isdigit() for c in v):
-            raise ValueError('Password must contain digit')
-        return v
-    
-    @validator('email')
-    def email_must_be_lowercase(cls, v):
-        return v.lower()
-
-
-# ============================================================================
-# PASSWORD UTILITIES
-# ============================================================================
-
-def hash_password(password: str) -> str:
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     """
-    Hash a password using bcrypt
+    Lifespan context manager for startup and shutdown events
     
-    Args:
-        password: Plain text password
-        
-    Returns:
-        Hashed password
+    Handles:
+    - Database connection pool initialization
+    - Resource cleanup on shutdown
     """
-    return pwd_context.hash(password)
-
-
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """
-    Verify a password against a hash
+    # Startup
+    logger.info("🚀 Starting YouTube Optimizer API...")
     
-    Args:
-        plain_password: Plain text password
-        hashed_password: Hashed password from database
-        
-    Returns:
-        True if password matches, False otherwise
-    """
     try:
-        return pwd_context.verify(plain_password, hashed_password)
-    except Exception as e:
-        logger.error(f"Error verifying password: {e}")
-        return False
-
-
-def generate_password_reset_token() -> str:
-    """Generate a secure random token for password resets"""
-    return secrets.token_urlsafe(32)
-
-
-# ============================================================================
-# JWT TOKEN UTILITIES
-# ============================================================================
-
-def create_access_token(
-    data: Dict[str, Any],
-    expires_delta: Optional[timedelta] = None
-) -> str:
-    """
-    Create a JWT access token
-    
-    Args:
-        data: Payload data to encode
-        expires_delta: Optional expiration time delta
+        # Initialize database connection pool
+        init_database()
+        logger.info("✅ Database connection pool initialized")
         
-    Returns:
-        Encoded JWT token
-    """
-    to_encode = data.copy()
-    
-    if expires_delta:
-        expire = datetime.now(timezone.utc) + expires_delta
-    else:
-        expire = datetime.now(timezone.utc) + timedelta(
-            minutes=ACCESS_TOKEN_EXPIRE_MINUTES
-        )
-    
-    to_encode.update({
-        "exp": expire,
-        "iat": datetime.now(timezone.utc),
-        "type": "access"
-    })
-    
-    encoded_jwt = jwt.encode(
-        to_encode,
-        settings.secret_key.get_secret_value(),
-        algorithm=ALGORITHM
-    )
-    
-    return encoded_jwt
-
-
-def create_refresh_token(user_id: int) -> str:
-    """
-    Create a refresh token
-    
-    Args:
-        user_id: User ID
+        # Verify database health
+        health = check_database_health()
+        if not health['healthy']:
+            logger.error(f"❌ Database health check failed: {health.get('error')}")
+            raise RuntimeError("Database not healthy")
         
-    Returns:
-        Encoded refresh token
-    """
-    expire = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
-    
-    to_encode = {
-        "sub": str(user_id),
-        "exp": expire,
-        "iat": datetime.now(timezone.utc),
-        "type": "refresh"
-    }
-    
-    encoded_jwt = jwt.encode(
-        to_encode,
-        settings.secret_key.get_secret_value(),
-        algorithm=ALGORITHM
-    )
-    
-    return encoded_jwt
-
-
-def decode_token(token: str) -> Dict[str, Any]:
-    """
-    Decode and validate a JWT token
-    
-    Args:
-        token: JWT token string
-        
-    Returns:
-        Decoded token payload
-        
-    Raises:
-        HTTPException: If token is invalid or expired
-    """
-    try:
-        payload = jwt.decode(
-            token,
-            settings.secret_key.get_secret_value(),
-            algorithms=[ALGORITHM]
-        )
-        return payload
-    except JWTError as e:
-        logger.warning(f"JWT decode error: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Could not validate credentials",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-
-# ============================================================================
-# USER OPERATIONS
-# ============================================================================
-
-def get_user_by_email(email: str) -> Optional[User]:
-    """
-    Get user by email address
-    
-    Args:
-        email: User email address
-        
-    Returns:
-        User object or None if not found
-    """
-    try:
-        result = execute_query(
-            """
-            SELECT id, email, full_name, is_active, is_admin, created_at
-            FROM users
-            WHERE email = %s
-            """,
-            (email.lower(),),
-            fetch='one'
+        logger.info(
+            f"✅ Database health check passed "
+            f"(response time: {health['response_time_ms']}ms)"
         )
         
-        if result:
-            return User(**result)
-        return None
+        logger.info("✅ Application startup complete")
         
     except Exception as e:
-        logger.error(f"Error getting user by email: {e}", exc_info=True)
-        return None
-
-
-def get_user_by_id(user_id: int) -> Optional[User]:
-    """
-    Get user by ID
-    
-    Args:
-        user_id: User ID
-        
-    Returns:
-        User object or None if not found
-    """
-    try:
-        result = execute_query(
-            """
-            SELECT id, email, full_name, is_active, is_admin, created_at
-            FROM users
-            WHERE id = %s
-            """,
-            (user_id,),
-            fetch='one'
-        )
-        
-        if result:
-            return User(**result)
-        return None
-        
-    except Exception as e:
-        logger.error(f"Error getting user by ID: {e}", exc_info=True)
-        return None
-
-
-def authenticate_user(email: str, password: str) -> Optional[User]:
-    """
-    Authenticate user with email and password
-    
-    Args:
-        email: User email
-        password: Plain text password
-        
-    Returns:
-        User object if authenticated, None otherwise
-    """
-    try:
-        result = execute_query(
-            """
-            SELECT id, email, password_hash, full_name, is_active, is_admin, created_at
-            FROM users
-            WHERE email = %s
-            """,
-            (email.lower(),),
-            fetch='one'
-        )
-        
-        if not result:
-            logger.warning(f"User not found: {email}")
-            return None
-        
-        if not result['is_active']:
-            logger.warning(f"Inactive user attempted login: {email}")
-            return None
-        
-        if not verify_password(password, result['password_hash']):
-            logger.warning(f"Invalid password for user: {email}")
-            return None
-        
-        # Remove password_hash from result
-        user_data = {k: v for k, v in result.items() if k != 'password_hash'}
-        return User(**user_data)
-        
-    except Exception as e:
-        logger.error(f"Error authenticating user: {e}", exc_info=True)
-        return None
-
-
-def create_user(user_data: UserCreate) -> Optional[User]:
-    """
-    Create a new user
-    
-    Args:
-        user_data: User creation data
-        
-    Returns:
-        Created User object or None on error
-    """
-    try:
-        # Check if user already exists
-        existing_user = get_user_by_email(user_data.email)
-        if existing_user:
-            logger.warning(f"User already exists: {user_data.email}")
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Email already registered"
-            )
-        
-        # Hash password
-        password_hash = hash_password(user_data.password)
-        
-        # Insert user
-        result = execute_query(
-            """
-            INSERT INTO users (email, password_hash, full_name, is_active, is_admin)
-            VALUES (%s, %s, %s, TRUE, FALSE)
-            RETURNING id, email, full_name, is_active, is_admin, created_at
-            """,
-            (user_data.email.lower(), password_hash, user_data.full_name),
-            fetch='one'
-        )
-        
-        if result:
-            logger.info(f"Created new user: {user_data.email}")
-            return User(**result)
-        return None
-        
-    except HTTPException:
+        logger.error(f"❌ Startup failed: {e}", exc_info=True)
         raise
-    except Exception as e:
-        logger.error(f"Error creating user: {e}", exc_info=True)
-        return None
-
-
-# ============================================================================
-# DEPENDENCY FUNCTIONS
-# ============================================================================
-
-async def get_current_user(
-    token: str = Depends(oauth2_scheme)
-) -> User:
-    """
-    FastAPI dependency to get current authenticated user from JWT token
     
-    Args:
-        token: JWT token from Authorization header
-        
-    Returns:
-        Current User object
-        
-    Raises:
-        HTTPException: If authentication fails
-    """
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Could not validate credentials",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
+    yield
+    
+    # Shutdown
+    logger.info("🛑 Shutting down YouTube Optimizer API...")
     
     try:
-        payload = decode_token(token)
-        user_id: str = payload.get("sub")
-        
-        if user_id is None:
-            raise credentials_exception
-        
-        token_type = payload.get("type")
-        if token_type != "access":
-            raise credentials_exception
-            
-    except JWTError:
-        raise credentials_exception
+        cleanup_database()
+        logger.info("✅ Database cleanup complete")
+    except Exception as e:
+        logger.error(f"❌ Shutdown error: {e}", exc_info=True)
     
-    user = get_user_by_id(int(user_id))
-    if user is None:
-        raise credentials_exception
-    
-    if not user.is_active:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Inactive user"
-        )
-    
-    return user
-
-
-async def get_current_active_user(
-    current_user: User = Depends(get_current_user)
-) -> User:
-    """
-    Get current active user
-    
-    Args:
-        current_user: Current user from get_current_user dependency
-        
-    Returns:
-        Active User object
-        
-    Raises:
-        HTTPException: If user is inactive
-    """
-    if not current_user.is_active:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Inactive user"
-        )
-    return current_user
-
-
-async def get_current_admin_user(
-    current_user: User = Depends(get_current_user)
-) -> User:
-    """
-    Get current admin user
-    
-    Args:
-        current_user: Current user from get_current_user dependency
-        
-    Returns:
-        Admin User object
-        
-    Raises:
-        HTTPException: If user is not admin
-    """
-    if not current_user.is_admin:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Admin access required"
-        )
-    return current_user
-
-
-def require_permissions(required_scopes: List[str]):
-    """
-    Dependency factory for permission checking
-    
-    Args:
-        required_scopes: List of required permission scopes
-        
-    Returns:
-        Dependency function that checks permissions
-    """
-    async def permission_checker(
-        current_user: User = Depends(get_current_user)
-    ) -> User:
-        # For now, just check if user is active
-        # In future, implement granular permissions
-        if not current_user.is_active:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Insufficient permissions"
-            )
-        return current_user
-    
-    return permission_checker
+    logger.info("✅ Application shutdown complete")
 
 
 # ============================================================================
-# TOKEN OPERATIONS
+# APPLICATION INSTANCE
 # ============================================================================
 
-def login(email: str, password: str) -> Optional[Token]:
-    """
-    Login user and create tokens
-    
-    Args:
-        email: User email
-        password: User password
-        
-    Returns:
-        Token object with access and refresh tokens
-    """
-    user = authenticate_user(email, password)
-    if not user:
-        return None
-    
-    # Create tokens
-    access_token = create_access_token(
-        data={"sub": str(user.id), "email": user.email}
-    )
-    refresh_token = create_refresh_token(user.id)
-    
-    # Log successful login
-    logger.info(f"User logged in: {user.email}")
-    
-    return Token(
-        access_token=access_token,
-        refresh_token=refresh_token,
-        expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60  # seconds
+app = FastAPI(
+    title="YouTube Video Optimizer API",
+    description="AI-powered YouTube video optimization platform",
+    version="1.0.0",
+    docs_url="/docs" if settings.environment != "production" else None,
+    redoc_url="/redoc" if settings.environment != "production" else None,
+    lifespan=lifespan,
+    openapi_url="/openapi.json" if settings.environment != "production" else None
+)
+
+
+# ============================================================================
+# MIDDLEWARE
+# ============================================================================
+
+# CORS Middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.allowed_origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
+    allow_headers=["*"],
+    expose_headers=["X-Request-ID", "X-Response-Time"],
+)
+
+# Compression
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+# Trusted Host (security)
+if settings.environment == "production":
+    app.add_middleware(
+        TrustedHostMiddleware,
+        allowed_hosts=settings.allowed_hosts
     )
 
 
-def refresh_access_token(refresh_token: str) -> Optional[str]:
+# Request logging and timing middleware
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
     """
-    Create new access token from refresh token
+    Log all requests with timing information
+    """
+    start_time = time.time()
     
-    Args:
-        refresh_token: Refresh token
-        
-    Returns:
-        New access token or None if invalid
-    """
+    # Generate request ID
+    request_id = str(time.time_ns())
+    
+    # Log request
+    logger.info(
+        f"Request started: {request.method} {request.url.path} "
+        f"[ID: {request_id}]"
+    )
+    
+    # Process request
     try:
-        payload = decode_token(refresh_token)
+        response = await call_next(request)
         
-        # Verify it's a refresh token
-        if payload.get("type") != "refresh":
-            logger.warning("Invalid token type for refresh")
-            return None
+        # Calculate processing time
+        process_time = time.time() - start_time
         
-        user_id = int(payload.get("sub"))
-        user = get_user_by_id(user_id)
+        # Add custom headers
+        response.headers["X-Request-ID"] = request_id
+        response.headers["X-Response-Time"] = f"{process_time:.4f}s"
         
-        if not user or not user.is_active:
-            logger.warning(f"Cannot refresh token for inactive user: {user_id}")
-            return None
-        
-        # Create new access token
-        access_token = create_access_token(
-            data={"sub": str(user.id), "email": user.email}
+        # Log response
+        logger.info(
+            f"Request completed: {request.method} {request.url.path} "
+            f"[ID: {request_id}] "
+            f"Status: {response.status_code} "
+            f"Time: {process_time:.4f}s"
         )
         
-        return access_token
+        return response
         
     except Exception as e:
-        logger.error(f"Error refreshing access token: {e}", exc_info=True)
-        return None
+        process_time = time.time() - start_time
+        logger.error(
+            f"Request failed: {request.method} {request.url.path} "
+            f"[ID: {request_id}] "
+            f"Error: {str(e)} "
+            f"Time: {process_time:.4f}s",
+            exc_info=True
+        )
+        raise
+
+
+# Security headers middleware
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    """
+    Add security headers to all responses
+    """
+    response = await call_next(request)
+    
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    
+    if settings.environment == "production":
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; "
+            "script-src 'self' 'unsafe-inline'; "
+            "style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data: https:; "
+            "font-src 'self' data:; "
+            "connect-src 'self'"
+        )
+    
+    return response
 
 
 # ============================================================================
-# API KEY MANAGEMENT (for service-to-service auth)
+# EXCEPTION HANDLERS
 # ============================================================================
 
-def generate_api_key() -> str:
-    """Generate a secure API key"""
-    return secrets.token_urlsafe(32)
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """
+    Handle request validation errors with detailed error messages
+    """
+    errors = []
+    for error in exc.errors():
+        errors.append({
+            "field": " -> ".join(str(loc) for loc in error["loc"]),
+            "message": error["msg"],
+            "type": error["type"]
+        })
+    
+    logger.warning(
+        f"Validation error on {request.method} {request.url.path}: {errors}"
+    )
+    
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={
+            "detail": "Request validation failed",
+            "errors": errors
+        }
+    )
 
 
-def hash_api_key(api_key: str) -> str:
-    """Hash an API key for storage"""
-    return hashlib.sha256(api_key.encode()).hexdigest()
+@app.exception_handler(Exception)
+async def generic_exception_handler(request: Request, exc: Exception):
+    """
+    Handle all unhandled exceptions
+    """
+    logger.error(
+        f"Unhandled exception on {request.method} {request.url.path}: {exc}",
+        exc_info=True
+    )
+    
+    if settings.environment == "production":
+        # Don't expose internal errors in production
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={
+                "detail": "An internal error occurred. Please try again later."
+            }
+        )
+    else:
+        # Show detailed errors in development
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={
+                "detail": str(exc),
+                "type": type(exc).__name__
+            }
+        )
 
 
 # ============================================================================
-# EXPORTS
+# ROUTES
 # ============================================================================
 
-__all__ = [
-    'User',
-    'UserCreate',
-    'Token',
-    'TokenData',
-    'hash_password',
-    'verify_password',
-    'create_access_token',
-    'create_refresh_token',
-    'decode_token',
-    'get_user_by_email',
-    'get_user_by_id',
-    'authenticate_user',
-    'create_user',
-    'get_current_user',
-    'get_current_active_user',
-    'get_current_admin_user',
-    'require_permissions',
-    'login',
-    'refresh_access_token',
-    'generate_api_key',
-    'hash_api_key',
-]
+# Health check routes (no auth required)
+app.include_router(
+    health_routes.router,
+    tags=["Health"]
+)
+
+# Authentication routes
+app.include_router(
+    auth_routes.router,
+    prefix="/api/v1/auth",
+    tags=["Authentication"]
+)
+
+# Video optimization routes
+app.include_router(
+    video_routes.router,
+    prefix="/api/v1/videos",
+    tags=["Videos"]
+)
+
+# Channel management routes
+app.include_router(
+    channel_routes.router,
+    prefix="/api/v1/channels",
+    tags=["Channels"]
+)
+
+# Analytics routes
+app.include_router(
+    analytics_routes.router,
+    prefix="/api/v1/analytics",
+    tags=["Analytics"]
+)
+
+# Scheduler routes
+app.include_router(
+    scheduler_routes.router,
+    prefix="/api/v1/scheduler",
+    tags=["Scheduler"]
+)
+
+
+# ============================================================================
+# ROOT ENDPOINTS
+# ============================================================================
+
+@app.get("/")
+async def root() -> Dict[str, str]:
+    """
+    Root endpoint - API information
+    """
+    return {
+        "name": "YouTube Video Optimizer API",
+        "version": "1.0.0",
+        "status": "operational",
+        "docs": "/docs" if settings.environment != "production" else "disabled",
+        "health": "/health"
+    }
+
+
+@app.get("/info")
+async def info() -> Dict[str, Any]:
+    """
+    Get API information and configuration
+    """
+    return {
+        "name": "YouTube Video Optimizer API",
+        "version": "1.0.0",
+        "environment": settings.environment,
+        "features": {
+            "video_optimization": True,
+            "channel_optimization": True,
+            "analytics": True,
+            "scheduling": True,
+            "thumbnail_generation": True
+        },
+        "limits": {
+            "max_upload_size_mb": 100,
+            "max_videos_per_batch": 100,
+            "rate_limit_per_minute": 60
+        }
+    }
+
+
+# ============================================================================
+# APPLICATION ENTRY POINT
+# ============================================================================
+
+if __name__ == "__main__":
+    import uvicorn
+    
+    # Development server configuration
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True if settings.environment != "production" else False,
+        log_level="info",
+        access_log=True
+    )
