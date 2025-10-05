@@ -1,307 +1,254 @@
 # utils/db.py
 """
 Production-Ready Database Utilities
-===================================
-Provides connection pooling, transaction management, retry logic,
-and comprehensive error handling for PostgreSQL database operations.
+Provides connection pooling, transaction management, and error handling
 """
 
 import psycopg2
 from psycopg2 import pool, extras, sql
-from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT, ISOLATION_LEVEL_READ_COMMITTED
+from psycopg2.extensions import ISOLATION_LEVEL_READ_COMMITTED
+from typing import Optional, Dict, List, Any, Callable
 from contextlib import contextmanager
-from typing import Optional, Dict, Any, List, Tuple, Callable
 import logging
-import time
 from functools import wraps
-import threading
+import time
+
+from config import settings
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
 
 logger = logging.getLogger(__name__)
 
+# Connection pool configuration
+MIN_CONNECTIONS = 2
+MAX_CONNECTIONS = 20
+CONNECTION_TIMEOUT = 30  # seconds
+QUERY_TIMEOUT = 60  # seconds
+
 # Global connection pool
 _connection_pool: Optional[pool.ThreadedConnectionPool] = None
-_pool_lock = threading.Lock()
-_pool_config: Dict[str, Any] = {}
 
 
-class DatabaseError(Exception):
-    """Base exception for database errors."""
-    pass
+# ============================================================================
+# CONNECTION POOL MANAGEMENT
+# ============================================================================
 
-
-class ConnectionPoolExhausted(DatabaseError):
-    """Raised when connection pool is exhausted."""
-    pass
-
-
-class TransactionError(DatabaseError):
-    """Raised when transaction operations fail."""
-    pass
-
-
-class QueryTimeoutError(DatabaseError):
-    """Raised when query execution times out."""
-    pass
-
-
-def init_db_pool(
-    host: str = "localhost",
-    port: int = 5432,
-    database: str = "youtube_optimizer",
-    user: str = "postgres",
-    password: str = "",
-    min_connections: int = 2,
-    max_connections: int = 10,
-    pool_size: int = 10,
-    max_overflow: int = 20,
-    pool_timeout: int = 30,
-    **kwargs
-) -> None:
+def initialize_connection_pool():
     """
-    Initialize the database connection pool.
+    Initialize the database connection pool
     
-    Args:
-        host: Database host
-        port: Database port
-        database: Database name
-        user: Database user
-        password: Database password
-        min_connections: Minimum number of connections in pool
-        max_connections: Maximum number of connections in pool
-        pool_size: Alias for max_connections
-        max_overflow: Additional connections beyond pool_size
-        pool_timeout: Connection timeout in seconds
-        **kwargs: Additional connection parameters
+    Should be called once at application startup
     """
-    global _connection_pool, _pool_config
-    
-    with _pool_lock:
-        if _connection_pool is not None:
-            logger.warning("Connection pool already exists. Closing existing pool.")
-            close_db_pool()
-        
-        try:
-            # Calculate actual pool size
-            actual_max = max_connections or (pool_size + max_overflow)
-            actual_min = min(min_connections, actual_max)
-            
-            # Store configuration for reconnection
-            _pool_config = {
-                'host': host,
-                'port': port,
-                'database': database,
-                'user': user,
-                'password': password,
-                'minconn': actual_min,
-                'maxconn': actual_max,
-                'connect_timeout': pool_timeout,
-                'options': kwargs.get('options', '-c statement_timeout=30000'),  # 30s default timeout
-            }
-            
-            # Add any additional kwargs
-            for key, value in kwargs.items():
-                if key not in _pool_config:
-                    _pool_config[key] = value
-            
-            # Create connection pool
-            _connection_pool = pool.ThreadedConnectionPool(**_pool_config)
-            
-            logger.info(
-                f"Database connection pool initialized: "
-                f"{actual_min}-{actual_max} connections to "
-                f"{host}:{port}/{database}"
-            )
-            
-        except Exception as e:
-            logger.error(f"Failed to initialize database pool: {e}", exc_info=True)
-            raise DatabaseError(f"Database pool initialization failed: {e}")
-
-
-def close_db_pool() -> None:
-    """Close all connections in the pool."""
     global _connection_pool
     
-    with _pool_lock:
-        if _connection_pool is not None:
-            try:
-                _connection_pool.closeall()
-                logger.info("Database connection pool closed")
-            except Exception as e:
-                logger.error(f"Error closing connection pool: {e}")
-            finally:
-                _connection_pool = None
-
-
-def get_connection(timeout: int = 10):
-    """
-    Get a connection from the pool with timeout and retry logic.
+    if _connection_pool is not None:
+        logger.warning("Connection pool already initialized")
+        return
     
-    Args:
-        timeout: Maximum time to wait for a connection
+    try:
+        _connection_pool = pool.ThreadedConnectionPool(
+            MIN_CONNECTIONS,
+            MAX_CONNECTIONS,
+            host=settings.database_host,
+            port=settings.database_port,
+            database=settings.database_name,
+            user=settings.database_user,
+            password=settings.database_password.get_secret_value(),
+            connect_timeout=CONNECTION_TIMEOUT,
+            options=f'-c statement_timeout={QUERY_TIMEOUT * 1000}'  # milliseconds
+        )
         
-    Returns:
-        psycopg2 connection object
+        logger.info(
+            f"Database connection pool initialized: "
+            f"{MIN_CONNECTIONS}-{MAX_CONNECTIONS} connections"
+        )
         
-    Raises:
-        ConnectionPoolExhausted: If no connection available within timeout
-        DatabaseError: If connection pool not initialized
+        # Test connection
+        test_conn = _connection_pool.getconn()
+        try:
+            with test_conn.cursor() as cursor:
+                cursor.execute("SELECT 1")
+            logger.info("Database connection test successful")
+        finally:
+            _connection_pool.putconn(test_conn)
+            
+    except Exception as e:
+        logger.error(f"Failed to initialize connection pool: {e}", exc_info=True)
+        raise
+
+
+def close_connection_pool():
+    """
+    Close all connections in the pool
+    
+    Should be called at application shutdown
     """
     global _connection_pool
     
     if _connection_pool is None:
-        raise DatabaseError("Database connection pool not initialized. Call init_db_pool() first.")
+        logger.warning("Connection pool not initialized")
+        return
     
-    start_time = time.time()
-    retry_count = 0
-    max_retries = 3
-    
-    while time.time() - start_time < timeout:
-        try:
-            conn = _connection_pool.getconn()
-            
-            if conn is None:
-                raise ConnectionPoolExhausted("No connection available in pool")
-            
-            # Verify connection is alive
-            try:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT 1")
-                return conn
-            except (psycopg2.OperationalError, psycopg2.InterfaceError):
-                # Connection is dead, return to pool and retry
-                logger.warning(f"Dead connection detected, reconnecting...")
-                _connection_pool.putconn(conn, close=True)
-                retry_count += 1
-                
-                if retry_count >= max_retries:
-                    raise DatabaseError("Failed to get valid connection after retries")
-                
-                time.sleep(0.1 * retry_count)  # Exponential backoff
-                continue
-                
-        except pool.PoolError as e:
-            logger.warning(f"Pool error getting connection: {e}")
-            time.sleep(0.1)
-            continue
-    
-    raise ConnectionPoolExhausted(f"Could not get connection within {timeout} seconds")
+    try:
+        _connection_pool.closeall()
+        _connection_pool = None
+        logger.info("Database connection pool closed")
+    except Exception as e:
+        logger.error(f"Error closing connection pool: {e}", exc_info=True)
 
 
-def return_connection(conn, close: bool = False) -> None:
+def get_connection():
     """
-    Return a connection to the pool.
+    Get a connection from the pool
     
-    Args:
-        conn: Connection to return
-        close: If True, close the connection instead of returning to pool
+    Returns:
+        Database connection
+        
+    Raises:
+        RuntimeError: If pool not initialized
+        psycopg2.Error: On connection failure
     """
     global _connection_pool
     
-    if _connection_pool is not None and conn is not None:
-        try:
-            _connection_pool.putconn(conn, close=close)
-        except Exception as e:
-            logger.error(f"Error returning connection to pool: {e}")
+    if _connection_pool is None:
+        raise RuntimeError(
+            "Connection pool not initialized. "
+            "Call initialize_connection_pool() first."
+        )
+    
+    try:
+        conn = _connection_pool.getconn()
+        conn.set_isolation_level(ISOLATION_LEVEL_READ_COMMITTED)
+        return conn
+    except Exception as e:
+        logger.error(f"Error getting connection from pool: {e}", exc_info=True)
+        raise
+
+
+def return_connection(conn):
+    """
+    Return a connection to the pool
+    
+    Args:
+        conn: Connection to return
+    """
+    global _connection_pool
+    
+    if _connection_pool is None:
+        logger.warning("Cannot return connection - pool not initialized")
+        return
+    
+    try:
+        _connection_pool.putconn(conn)
+    except Exception as e:
+        logger.error(f"Error returning connection to pool: {e}", exc_info=True)
 
 
 @contextmanager
-def get_db_connection(auto_commit: bool = False, timeout: int = 10):
+def get_db_connection():
     """
-    Context manager for database connections with automatic cleanup.
+    Context manager for database connections
     
-    Args:
-        auto_commit: If True, set isolation level to autocommit
-        timeout: Connection timeout in seconds
-        
-    Yields:
-        Database connection
-        
-    Example:
+    Automatically returns connection to pool when done
+    
+    Usage:
         with get_db_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT * FROM users")
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT * FROM users")
     """
     conn = None
     try:
-        conn = get_connection(timeout=timeout)
-        
-        if auto_commit:
-            conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
-        else:
-            conn.set_isolation_level(ISOLATION_LEVEL_READ_COMMITTED)
-        
+        conn = get_connection()
         yield conn
-        
     except Exception as e:
-        if conn is not None:
-            try:
-                conn.rollback()
-            except:
-                pass
-        logger.error(f"Database operation failed: {e}", exc_info=True)
+        if conn:
+            conn.rollback()
+        logger.error(f"Database error in context manager: {e}", exc_info=True)
         raise
-        
     finally:
-        if conn is not None:
+        if conn:
             return_connection(conn)
 
 
 @contextmanager
-def transaction(conn=None, auto_close: bool = True):
+def get_db_cursor(commit: bool = False):
     """
-    Context manager for database transactions with automatic rollback.
+    Context manager for database cursor
     
     Args:
-        conn: Optional existing connection, creates new if None
-        auto_close: If True, return connection to pool after transaction
+        commit: Whether to commit transaction on success
         
-    Yields:
-        Database connection
-        
-    Example:
-        with transaction() as conn:
-            with conn.cursor() as cur:
-                cur.execute("INSERT INTO users VALUES (%s)", (user_id,))
-                cur.execute("UPDATE stats SET count = count + 1")
-            # Automatically commits if no exception
+    Usage:
+        with get_db_cursor(commit=True) as cursor:
+            cursor.execute("INSERT INTO users ...")
     """
-    new_conn = False
-    if conn is None:
-        conn = get_connection()
-        new_conn = True
-    
+    conn = None
+    cursor = None
     try:
-        yield conn
-        conn.commit()
-        logger.debug("Transaction committed successfully")
+        conn = get_connection()
+        cursor = conn.cursor(cursor_factory=extras.RealDictCursor)
+        yield cursor
         
+        if commit:
+            conn.commit()
+            
     except Exception as e:
-        conn.rollback()
-        logger.error(f"Transaction rolled back due to error: {e}", exc_info=True)
-        raise TransactionError(f"Transaction failed: {e}")
-        
+        if conn:
+            conn.rollback()
+        logger.error(f"Error in cursor context manager: {e}", exc_info=True)
+        raise
     finally:
-        if new_conn and auto_close:
+        if cursor:
+            cursor.close()
+        if conn:
             return_connection(conn)
 
 
-def retry_on_db_error(max_retries: int = 3, backoff_factor: float = 0.5):
+# ============================================================================
+# TRANSACTION MANAGEMENT
+# ============================================================================
+
+@contextmanager
+def transaction():
     """
-    Decorator to retry database operations on transient errors.
+    Context manager for database transactions
+    
+    Automatically commits on success, rollsback on error
+    
+    Usage:
+        with transaction() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("INSERT ...")
+                cursor.execute("UPDATE ...")
+        # Auto-commits here if no exceptions
+    """
+    conn = None
+    try:
+        conn = get_connection()
+        yield conn
+        conn.commit()
+        logger.debug("Transaction committed successfully")
+    except Exception as e:
+        if conn:
+            conn.rollback()
+            logger.warning(f"Transaction rolled back due to error: {e}")
+        raise
+    finally:
+        if conn:
+            return_connection(conn)
+
+
+def retry_on_deadlock(max_retries: int = 3, delay: float = 0.1):
+    """
+    Decorator to retry database operations on deadlock
     
     Args:
         max_retries: Maximum number of retry attempts
-        backoff_factor: Multiplier for exponential backoff
-        
-    Example:
-        @retry_on_db_error(max_retries=3)
-        def get_user(user_id):
-            with get_db_connection() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT * FROM users WHERE id = %s", (user_id,))
-                    return cur.fetchone()
+        delay: Delay between retries (seconds)
     """
-    def decorator(func: Callable) -> Callable:
+    def decorator(func: Callable):
         @wraps(func)
         def wrapper(*args, **kwargs):
             last_exception = None
@@ -309,231 +256,305 @@ def retry_on_db_error(max_retries: int = 3, backoff_factor: float = 0.5):
             for attempt in range(max_retries):
                 try:
                     return func(*args, **kwargs)
-                    
-                except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+                except psycopg2.extensions.TransactionRollbackError as e:
                     last_exception = e
                     if attempt < max_retries - 1:
-                        wait_time = backoff_factor * (2 ** attempt)
                         logger.warning(
-                            f"Database error on attempt {attempt + 1}/{max_retries}, "
-                            f"retrying in {wait_time}s: {e}"
+                            f"Deadlock detected in {func.__name__}, "
+                            f"retry {attempt + 1}/{max_retries}"
                         )
-                        time.sleep(wait_time)
+                        time.sleep(delay * (attempt + 1))
                     else:
-                        logger.error(f"Max retries ({max_retries}) exceeded for {func.__name__}")
-                        
-                except Exception as e:
-                    # Don't retry on non-transient errors
-                    logger.error(f"Non-retryable error in {func.__name__}: {e}")
-                    raise
+                        logger.error(
+                            f"Max retries exceeded for {func.__name__} "
+                            f"after {max_retries} attempts"
+                        )
             
-            raise DatabaseError(f"Operation failed after {max_retries} retries: {last_exception}")
+            raise last_exception
         
         return wrapper
     return decorator
 
 
-def test_db_connection() -> bool:
-    """
-    Test database connectivity.
-    
-    Returns:
-        True if connection successful, False otherwise
-    """
-    try:
-        with get_db_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT 1")
-                result = cur.fetchone()
-                return result is not None and result[0] == 1
-    except Exception as e:
-        logger.error(f"Database connection test failed: {e}")
-        return False
-
+# ============================================================================
+# QUERY HELPERS
+# ============================================================================
 
 def execute_query(
     query: str,
-    params: Optional[Tuple] = None,
-    fetch: str = "none",
-    timeout: int = 30
-) -> Any:
+    params: tuple = None,
+    fetch: str = None
+) -> Optional[Any]:
     """
-    Execute a database query with proper error handling.
+    Execute a database query with automatic connection management
     
     Args:
-        query: SQL query to execute
-        params: Query parameters
-        fetch: 'one', 'all', 'none' - how to fetch results
-        timeout: Query timeout in seconds
+        query: SQL query string
+        params: Query parameters tuple
+        fetch: Fetch mode ('one', 'all', or None for no fetch)
         
     Returns:
-        Query results based on fetch parameter
-        
-    Example:
-        result = execute_query(
-            "SELECT * FROM users WHERE id = %s",
-            params=(user_id,),
-            fetch='one'
-        )
+        Query results based on fetch mode, or None
     """
-    with get_db_connection() as conn:
-        with conn.cursor(cursor_factory=extras.RealDictCursor) as cur:
-            try:
-                # Set statement timeout
-                cur.execute(f"SET statement_timeout = {timeout * 1000}")
+    conn = None
+    try:
+        conn = get_connection()
+        with conn.cursor(cursor_factory=extras.RealDictCursor) as cursor:
+            cursor.execute(query, params or ())
+            
+            if fetch == 'one':
+                return cursor.fetchone()
+            elif fetch == 'all':
+                return cursor.fetchall()
+            elif fetch is None:
+                conn.commit()
+                return None
+            else:
+                raise ValueError(f"Invalid fetch mode: {fetch}")
                 
-                # Execute query
-                cur.execute(query, params)
-                
-                # Fetch results
-                if fetch == 'one':
-                    return cur.fetchone()
-                elif fetch == 'all':
-                    return cur.fetchall()
-                else:
-                    return None
-                    
-            except psycopg2.extensions.QueryCanceledError:
-                raise QueryTimeoutError(f"Query exceeded timeout of {timeout}s")
+    except Exception as e:
+        logger.error(f"Error executing query: {e}", exc_info=True)
+        if conn:
+            conn.rollback()
+        raise
+    finally:
+        if conn:
+            return_connection(conn)
 
 
 def bulk_insert(
     table: str,
     columns: List[str],
-    values: List[Tuple],
-    batch_size: int = 1000
+    values: List[tuple],
+    on_conflict: Optional[str] = None
 ) -> int:
     """
-    Perform bulk insert with batching.
+    Perform bulk insert operation
     
     Args:
         table: Table name
-        columns: Column names
+        columns: List of column names
         values: List of value tuples
-        batch_size: Number of rows per batch
+        on_conflict: Optional ON CONFLICT clause
         
     Returns:
         Number of rows inserted
-        
-    Example:
-        rows_inserted = bulk_insert(
-            'users',
-            ['id', 'name', 'email'],
-            [(1, 'John', 'john@example.com'), (2, 'Jane', 'jane@example.com')]
-        )
     """
     if not values:
         return 0
     
-    total_inserted = 0
-    
-    with transaction() as conn:
-        with conn.cursor() as cur:
-            for i in range(0, len(values), batch_size):
-                batch = values[i:i + batch_size]
-                
-                # Build insert query
-                columns_str = ', '.join(columns)
-                placeholders = ', '.join(['%s'] * len(columns))
-                query = f"INSERT INTO {table} ({columns_str}) VALUES ({placeholders})"
-                
-                # Execute batch
-                extras.execute_batch(cur, query, batch)
-                total_inserted += len(batch)
-                
-                logger.debug(f"Inserted batch {i//batch_size + 1}: {len(batch)} rows")
-    
-    logger.info(f"Bulk insert completed: {total_inserted} rows inserted into {table}")
-    return total_inserted
+    conn = None
+    try:
+        conn = get_connection()
+        with conn.cursor() as cursor:
+            # Build query
+            cols_sql = sql.SQL(', ').join(map(sql.Identifier, columns))
+            placeholders = sql.SQL(', ').join(
+                sql.SQL('({})').format(
+                    sql.SQL(', ').join(sql.Placeholder() for _ in columns)
+                )
+                for _ in range(len(values))
+            )
+            
+            query = sql.SQL(
+                "INSERT INTO {table} ({columns}) VALUES {placeholders}"
+            ).format(
+                table=sql.Identifier(table),
+                columns=cols_sql,
+                placeholders=placeholders
+            )
+            
+            if on_conflict:
+                query = sql.SQL("{query} {conflict}").format(
+                    query=query,
+                    conflict=sql.SQL(on_conflict)
+                )
+            
+            # Flatten values for execute
+            flat_values = [item for sublist in values for item in sublist]
+            
+            cursor.execute(query, flat_values)
+            rows_inserted = cursor.rowcount
+            conn.commit()
+            
+            logger.debug(f"Bulk inserted {rows_inserted} rows into {table}")
+            return rows_inserted
+            
+    except Exception as e:
+        logger.error(f"Error in bulk insert: {e}", exc_info=True)
+        if conn:
+            conn.rollback()
+        raise
+    finally:
+        if conn:
+            return_connection(conn)
 
 
-def get_table_info(table_name: str) -> Dict[str, Any]:
+def upsert(
+    table: str,
+    data: Dict[str, Any],
+    conflict_columns: List[str],
+    update_columns: Optional[List[str]] = None
+) -> bool:
     """
-    Get information about a table.
+    Insert or update record (UPSERT)
     
     Args:
-        table_name: Name of the table
+        table: Table name
+        data: Dict of column: value pairs
+        conflict_columns: Columns to check for conflicts
+        update_columns: Columns to update on conflict (defaults to all)
         
     Returns:
-        Dictionary with table information
+        True if successful
     """
-    query = """
-        SELECT 
-            column_name,
-            data_type,
-            is_nullable,
-            column_default
-        FROM information_schema.columns
-        WHERE table_name = %s
-        ORDER BY ordinal_position
-    """
+    if update_columns is None:
+        update_columns = [k for k in data.keys() if k not in conflict_columns]
     
-    columns = execute_query(query, params=(table_name,), fetch='all')
-    
-    return {
-        'table_name': table_name,
-        'columns': [dict(col) for col in columns] if columns else []
-    }
+    conn = None
+    try:
+        conn = get_connection()
+        with conn.cursor() as cursor:
+            # Build column and value lists
+            columns = list(data.keys())
+            values = [data[col] for col in columns]
+            
+            # Build SQL
+            cols_sql = sql.SQL(', ').join(map(sql.Identifier, columns))
+            vals_sql = sql.SQL(', ').join(sql.Placeholder() for _ in columns)
+            
+            conflict_sql = sql.SQL(', ').join(
+                map(sql.Identifier, conflict_columns)
+            )
+            
+            update_sql = sql.SQL(', ').join(
+                sql.SQL("{col} = EXCLUDED.{col}").format(
+                    col=sql.Identifier(col)
+                )
+                for col in update_columns
+            )
+            
+            query = sql.SQL(
+                "INSERT INTO {table} ({columns}) "
+                "VALUES ({values}) "
+                "ON CONFLICT ({conflict}) "
+                "DO UPDATE SET {updates}"
+            ).format(
+                table=sql.Identifier(table),
+                columns=cols_sql,
+                values=vals_sql,
+                conflict=conflict_sql,
+                updates=update_sql
+            )
+            
+            cursor.execute(query, values)
+            conn.commit()
+            
+            logger.debug(f"Upserted record in {table}")
+            return True
+            
+    except Exception as e:
+        logger.error(f"Error in upsert: {e}", exc_info=True)
+        if conn:
+            conn.rollback()
+        raise
+    finally:
+        if conn:
+            return_connection(conn)
 
 
-def get_pool_status() -> Dict[str, Any]:
+# ============================================================================
+# HEALTH CHECK
+# ============================================================================
+
+def check_database_health() -> Dict[str, Any]:
     """
-    Get current connection pool status.
+    Check database health and connection pool status
     
     Returns:
-        Dictionary with pool statistics
+        Dict with health status information
     """
     global _connection_pool
     
-    if _connection_pool is None:
-        return {'status': 'not_initialized'}
-    
-    try:
-        # Try to get pool stats (these methods may not be available in all versions)
-        return {
-            'status': 'active',
-            'minconn': _pool_config.get('minconn', 0),
-            'maxconn': _pool_config.get('maxconn', 0),
-            'host': _pool_config.get('host', 'unknown'),
-            'database': _pool_config.get('database', 'unknown')
-        }
-    except Exception as e:
-        logger.error(f"Error getting pool status: {e}")
-        return {'status': 'error', 'message': str(e)}
-
-
-# Health check function
-def health_check() -> Dict[str, Any]:
-    """
-    Comprehensive database health check.
-    
-    Returns:
-        Dictionary with health status
-    """
     health = {
         'healthy': False,
-        'pool_status': 'unknown',
-        'connection_test': False,
+        'pool_initialized': _connection_pool is not None,
+        'can_connect': False,
         'response_time_ms': None,
         'error': None
     }
     
+    if _connection_pool is None:
+        health['error'] = "Connection pool not initialized"
+        return health
+    
+    conn = None
     try:
-        # Check pool status
-        pool_status = get_pool_status()
-        health['pool_status'] = pool_status.get('status', 'unknown')
-        
-        # Test connection with timing
         start_time = time.time()
-        connection_ok = test_db_connection()
-        response_time = (time.time() - start_time) * 1000
+        conn = get_connection()
         
-        health['connection_test'] = connection_ok
-        health['response_time_ms'] = round(response_time, 2)
-        health['healthy'] = connection_ok and pool_status.get('status') == 'active'
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT 1")
+            cursor.fetchone()
+        
+        response_time = (time.time() - start_time) * 1000  # milliseconds
+        
+        health.update({
+            'healthy': True,
+            'can_connect': True,
+            'response_time_ms': round(response_time, 2)
+        })
         
     except Exception as e:
+        logger.error(f"Database health check failed: {e}")
         health['error'] = str(e)
-        logger.error(f"Health check failed: {e}")
+    finally:
+        if conn:
+            return_connection(conn)
     
     return health
+
+
+# ============================================================================
+# INITIALIZATION
+# ============================================================================
+
+def init_database():
+    """Initialize database connection pool (call at startup)"""
+    try:
+        initialize_connection_pool()
+        logger.info("Database initialized successfully")
+    except Exception as e:
+        logger.error(f"Failed to initialize database: {e}", exc_info=True)
+        raise
+
+
+def cleanup_database():
+    """Cleanup database resources (call at shutdown)"""
+    try:
+        close_connection_pool()
+        logger.info("Database cleanup completed")
+    except Exception as e:
+        logger.error(f"Error during database cleanup: {e}", exc_info=True)
+
+
+# ============================================================================
+# EXPORTS
+# ============================================================================
+
+__all__ = [
+    'get_connection',
+    'return_connection',
+    'get_db_connection',
+    'get_db_cursor',
+    'transaction',
+    'retry_on_deadlock',
+    'execute_query',
+    'bulk_insert',
+    'upsert',
+    'check_database_health',
+    'init_database',
+    'cleanup_database',
+    'initialize_connection_pool',
+    'close_connection_pool',
+]
