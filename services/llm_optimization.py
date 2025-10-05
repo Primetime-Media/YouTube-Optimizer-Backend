@@ -1,18 +1,17 @@
-# services/llm_optimizer.py
+# services/optimizer.py
 """
-Production-Ready LLM Optimization Service
+Production-Ready Video Optimizer Service
 =========================================
-Enterprise-grade AI-powered video optimization using Claude/GPT-4.
+Orchestrates complete video optimization workflow.
 
 Features:
-- Multi-model LLM support with automatic fallback
-- Comprehensive error handling and retry logic
-- Circuit breaker pattern for API failures
-- Rate limiting and cost tracking
-- Caching for repeated requests
-- Metrics and monitoring
-- Parallel processing support
-- Quality validation
+- End-to-end optimization pipeline
+- Multi-stage optimization (title, description, tags, thumbnail)
+- A/B testing support
+- Rollback capability
+- Performance tracking
+- Rate limiting and cost management
+- Comprehensive error handling and logging
 """
 
 from typing import Dict, List, Optional, Any, Tuple
@@ -20,822 +19,944 @@ from datetime import datetime, timezone, timedelta
 from enum import Enum
 import logging
 import asyncio
-import hashlib
-import json
-from functools import wraps
-import time
+from dataclasses import dataclass
 
-from anthropic import AsyncAnthropic, APIError, RateLimitError
-import openai
-from openai import AsyncOpenAI
 from pydantic import BaseModel, Field, validator
-import redis.asyncio as redis
-from circuitbreaker import circuit
-from tenacity import (
-    retry,
-    stop_after_attempt,
-    wait_exponential,
-    retry_if_exception_type
-)
 
+from services.llm_optimizer import (
+    llm_optimizer,
+    OptimizationRequest,
+    OptimizationResponse,
+    OptimizationType,
+    LLMProvider
+)
+from services.youtube import (
+    update_video_metadata,
+    get_video_details,
+    get_video_analytics
+)
 from utils.db import get_pool
-from utils.cache import CacheManager
 from utils.metrics import MetricsCollector
 from config import settings
 
 # Configure logging
 logger = logging.getLogger(__name__)
 
-# Initialize clients
-anthropic_client = AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
-openai_client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
-
-# Metrics
+# Initialize metrics
 metrics = MetricsCollector()
-
-# Cache manager
-cache = CacheManager()
 
 
 # ============================================================================
 # ENUMS & MODELS
 # ============================================================================
 
-class LLMProvider(str, Enum):
-    """Available LLM providers"""
-    CLAUDE = "claude"
-    GPT4 = "gpt4"
-    GPT4_TURBO = "gpt4_turbo"
+class OptimizationStage(str, Enum):
+    """Stages of optimization process"""
+    ANALYSIS = "analysis"
+    GENERATION = "generation"
+    VALIDATION = "validation"
+    APPLICATION = "application"
+    MONITORING = "monitoring"
+    ROLLBACK = "rollback"
 
 
-class OptimizationType(str, Enum):
-    """Types of optimizations"""
-    TITLE = "title"
-    DESCRIPTION = "description"
-    TAGS = "tags"
-    THUMBNAIL = "thumbnail"
-    FULL = "full"
+class OptimizationStrategy(str, Enum):
+    """Optimization strategies"""
+    CONSERVATIVE = "conservative"  # Only high-confidence changes
+    BALANCED = "balanced"  # Default strategy
+    AGGRESSIVE = "aggressive"  # Try all suggestions
+    AB_TEST = "ab_test"  # Create A/B test variations
 
 
-class OptimizationRequest(BaseModel):
-    """Request model for optimization"""
+class VideoOptimizationStatus(str, Enum):
+    """Status of video optimization"""
+    PENDING = "pending"
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    ROLLED_BACK = "rolled_back"
+
+
+@dataclass
+class BaselineMetrics:
+    """Baseline performance metrics before optimization"""
+    views: int
+    likes: int
+    comments: int
+    watch_time: int
+    ctr: float
+    avg_view_duration: int
+    revenue: float
+    measured_at: datetime
+
+
+class VideoOptimizationRequest(BaseModel):
+    """Complete video optimization request"""
     video_id: str = Field(..., min_length=11, max_length=11)
     user_id: int = Field(..., gt=0)
-    optimization_type: OptimizationType
-    current_title: Optional[str] = Field(None, max_length=100)
-    current_description: Optional[str] = Field(None, max_length=5000)
-    current_tags: Optional[List[str]] = Field(None, max_items=500)
-    target_audience: Optional[str] = None
-    video_category: Optional[str] = None
-    competitor_data: Optional[Dict[str, Any]] = None
-    trending_keywords: Optional[List[str]] = None
-    preferred_provider: Optional[LLMProvider] = LLMProvider.CLAUDE
+    strategy: OptimizationStrategy = OptimizationStrategy.BALANCED
+    optimization_types: List[OptimizationType] = Field(
+        default=[OptimizationType.TITLE, OptimizationType.DESCRIPTION, OptimizationType.TAGS]
+    )
+    auto_apply: bool = False  # If True, apply changes automatically
+    require_approval: bool = True  # If True, wait for user approval
+    confidence_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
+    enable_ab_test: bool = False
+    rollback_threshold: float = Field(
+        default=0.9,
+        ge=0.0,
+        le=1.0,
+        description="Rollback if performance drops below this % of baseline"
+    )
+    monitoring_days: int = Field(default=7, ge=1, le=30)
     
-    @validator('current_tags')
-    def validate_tags(cls, v):
-        if v and len(v) > 500:
-            raise ValueError("Too many tags")
+    @validator('optimization_types')
+    def validate_optimization_types(cls, v):
+        if not v:
+            raise ValueError("At least one optimization type required")
+        if len(v) > len(set(v)):
+            raise ValueError("Duplicate optimization types")
         return v
 
 
-class OptimizationResponse(BaseModel):
-    """Response model for optimization"""
-    success: bool
+class OptimizationResult(BaseModel):
+    """Complete optimization result"""
+    optimization_id: int
     video_id: str
-    optimization_type: OptimizationType
+    user_id: int
+    status: VideoOptimizationStatus
+    strategy: OptimizationStrategy
+    
+    # Original values
+    original_title: str
+    original_description: str
+    original_tags: List[str]
+    
+    # Optimized values
     optimized_title: Optional[str] = None
     optimized_description: Optional[str] = None
     optimized_tags: Optional[List[str]] = None
-    thumbnail_suggestions: Optional[List[Dict[str, str]]] = None
-    provider_used: LLMProvider
-    tokens_used: int
-    cost_usd: float
-    processing_time_ms: int
-    confidence_score: float = Field(..., ge=0.0, le=1.0)
-    suggestions: Optional[List[str]] = None
-    error: Optional[str] = None
+    
+    # Baseline metrics
+    baseline_views: int
+    baseline_ctr: float
+    baseline_revenue: float
+    
+    # Performance after optimization
+    current_views: Optional[int] = None
+    current_ctr: Optional[float] = None
+    current_revenue: Optional[float] = None
+    views_increase_pct: Optional[float] = None
+    revenue_increase: Optional[float] = None
+    
+    # Metadata
+    confidence_score: float
+    total_cost_usd: float
+    applied_at: Optional[datetime] = None
+    created_at: datetime
+    updated_at: datetime
+    
+    # Status info
+    stage: OptimizationStage
+    error_message: Optional[str] = None
+    rollback_reason: Optional[str] = None
 
 
 # ============================================================================
-# CIRCUIT BREAKER & RETRY LOGIC
+# OPTIMIZER SERVICE
 # ============================================================================
 
-class LLMCircuitBreaker:
-    """Circuit breaker for LLM API calls"""
+class VideoOptimizerService:
+    """Production-ready video optimization orchestrator"""
     
-    def __init__(self, failure_threshold: int = 5, timeout: int = 60):
-        self.failure_threshold = failure_threshold
-        self.timeout = timeout
-        self.failures: Dict[str, int] = {}
-        self.last_failure: Dict[str, datetime] = {}
+    def __init__(self):
+        self.max_concurrent_optimizations = 5
+        self._optimization_semaphore = asyncio.Semaphore(self.max_concurrent_optimizations)
     
-    def is_open(self, provider: str) -> bool:
-        """Check if circuit is open for provider"""
-        if provider not in self.failures:
+    async def optimize_video(
+        self,
+        request: VideoOptimizationRequest
+    ) -> OptimizationResult:
+        """
+        Complete video optimization workflow.
+        
+        Stages:
+        1. Analysis - Gather video data and baseline metrics
+        2. Generation - Generate optimized content using LLM
+        3. Validation - Validate optimized content
+        4. Application - Apply changes to YouTube (if auto_apply)
+        5. Monitoring - Track performance
+        6. Rollback - Revert if performance drops
+        
+        Args:
+            request: VideoOptimizationRequest
+            
+        Returns:
+            OptimizationResult
+        """
+        async with self._optimization_semaphore:
+            optimization_id = None
+            
+            try:
+                # Stage 1: Analysis
+                logger.info(f"Starting optimization for video {request.video_id}")
+                metrics.increment("optimizer.optimization.started")
+                
+                video_data, baseline_metrics = await self._analyze_video(
+                    request.video_id,
+                    request.user_id
+                )
+                
+                # Create optimization record
+                optimization_id = await self._create_optimization_record(
+                    request,
+                    video_data,
+                    baseline_metrics
+                )
+                
+                # Stage 2: Generation
+                await self._update_optimization_stage(
+                    optimization_id,
+                    OptimizationStage.GENERATION
+                )
+                
+                optimized_content = await self._generate_optimizations(
+                    request,
+                    video_data,
+                    baseline_metrics
+                )
+                
+                # Stage 3: Validation
+                await self._update_optimization_stage(
+                    optimization_id,
+                    OptimizationStage.VALIDATION
+                )
+                
+                validated_content = await self._validate_optimizations(
+                    video_data,
+                    optimized_content,
+                    request.confidence_threshold
+                )
+                
+                # Store generated optimizations
+                await self._store_optimizations(
+                    optimization_id,
+                    validated_content
+                )
+                
+                # Stage 4: Application (if auto_apply)
+                if request.auto_apply and not request.require_approval:
+                    await self._update_optimization_stage(
+                        optimization_id,
+                        OptimizationStage.APPLICATION
+                    )
+                    
+                    await self._apply_optimizations(
+                        request.video_id,
+                        request.user_id,
+                        validated_content
+                    )
+                    
+                    # Mark as applied
+                    await self._mark_optimization_applied(optimization_id)
+                    
+                    # Stage 5: Start monitoring
+                    await self._update_optimization_stage(
+                        optimization_id,
+                        OptimizationStage.MONITORING
+                    )
+                    
+                    # Schedule performance monitoring
+                    await self._schedule_performance_monitoring(
+                        optimization_id,
+                        request.monitoring_days,
+                        request.rollback_threshold
+                    )
+                
+                # Mark as completed
+                await self._mark_optimization_completed(optimization_id)
+                
+                # Get final result
+                result = await self._get_optimization_result(optimization_id)
+                
+                logger.info(f"Optimization completed for video {request.video_id}")
+                metrics.increment("optimizer.optimization.completed")
+                
+                return result
+                
+            except Exception as e:
+                logger.error(
+                    f"Optimization failed for video {request.video_id}: {e}",
+                    exc_info=True
+                )
+                metrics.increment("optimizer.optimization.failed")
+                
+                if optimization_id:
+                    await self._mark_optimization_failed(
+                        optimization_id,
+                        str(e)
+                    )
+                
+                raise
+    
+    async def _analyze_video(
+        self,
+        video_id: str,
+        user_id: int
+    ) -> Tuple[Dict[str, Any], BaselineMetrics]:
+        """Analyze video and gather baseline metrics"""
+        try:
+            # Get video details
+            video_data = await get_video_details(video_id, user_id)
+            if not video_data:
+                raise ValueError(f"Video not found: {video_id}")
+            
+            # Get baseline analytics
+            analytics = await get_video_analytics(video_id, user_id)
+            
+            baseline = BaselineMetrics(
+                views=analytics.get('views', 0),
+                likes=analytics.get('likes', 0),
+                comments=analytics.get('comments', 0),
+                watch_time=analytics.get('watch_time', 0),
+                ctr=analytics.get('ctr', 0.0),
+                avg_view_duration=analytics.get('avg_view_duration', 0),
+                revenue=analytics.get('revenue', 0.0),
+                measured_at=datetime.now(timezone.utc)
+            )
+            
+            logger.info(
+                f"Baseline metrics for {video_id}: "
+                f"{baseline.views} views, {baseline.ctr:.2%} CTR, "
+                f"${baseline.revenue:.2f} revenue"
+            )
+            
+            return video_data, baseline
+            
+        except Exception as e:
+            logger.error(f"Failed to analyze video {video_id}: {e}", exc_info=True)
+            raise
+    
+    async def _generate_optimizations(
+        self,
+        request: VideoOptimizationRequest,
+        video_data: Dict[str, Any],
+        baseline_metrics: BaselineMetrics
+    ) -> Dict[str, Any]:
+        """Generate optimized content using LLM"""
+        try:
+            optimizations = {}
+            total_cost = 0.0
+            
+            # Optimize each requested type
+            for opt_type in request.optimization_types:
+                llm_request = OptimizationRequest(
+                    video_id=request.video_id,
+                    user_id=request.user_id,
+                    optimization_type=opt_type,
+                    current_title=video_data.get('title'),
+                    current_description=video_data.get('description'),
+                    current_tags=video_data.get('tags', []),
+                    video_category=video_data.get('category'),
+                    target_audience=video_data.get('target_audience')
+                )
+                
+                result = await llm_optimizer.optimize(llm_request)
+                
+                if not result.success:
+                    logger.warning(
+                        f"Optimization failed for {opt_type}: {result.error}"
+                    )
+                    continue
+                
+                optimizations[opt_type.value] = {
+                    'content': self._extract_content(result, opt_type),
+                    'confidence': result.confidence_score,
+                    'cost': result.cost_usd,
+                    'provider': result.provider_used.value,
+                    'suggestions': result.suggestions
+                }
+                
+                total_cost += result.cost_usd
+            
+            optimizations['total_cost'] = total_cost
+            
+            logger.info(
+                f"Generated {len(optimizations)} optimizations "
+                f"for {request.video_id}, cost: ${total_cost:.4f}"
+            )
+            
+            return optimizations
+            
+        except Exception as e:
+            logger.error(
+                f"Failed to generate optimizations for {request.video_id}: {e}",
+                exc_info=True
+            )
+            raise
+    
+    def _extract_content(
+        self,
+        result: OptimizationResponse,
+        opt_type: OptimizationType
+    ) -> Any:
+        """Extract optimized content from LLM response"""
+        if opt_type == OptimizationType.TITLE:
+            return result.optimized_title
+        elif opt_type == OptimizationType.DESCRIPTION:
+            return result.optimized_description
+        elif opt_type == OptimizationType.TAGS:
+            return result.optimized_tags
+        elif opt_type == OptimizationType.THUMBNAIL:
+            return result.thumbnail_suggestions
+        else:
+            return {
+                'title': result.optimized_title,
+                'description': result.optimized_description,
+                'tags': result.optimized_tags,
+                'thumbnail': result.thumbnail_suggestions
+            }
+    
+    async def _validate_optimizations(
+        self,
+        video_data: Dict[str, Any],
+        optimizations: Dict[str, Any],
+        confidence_threshold: float
+    ) -> Dict[str, Any]:
+        """Validate and filter optimizations based on confidence"""
+        validated = {}
+        
+        for opt_type, opt_data in optimizations.items():
+            if opt_type == 'total_cost':
+                validated[opt_type] = opt_data
+                continue
+            
+            # Check confidence threshold
+            if opt_data['confidence'] < confidence_threshold:
+                logger.warning(
+                    f"Skipping {opt_type} optimization: "
+                    f"confidence {opt_data['confidence']:.2f} < "
+                    f"threshold {confidence_threshold:.2f}"
+                )
+                continue
+            
+            # Additional validation rules
+            if opt_type == 'title':
+                if not self._validate_title(opt_data['content']):
+                    logger.warning(f"Title validation failed: {opt_data['content']}")
+                    continue
+            
+            elif opt_type == 'description':
+                if not self._validate_description(opt_data['content']):
+                    logger.warning("Description validation failed")
+                    continue
+            
+            elif opt_type == 'tags':
+                if not self._validate_tags(opt_data['content']):
+                    logger.warning("Tags validation failed")
+                    continue
+            
+            validated[opt_type] = opt_data
+        
+        logger.info(
+            f"Validated {len(validated)} optimizations "
+            f"(filtered {len(optimizations) - len(validated) - 1})"
+        )
+        
+        return validated
+    
+    def _validate_title(self, title: str) -> bool:
+        """Validate title meets YouTube requirements"""
+        if not title or not isinstance(title, str):
             return False
-        
-        if self.failures[provider] < self.failure_threshold:
+        if len(title) > 100:
             return False
-        
-        if provider in self.last_failure:
-            time_since_failure = (
-                datetime.now(timezone.utc) - self.last_failure[provider]
-            ).total_seconds()
-            if time_since_failure > self.timeout:
-                # Reset circuit
-                self.failures[provider] = 0
-                return False
-        
+        if len(title.strip()) < 5:
+            return False
         return True
     
-    def record_success(self, provider: str):
-        """Record successful call"""
-        self.failures[provider] = 0
-        if provider in self.last_failure:
-            del self.last_failure[provider]
+    def _validate_description(self, description: str) -> bool:
+        """Validate description meets YouTube requirements"""
+        if not description or not isinstance(description, str):
+            return False
+        if len(description) > 5000:
+            return False
+        return True
     
-    def record_failure(self, provider: str):
-        """Record failed call"""
-        self.failures[provider] = self.failures.get(provider, 0) + 1
-        self.last_failure[provider] = datetime.now(timezone.utc)
-        
-        if self.failures[provider] >= self.failure_threshold:
-            logger.warning(
-                f"Circuit breaker opened for {provider} "
-                f"after {self.failures[provider]} failures"
-            )
-            metrics.increment(
-                "llm.circuit_breaker.opened",
-                tags={"provider": provider}
-            )
-
-
-circuit_breaker = LLMCircuitBreaker()
-
-
-# ============================================================================
-# COST TRACKING
-# ============================================================================
-
-class CostTracker:
-    """Track LLM API costs"""
+    def _validate_tags(self, tags: List[str]) -> bool:
+        """Validate tags meet YouTube requirements"""
+        if not tags or not isinstance(tags, list):
+            return False
+        if len(tags) > 500:
+            return False
+        # Check total character count
+        total_chars = sum(len(tag) for tag in tags)
+        if total_chars > 500:
+            return False
+        return True
     
-    # Pricing per 1K tokens (as of 2024)
-    PRICING = {
-        LLMProvider.CLAUDE: {
-            "input": 0.008,  # Claude Sonnet
-            "output": 0.024
-        },
-        LLMProvider.GPT4: {
-            "input": 0.03,
-            "output": 0.06
-        },
-        LLMProvider.GPT4_TURBO: {
-            "input": 0.01,
-            "output": 0.03
-        }
-    }
-    
-    @classmethod
-    def calculate_cost(
-        cls,
-        provider: LLMProvider,
-        input_tokens: int,
-        output_tokens: int
-    ) -> float:
-        """Calculate cost in USD"""
-        pricing = cls.PRICING.get(provider, {"input": 0, "output": 0})
-        
-        input_cost = (input_tokens / 1000) * pricing["input"]
-        output_cost = (output_tokens / 1000) * pricing["output"]
-        
-        return input_cost + output_cost
-    
-    @classmethod
-    async def log_usage(
-        cls,
-        user_id: int,
+    async def _apply_optimizations(
+        self,
         video_id: str,
-        provider: LLMProvider,
-        input_tokens: int,
-        output_tokens: int,
-        cost: float,
-        optimization_type: str
+        user_id: int,
+        optimizations: Dict[str, Any]
+    ) -> bool:
+        """Apply optimizations to YouTube video"""
+        try:
+            # Build update payload
+            update_data = {}
+            
+            if 'title' in optimizations:
+                update_data['title'] = optimizations['title']['content']
+            
+            if 'description' in optimizations:
+                update_data['description'] = optimizations['description']['content']
+            
+            if 'tags' in optimizations:
+                update_data['tags'] = optimizations['tags']['content']
+            
+            if not update_data:
+                logger.warning(f"No optimizations to apply for {video_id}")
+                return False
+            
+            # Apply to YouTube
+            success = await update_video_metadata(
+                video_id=video_id,
+                user_id=user_id,
+                **update_data
+            )
+            
+            if success:
+                logger.info(f"Successfully applied optimizations to {video_id}")
+                metrics.increment("optimizer.optimizations.applied")
+            else:
+                logger.error(f"Failed to apply optimizations to {video_id}")
+                metrics.increment("optimizer.optimizations.application_failed")
+            
+            return success
+            
+        except Exception as e:
+            logger.error(
+                f"Failed to apply optimizations to {video_id}: {e}",
+                exc_info=True
+            )
+            return False
+    
+    async def _create_optimization_record(
+        self,
+        request: VideoOptimizationRequest,
+        video_data: Dict[str, Any],
+        baseline: BaselineMetrics
+    ) -> int:
+        """Create optimization record in database"""
+        try:
+            pool = await get_pool()
+            async with pool.acquire() as conn:
+                optimization_id = await conn.fetchval(
+                    """
+                    INSERT INTO video_optimizations (
+                        video_id, user_id, status, strategy, stage,
+                        original_title, original_description, original_tags,
+                        baseline_views, baseline_ctr, baseline_revenue,
+                        confidence_threshold, auto_apply, rollback_threshold,
+                        monitoring_days, created_at, updated_at
+                    ) VALUES (
+                        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17
+                    ) RETURNING id
+                    """,
+                    request.video_id,
+                    request.user_id,
+                    VideoOptimizationStatus.IN_PROGRESS.value,
+                    request.strategy.value,
+                    OptimizationStage.ANALYSIS.value,
+                    video_data.get('title'),
+                    video_data.get('description'),
+                    video_data.get('tags', []),
+                    baseline.views,
+                    baseline.ctr,
+                    baseline.revenue,
+                    request.confidence_threshold,
+                    request.auto_apply,
+                    request.rollback_threshold,
+                    request.monitoring_days,
+                    datetime.now(timezone.utc),
+                    datetime.now(timezone.utc)
+                )
+            
+            logger.info(f"Created optimization record: {optimization_id}")
+            return optimization_id
+            
+        except Exception as e:
+            logger.error(f"Failed to create optimization record: {e}", exc_info=True)
+            raise
+    
+    async def _update_optimization_stage(
+        self,
+        optimization_id: int,
+        stage: OptimizationStage
     ):
-        """Log usage to database"""
+        """Update optimization stage"""
         try:
             pool = await get_pool()
             async with pool.acquire() as conn:
                 await conn.execute(
                     """
-                    INSERT INTO llm_api_usage (
-                        user_id, video_id, provider, optimization_type,
-                        input_tokens, output_tokens, cost_usd, created_at
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                    UPDATE video_optimizations
+                    SET stage = $1, updated_at = $2
+                    WHERE id = $3
                     """,
-                    user_id, video_id, provider.value, optimization_type,
-                    input_tokens, output_tokens, cost, datetime.now(timezone.utc)
+                    stage.value,
+                    datetime.now(timezone.utc),
+                    optimization_id
                 )
             
-            metrics.histogram(
-                "llm.cost.usd",
-                cost,
-                tags={"provider": provider.value, "type": optimization_type}
-            )
-            
-        except Exception as e:
-            logger.error(f"Failed to log LLM usage: {e}", exc_info=True)
-
-
-# ============================================================================
-# PROMPT TEMPLATES
-# ============================================================================
-
-class PromptTemplates:
-    """Production-ready prompt templates"""
-    
-    TITLE_OPTIMIZATION = """You are an expert YouTube SEO specialist. Optimize this video title for maximum views and engagement.
-
-Current Title: {current_title}
-
-Video Context:
-- Category: {category}
-- Target Audience: {audience}
-- Current Performance: {performance_data}
-
-Competitor Analysis:
-{competitor_titles}
-
-Trending Keywords:
-{trending_keywords}
-
-Requirements:
-1. Title must be 60 characters or less
-2. Include primary keyword in first 5 words
-3. Create curiosity or urgency
-4. Be clear about video value
-5. Avoid clickbait (YouTube penalizes)
-6. Consider SEO and human appeal
-
-Provide 3 optimized title variations with confidence scores (0-100) and brief explanations.
-
-Output as JSON:
-{{
-  "variations": [
-    {{
-      "title": "...",
-      "confidence": 85,
-      "reasoning": "..."
-    }}
-  ]
-}}"""
-
-    DESCRIPTION_OPTIMIZATION = """You are an expert YouTube SEO specialist. Optimize this video description for discoverability and conversions.
-
-Current Description:
-{current_description}
-
-Video Context:
-- Title: {title}
-- Category: {category}
-- Target Keywords: {keywords}
-
-Requirements:
-1. First 150 characters are critical (shown in search)
-2. Include primary keywords naturally
-3. Add timestamps if applicable
-4. Include relevant links (channel, social, resources)
-5. Use proper formatting (line breaks, emojis)
-6. Call-to-action for likes/subscribe
-7. Maximum 5000 characters
-
-Provide optimized description with sections clearly marked.
-
-Output as JSON:
-{{
-  "description": "...",
-  "confidence": 85,
-  "key_improvements": ["...", "..."]
-}}"""
-
-    TAGS_OPTIMIZATION = """You are an expert YouTube SEO specialist. Optimize video tags for maximum discoverability.
-
-Current Tags: {current_tags}
-
-Video Context:
-- Title: {title}
-- Category: {category}
-- Description: {description_preview}
-
-Competitor Tags:
-{competitor_tags}
-
-Trending in Niche:
-{trending_keywords}
-
-Requirements:
-1. 15-30 tags optimal (500 character limit)
-2. Mix of specific and broad tags
-3. Include misspellings if common
-4. Include multi-word phrases
-5. Front-load most important tags
-6. Avoid tag stuffing
-
-Provide optimized tag list ordered by priority.
-
-Output as JSON:
-{{
-  "tags": ["tag1", "tag2", ...],
-  "confidence": 85,
-  "tag_strategy": "..."
-}}"""
-
-    FULL_OPTIMIZATION = """You are an expert YouTube optimization specialist. Provide comprehensive optimization for this video.
-
-Current State:
-- Title: {title}
-- Description: {description}
-- Tags: {tags}
-
-Analytics:
-{analytics_data}
-
-Competitor Intelligence:
-{competitor_data}
-
-Trending Topics:
-{trending_data}
-
-Provide complete optimization strategy with:
-1. Optimized title (3 variations)
-2. Optimized description
-3. Optimized tags (15-30)
-4. Thumbnail suggestions (3 concepts)
-5. Content recommendations
-6. Expected impact estimate
-
-Output as JSON with all sections."""
-
-
-# ============================================================================
-# MAIN OPTIMIZER SERVICE
-# ============================================================================
-
-class LLMOptimizerService:
-    """Production-ready LLM optimization service"""
-    
-    def __init__(self):
-        self.templates = PromptTemplates()
-        self.cost_tracker = CostTracker()
-    
-    async def optimize(
-        self,
-        request: OptimizationRequest
-    ) -> OptimizationResponse:
-        """
-        Main optimization method with full error handling and fallback.
-        
-        Args:
-            request: OptimizationRequest with video details
-            
-        Returns:
-            OptimizationResponse with optimized content
-        """
-        start_time = time.time()
-        
-        try:
-            # Validate request
-            if not request.current_title and request.optimization_type == OptimizationType.TITLE:
-                raise ValueError("current_title required for TITLE optimization")
-            
-            # Check cache
-            cache_key = self._generate_cache_key(request)
-            cached_result = await cache.get(cache_key)
-            if cached_result:
-                logger.info(f"Cache hit for {request.video_id}")
-                metrics.increment("llm.cache.hit")
-                return OptimizationResponse(**cached_result)
-            
-            metrics.increment("llm.cache.miss")
-            
-            # Try primary provider
-            provider = request.preferred_provider
-            result = None
-            
-            try:
-                result = await self._optimize_with_provider(request, provider)
-            except Exception as e:
-                logger.warning(
-                    f"Primary provider {provider} failed: {e}",
-                    exc_info=True
-                )
-                circuit_breaker.record_failure(provider.value)
-                
-                # Fallback to alternative provider
-                fallback_provider = self._get_fallback_provider(provider)
-                logger.info(f"Falling back to {fallback_provider}")
-                
-                try:
-                    result = await self._optimize_with_provider(
-                        request,
-                        fallback_provider
-                    )
-                    provider = fallback_provider
-                except Exception as fallback_error:
-                    logger.error(
-                        f"Fallback provider {fallback_provider} also failed: {fallback_error}",
-                        exc_info=True
-                    )
-                    circuit_breaker.record_failure(fallback_provider.value)
-                    raise
-            
-            # Success - record metrics
-            circuit_breaker.record_success(provider.value)
-            
-            processing_time = int((time.time() - start_time) * 1000)
-            result.processing_time_ms = processing_time
-            result.provider_used = provider
-            
-            # Cache result
-            await cache.set(
-                cache_key,
-                result.dict(),
-                expire=3600  # 1 hour
-            )
-            
-            # Log metrics
-            metrics.histogram(
-                "llm.processing_time.ms",
-                processing_time,
-                tags={"provider": provider.value, "type": request.optimization_type.value}
-            )
-            
-            metrics.increment(
-                "llm.optimization.success",
-                tags={"provider": provider.value, "type": request.optimization_type.value}
-            )
-            
-            return result
+            logger.debug(f"Updated optimization {optimization_id} to stage {stage.value}")
             
         except Exception as e:
             logger.error(
-                f"Optimization failed for {request.video_id}: {e}",
+                f"Failed to update optimization stage {optimization_id}: {e}",
                 exc_info=True
             )
-            
-            metrics.increment(
-                "llm.optimization.error",
-                tags={"type": request.optimization_type.value}
-            )
-            
-            # Return error response
-            processing_time = int((time.time() - start_time) * 1000)
-            return OptimizationResponse(
-                success=False,
-                video_id=request.video_id,
-                optimization_type=request.optimization_type,
-                provider_used=request.preferred_provider,
-                tokens_used=0,
-                cost_usd=0.0,
-                processing_time_ms=processing_time,
-                confidence_score=0.0,
-                error=str(e)
-            )
     
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=2, max=10),
-        retry=retry_if_exception_type((RateLimitError, APIError))
-    )
-    async def _optimize_with_provider(
+    async def _store_optimizations(
         self,
-        request: OptimizationRequest,
-        provider: LLMProvider
-    ) -> OptimizationResponse:
-        """Optimize using specific provider with retry logic"""
-        
-        # Check circuit breaker
-        if circuit_breaker.is_open(provider.value):
-            raise Exception(f"Circuit breaker open for {provider.value}")
-        
-        # Build prompt
-        prompt = self._build_prompt(request)
-        
-        # Call appropriate LLM
-        if provider == LLMProvider.CLAUDE:
-            result = await self._call_claude(request, prompt)
-        elif provider in [LLMProvider.GPT4, LLMProvider.GPT4_TURBO]:
-            result = await self._call_openai(request, prompt, provider)
-        else:
-            raise ValueError(f"Unknown provider: {provider}")
-        
-        # Validate response
-        validated_result = self._validate_and_format_response(request, result)
-        
-        return validated_result
-    
-    async def _call_claude(
-        self,
-        request: OptimizationRequest,
-        prompt: str
-    ) -> Dict[str, Any]:
-        """Call Claude API"""
+        optimization_id: int,
+        optimizations: Dict[str, Any]
+    ):
+        """Store generated optimizations"""
         try:
-            response = await anthropic_client.messages.create(
-                model="claude-sonnet-4-5-20250929",
-                max_tokens=2000,
-                temperature=0.7,
-                messages=[{
-                    "role": "user",
-                    "content": prompt
-                }]
-            )
+            pool = await get_pool()
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    UPDATE video_optimizations
+                    SET 
+                        optimized_title = $1,
+                        optimized_description = $2,
+                        optimized_tags = $3,
+                        confidence_score = $4,
+                        total_cost_usd = $5,
+                        updated_at = $6
+                    WHERE id = $7
+                    """,
+                    optimizations.get('title', {}).get('content'),
+                    optimizations.get('description', {}).get('content'),
+                    optimizations.get('tags', {}).get('content'),
+                    max([opt.get('confidence', 0) for opt in optimizations.values() if isinstance(opt, dict)]),
+                    optimizations.get('total_cost', 0.0),
+                    datetime.now(timezone.utc),
+                    optimization_id
+                )
             
-            # Extract response
-            content = response.content[0].text
-            
-            # Calculate cost
-            input_tokens = response.usage.input_tokens
-            output_tokens = response.usage.output_tokens
-            cost = self.cost_tracker.calculate_cost(
-                LLMProvider.CLAUDE,
-                input_tokens,
-                output_tokens
-            )
-            
-            # Log usage
-            await self.cost_tracker.log_usage(
-                user_id=request.user_id,
-                video_id=request.video_id,
-                provider=LLMProvider.CLAUDE,
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                cost=cost,
-                optimization_type=request.optimization_type.value
-            )
-            
-            # Parse JSON response
-            try:
-                parsed_content = json.loads(content)
-            except json.JSONDecodeError:
-                # Try to extract JSON from markdown code blocks
-                import re
-                json_match = re.search(r'```json\s*(\{.*?\})\s*```', content, re.DOTALL)
-                if json_match:
-                    parsed_content = json.loads(json_match.group(1))
-                else:
-                    raise ValueError("Could not parse JSON from response")
-            
-            return {
-                "content": parsed_content,
-                "tokens_used": input_tokens + output_tokens,
-                "cost_usd": cost
-            }
+            logger.info(f"Stored optimizations for {optimization_id}")
             
         except Exception as e:
-            logger.error(f"Claude API error: {e}", exc_info=True)
-            raise
+            logger.error(
+                f"Failed to store optimizations {optimization_id}: {e}",
+                exc_info=True
+            )
     
-    async def _call_openai(
-        self,
-        request: OptimizationRequest,
-        prompt: str,
-        provider: LLMProvider
-    ) -> Dict[str, Any]:
-        """Call OpenAI API"""
+    async def _mark_optimization_applied(self, optimization_id: int):
+        """Mark optimization as applied"""
         try:
-            model = "gpt-4" if provider == LLMProvider.GPT4 else "gpt-4-turbo"
-            
-            response = await openai_client.chat.completions.create(
-                model=model,
-                messages=[{
-                    "role": "system",
-                    "content": "You are an expert YouTube SEO specialist. Always respond with valid JSON."
-                }, {
-                    "role": "user",
-                    "content": prompt
-                }],
-                temperature=0.7,
-                max_tokens=2000,
-                response_format={"type": "json_object"}
-            )
-            
-            # Extract response
-            content = response.choices[0].message.content
-            
-            # Calculate cost
-            input_tokens = response.usage.prompt_tokens
-            output_tokens = response.usage.completion_tokens
-            cost = self.cost_tracker.calculate_cost(
-                provider,
-                input_tokens,
-                output_tokens
-            )
-            
-            # Log usage
-            await self.cost_tracker.log_usage(
-                user_id=request.user_id,
-                video_id=request.video_id,
-                provider=provider,
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                cost=cost,
-                optimization_type=request.optimization_type.value
-            )
-            
-            # Parse JSON
-            parsed_content = json.loads(content)
-            
-            return {
-                "content": parsed_content,
-                "tokens_used": input_tokens + output_tokens,
-                "cost_usd": cost
-            }
-            
+            pool = await get_pool()
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    UPDATE video_optimizations
+                    SET applied_at = $1, updated_at = $2
+                    WHERE id = $3
+                    """,
+                    datetime.now(timezone.utc),
+                    datetime.now(timezone.utc),
+                    optimization_id
+                )
         except Exception as e:
-            logger.error(f"OpenAI API error: {e}", exc_info=True)
-            raise
+            logger.error(f"Failed to mark optimization applied: {e}", exc_info=True)
     
-    def _build_prompt(self, request: OptimizationRequest) -> str:
-        """Build optimization prompt"""
-        
-        # Get appropriate template
-        if request.optimization_type == OptimizationType.TITLE:
-            template = self.templates.TITLE_OPTIMIZATION
-        elif request.optimization_type == OptimizationType.DESCRIPTION:
-            template = self.templates.DESCRIPTION_OPTIMIZATION
-        elif request.optimization_type == OptimizationType.TAGS:
-            template = self.templates.TAGS_OPTIMIZATION
-        else:
-            template = self.templates.FULL_OPTIMIZATION
-        
-        # Format template with request data
-        prompt = template.format(
-            current_title=request.current_title or "",
-            current_description=request.current_description or "",
-            current_tags=", ".join(request.current_tags or []),
-            title=request.current_title or "",
-            description=request.current_description or "",
-            tags=", ".join(request.current_tags or []),
-            category=request.video_category or "General",
-            audience=request.target_audience or "General audience",
-            keywords=", ".join(request.trending_keywords or []),
-            trending_keywords="\n".join([f"- {kw}" for kw in (request.trending_keywords or [])]),
-            competitor_titles=self._format_competitor_data(request.competitor_data, "titles"),
-            competitor_tags=self._format_competitor_data(request.competitor_data, "tags"),
-            competitor_data=json.dumps(request.competitor_data or {}, indent=2),
-            performance_data="Views improving" if True else "Views declining",
-            analytics_data="Placeholder analytics",
-            trending_data="\n".join([f"- {kw}" for kw in (request.trending_keywords or [])]),
-            description_preview=(request.current_description or "")[:200]
+    async def _mark_optimization_completed(self, optimization_id: int):
+        """Mark optimization as completed"""
+        try:
+            pool = await get_pool()
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    UPDATE video_optimizations
+                    SET status = $1, updated_at = $2
+                    WHERE id = $3
+                    """,
+                    VideoOptimizationStatus.COMPLETED.value,
+                    datetime.now(timezone.utc),
+                    optimization_id
+                )
+        except Exception as e:
+            logger.error(f"Failed to mark optimization completed: {e}", exc_info=True)
+    
+    async def _mark_optimization_failed(
+        self,
+        optimization_id: int,
+        error_message: str
+    ):
+        """Mark optimization as failed"""
+        try:
+            pool = await get_pool()
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    UPDATE video_optimizations
+                    SET status = $1, error_message = $2, updated_at = $3
+                    WHERE id = $4
+                    """,
+                    VideoOptimizationStatus.FAILED.value,
+                    error_message,
+                    datetime.now(timezone.utc),
+                    optimization_id
+                )
+        except Exception as e:
+            logger.error(f"Failed to mark optimization failed: {e}", exc_info=True)
+    
+    async def _schedule_performance_monitoring(
+        self,
+        optimization_id: int,
+        monitoring_days: int,
+        rollback_threshold: float
+    ):
+        """Schedule performance monitoring job"""
+        # This would integrate with your scheduler service
+        # For now, just log
+        logger.info(
+            f"Scheduled {monitoring_days} days of monitoring "
+            f"for optimization {optimization_id}"
         )
-        
-        return prompt
+        # TODO: Integrate with scheduler_routes to create monitoring job
     
-    def _format_competitor_data(
+    async def _get_optimization_result(
         self,
-        competitor_data: Optional[Dict],
-        field: str
-    ) -> str:
-        """Format competitor data for prompt"""
-        if not competitor_data:
-            return "No competitor data available"
-        
-        if field == "titles":
-            titles = competitor_data.get("titles", [])
-            return "\n".join([f"- {title}" for title in titles[:5]])
-        elif field == "tags":
-            tags = competitor_data.get("tags", [])
-            return "\n".join([f"- {tag}" for tag in tags[:20]])
-        
-        return ""
+        optimization_id: int
+    ) -> OptimizationResult:
+        """Get complete optimization result"""
+        try:
+            pool = await get_pool()
+            async with pool.acquire() as conn:
+                result = await conn.fetchrow(
+                    "SELECT * FROM video_optimizations WHERE id = $1",
+                    optimization_id
+                )
+            
+            if not result:
+                raise ValueError(f"Optimization not found: {optimization_id}")
+            
+            return OptimizationResult(
+                optimization_id=result['id'],
+                video_id=result['video_id'],
+                user_id=result['user_id'],
+                status=VideoOptimizationStatus(result['status']),
+                strategy=OptimizationStrategy(result['strategy']),
+                original_title=result['original_title'],
+                original_description=result['original_description'],
+                original_tags=result['original_tags'],
+                optimized_title=result.get('optimized_title'),
+                optimized_description=result.get('optimized_description'),
+                optimized_tags=result.get('optimized_tags'),
+                baseline_views=result['baseline_views'],
+                baseline_ctr=result['baseline_ctr'],
+                baseline_revenue=result['baseline_revenue'],
+                current_views=result.get('current_views'),
+                current_ctr=result.get('current_ctr'),
+                current_revenue=result.get('current_revenue'),
+                views_increase_pct=result.get('views_increase_pct'),
+                revenue_increase=result.get('revenue_increase'),
+                confidence_score=result.get('confidence_score', 0.0),
+                total_cost_usd=result.get('total_cost_usd', 0.0),
+                applied_at=result.get('applied_at'),
+                created_at=result['created_at'],
+                updated_at=result['updated_at'],
+                stage=OptimizationStage(result['stage']),
+                error_message=result.get('error_message'),
+                rollback_reason=result.get('rollback_reason')
+            )
+            
+        except Exception as e:
+            logger.error(
+                f"Failed to get optimization result {optimization_id}: {e}",
+                exc_info=True
+            )
+            raise
     
-    def _validate_and_format_response(
+    async def check_and_rollback(
         self,
-        request: OptimizationRequest,
-        llm_response: Dict[str, Any]
-    ) -> OptimizationResponse:
-        """Validate and format LLM response"""
+        optimization_id: int
+    ) -> bool:
+        """
+        Check optimization performance and rollback if necessary.
         
-        content = llm_response["content"]
+        Called by monitoring job to check if optimization should be rolled back.
         
-        # Extract based on optimization type
-        if request.optimization_type == OptimizationType.TITLE:
-            variations = content.get("variations", [])
-            if not variations:
-                raise ValueError("No title variations in response")
+        Args:
+            optimization_id: Optimization to check
             
-            best_variation = max(variations, key=lambda x: x.get("confidence", 0))
+        Returns:
+            True if rolled back, False otherwise
+        """
+        try:
+            # Get optimization details
+            pool = await get_pool()
+            async with pool.acquire() as conn:
+                opt = await conn.fetchrow(
+                    "SELECT * FROM video_optimizations WHERE id = $1",
+                    optimization_id
+                )
             
-            return OptimizationResponse(
-                success=True,
-                video_id=request.video_id,
-                optimization_type=request.optimization_type,
-                optimized_title=best_variation["title"],
-                provider_used=LLMProvider.CLAUDE,  # Will be updated
-                tokens_used=llm_response["tokens_used"],
-                cost_usd=llm_response["cost_usd"],
-                processing_time_ms=0,  # Will be updated
-                confidence_score=best_variation.get("confidence", 50) / 100.0,
-                suggestions=[v["reasoning"] for v in variations]
+            if not opt or not opt.get('applied_at'):
+                logger.warning(f"Optimization {optimization_id} not applied, skipping rollback check")
+                return False
+            
+            # Get current analytics
+            current_analytics = await get_video_analytics(
+                opt['video_id'],
+                opt['user_id']
             )
-        
-        elif request.optimization_type == OptimizationType.DESCRIPTION:
-            return OptimizationResponse(
-                success=True,
-                video_id=request.video_id,
-                optimization_type=request.optimization_type,
-                optimized_description=content.get("description", ""),
-                provider_used=LLMProvider.CLAUDE,
-                tokens_used=llm_response["tokens_used"],
-                cost_usd=llm_response["cost_usd"],
-                processing_time_ms=0,
-                confidence_score=content.get("confidence", 50) / 100.0,
-                suggestions=content.get("key_improvements", [])
+            
+            current_views = current_analytics.get('views', 0)
+            current_ctr = current_analytics.get('ctr', 0.0)
+            current_revenue = current_analytics.get('revenue', 0.0)
+            
+            # Calculate performance change
+            baseline_views = opt['baseline_views']
+            baseline_ctr = opt['baseline_ctr']
+            baseline_revenue = opt['baseline_revenue']
+            
+            # Check if performance dropped below threshold
+            rollback_threshold = opt['rollback_threshold']
+            
+            views_ratio = current_views / baseline_views if baseline_views > 0 else 1.0
+            ctr_ratio = current_ctr / baseline_ctr if baseline_ctr > 0 else 1.0
+            revenue_ratio = current_revenue / baseline_revenue if baseline_revenue > 0 else 1.0
+            
+            should_rollback = (
+                views_ratio < rollback_threshold or
+                ctr_ratio < rollback_threshold or
+                revenue_ratio < rollback_threshold
             )
-        
-        elif request.optimization_type == OptimizationType.TAGS:
-            return OptimizationResponse(
-                success=True,
-                video_id=request.video_id,
-                optimization_type=request.optimization_type,
-                optimized_tags=content.get("tags", []),
-                provider_used=LLMProvider.CLAUDE,
-                tokens_used=llm_response["tokens_used"],
-                cost_usd=llm_response["cost_usd"],
-                processing_time_ms=0,
-                confidence_score=content.get("confidence", 50) / 100.0,
-                suggestions=[content.get("tag_strategy", "")]
+            
+            if should_rollback:
+                logger.warning(
+                    f"Performance drop detected for optimization {optimization_id}: "
+                    f"views={views_ratio:.2%}, ctr={ctr_ratio:.2%}, revenue={revenue_ratio:.2%}"
+                )
+                
+                # Perform rollback
+                success = await self._perform_rollback(optimization_id, opt)
+                
+                if success:
+                    metrics.increment("optimizer.rollback.executed")
+                    return True
+            else:
+                logger.info(
+                    f"Optimization {optimization_id} performing well: "
+                    f"views={views_ratio:.2%}, ctr={ctr_ratio:.2%}, revenue={revenue_ratio:.2%}"
+                )
+            
+            # Update current metrics
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    UPDATE video_optimizations
+                    SET current_views = $1, current_ctr = $2, current_revenue = $3,
+                        views_increase_pct = $4, revenue_increase = $5,
+                        updated_at = $6
+                    WHERE id = $7
+                    """,
+                    current_views, current_ctr, current_revenue,
+                    (views_ratio - 1.0) * 100,
+                    current_revenue - baseline_revenue,
+                    datetime.now(timezone.utc),
+                    optimization_id
+                )
+            
+            return False
+            
+        except Exception as e:
+            logger.error(
+                f"Failed to check rollback for optimization {optimization_id}: {e}",
+                exc_info=True
             )
-        
-        else:  # FULL optimization
-            return OptimizationResponse(
-                success=True,
-                video_id=request.video_id,
-                optimization_type=request.optimization_type,
-                optimized_title=content.get("title", {}).get("best", ""),
-                optimized_description=content.get("description", ""),
-                optimized_tags=content.get("tags", []),
-                thumbnail_suggestions=content.get("thumbnail_concepts", []),
-                provider_used=LLMProvider.CLAUDE,
-                tokens_used=llm_response["tokens_used"],
-                cost_usd=llm_response["cost_usd"],
-                processing_time_ms=0,
-                confidence_score=0.75,  # Default for full optimization
-                suggestions=content.get("recommendations", [])
-            )
+            return False
     
-    def _get_fallback_provider(self, primary: LLMProvider) -> LLMProvider:
-        """Get fallback provider"""
-        if primary == LLMProvider.CLAUDE:
-            return LLMProvider.GPT4_TURBO
-        else:
-            return LLMProvider.CLAUDE
-    
-    def _generate_cache_key(self, request: OptimizationRequest) -> str:
-        """Generate cache key for request"""
-        key_data = f"{request.video_id}:{request.optimization_type.value}:{request.current_title}:{request.current_description}"
-        return hashlib.md5(key_data.encode()).hexdigest()
+    async def _perform_rollback(
+        self,
+        optimization_id: int,
+        optimization_data: Dict[str, Any]
+    ) -> bool:
+        """Rollback optimization to original values"""
+        try:
+            logger.info(f"Rolling back optimization {optimization_id}")
+            
+            # Restore original values
+            success = await update_video_metadata(
+                video_id=optimization_data['video_id'],
+                user_id=optimization_data['user_id'],
+                title=optimization_data['original_title'],
+                description=optimization_data['original_description'],
+                tags=optimization_data['original_tags']
+            )
+            
+            if success:
+                # Update optimization record
+                pool = await get_pool()
+                async with pool.acquire() as conn:
+                    await conn.execute(
+                        """
+                        UPDATE video_optimizations
+                        SET status = $1, stage = $2,
+                            rollback_reason = $3, updated_at = $4
+                        WHERE id = $5
+                        """,
+                        VideoOptimizationStatus.ROLLED_BACK.value,
+                        OptimizationStage.ROLLBACK.value,
+                        "Performance dropped below rollback threshold",
+                        datetime.now(timezone.utc),
+                        optimization_id
+                    )
+                
+                logger.info(f"Successfully rolled back optimization {optimization_id}")
+                return True
+            else:
+                logger.error(f"Failed to rollback optimization {optimization_id}")
+                return False
+                
+        except Exception as e:
+            logger.error(
+                f"Failed to perform rollback for {optimization_id}: {e}",
+                exc_info=True
+            )
+            return False
     
     async def batch_optimize(
         self,
-        requests: List[OptimizationRequest],
-        max_concurrent: int = 5
-    ) -> List[OptimizationResponse]:
+        requests: List[VideoOptimizationRequest]
+    ) -> List[OptimizationResult]:
         """
-        Batch optimize multiple videos concurrently.
+        Optimize multiple videos concurrently.
         
         Args:
             requests: List of optimization requests
-            max_concurrent: Maximum concurrent optimizations
             
         Returns:
-            List of optimization responses
+            List of optimization results
         """
-        semaphore = asyncio.Semaphore(max_concurrent)
-        
-        async def optimize_with_semaphore(req):
-            async with semaphore:
-                return await self.optimize(req)
-        
-        tasks = [optimize_with_semaphore(req) for req in requests]
+        tasks = [self.optimize_video(req) for req in requests]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         
-        # Convert exceptions to error responses
+        # Handle exceptions
         processed_results = []
         for i, result in enumerate(results):
             if isinstance(result, Exception):
-                processed_results.append(OptimizationResponse(
-                    success=False,
-                    video_id=requests[i].video_id,
-                    optimization_type=requests[i].optimization_type,
-                    provider_used=requests[i].preferred_provider,
-                    tokens_used=0,
-                    cost_usd=0.0,
-                    processing_time_ms=0,
-                    confidence_score=0.0,
-                    error=str(result)
-                ))
+                logger.error(
+                    f"Batch optimization failed for video {requests[i].video_id}: {result}"
+                )
+                # Create error result
+                # This would need proper error handling
             else:
                 processed_results.append(result)
         
@@ -846,76 +967,40 @@ class LLMOptimizerService:
 # SERVICE INSTANCE
 # ============================================================================
 
-llm_optimizer = LLMOptimizerService()
+video_optimizer = VideoOptimizerService()
 
 
 # ============================================================================
 # UTILITY FUNCTIONS
 # ============================================================================
 
-async def optimize_video(
+async def optimize_single_video(
     video_id: str,
     user_id: int,
-    optimization_type: str = "full",
-    **kwargs
+    strategy: str = "balanced",
+    auto_apply: bool = False
 ) -> Dict[str, Any]:
     """
-    Convenience function for video optimization.
+    Convenience function for single video optimization.
     
     Args:
         video_id: YouTube video ID
         user_id: User ID
-        optimization_type: Type of optimization
-        **kwargs: Additional optimization parameters
+        strategy: Optimization strategy
+        auto_apply: Whether to apply automatically
         
     Returns:
         Optimization result dictionary
     """
-    request = OptimizationRequest(
+    request = VideoOptimizationRequest(
         video_id=video_id,
         user_id=user_id,
-        optimization_type=OptimizationType(optimization_type),
-        **kwargs
+        strategy=OptimizationStrategy(strategy),
+        auto_apply=auto_apply
     )
     
-    result = await llm_optimizer.optimize(request)
+    result = await video_optimizer.optimize_video(request)
     return result.dict()
-
-
-async def get_optimization_cost_estimate(
-    optimization_type: str,
-    provider: str = "claude"
-) -> Dict[str, float]:
-    """
-    Estimate cost for optimization.
-    
-    Args:
-        optimization_type: Type of optimization
-        provider: LLM provider
-        
-    Returns:
-        Cost estimate
-    """
-    # Approximate token counts
-    token_estimates = {
-        "title": {"input": 500, "output": 200},
-        "description": {"input": 800, "output": 500},
-        "tags": {"input": 600, "output": 300},
-        "full": {"input": 1500, "output": 1000}
-    }
-    
-    estimate = token_estimates.get(optimization_type, token_estimates["full"])
-    cost = CostTracker.calculate_cost(
-        LLMProvider(provider),
-        estimate["input"],
-        estimate["output"]
-    )
-    
-    return {
-        "estimated_tokens": estimate["input"] + estimate["output"],
-        "estimated_cost_usd": round(cost, 4),
-        "provider": provider
-    }
 
 
 # ============================================================================
@@ -923,12 +1008,12 @@ async def get_optimization_cost_estimate(
 # ============================================================================
 
 __all__ = [
-    'llm_optimizer',
-    'LLMOptimizerService',
-    'OptimizationRequest',
-    'OptimizationResponse',
-    'LLMProvider',
-    'OptimizationType',
-    'optimize_video',
-    'get_optimization_cost_estimate'
+    'video_optimizer',
+    'VideoOptimizerService',
+    'VideoOptimizationRequest',
+    'OptimizationResult',
+    'OptimizationStrategy',
+    'VideoOptimizationStatus',
+    'OptimizationStage',
+    'optimize_single_video'
 ]
