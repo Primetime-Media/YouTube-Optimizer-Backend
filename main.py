@@ -1,803 +1,623 @@
-# main.py
+# utils/auth.py
 """
-Main FastAPI Application - YouTube Channel Optimizer
-====================================================
-Production-ready FastAPI application with comprehensive features:
-- Multi-route architecture (channels, videos, scheduler, health)
-- AI-powered LLM optimization using Anthropic Claude
-- Authentication & authorization
-- Rate limiting
-- Metrics & monitoring
-- Error tracking
-- Database connection pooling
-- Background tasks
-- Comprehensive middleware stack
-
-Author: YouTube Optimizer Team
-Version: 1.0.0
+Production-Ready Authentication & Authorization
+Handles OAuth2, JWT tokens, and user permissions
 """
 
-from fastapi import FastAPI, Request, Response, status
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.middleware.trustedhost import TrustedHostMiddleware
-from fastapi.responses import JSONResponse, RedirectResponse
-from fastapi.exceptions import RequestValidationError
-from fastapi.staticfiles import StaticFiles
-from contextlib import asynccontextmanager
-from typing import Callable, Any
+from typing import Optional, Dict, List, Any
+from datetime import datetime, timedelta, timezone
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from fastapi import Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer, HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel, EmailStr, validator
 import logging
-import sys
-import time
-import traceback
-from datetime import datetime
-import uuid
-import os
+import secrets
+import hashlib
 
-from config import get_settings, setup_logging
-from utils.exceptions import BaseAPIException
+from utils.db import get_db_connection, execute_query
+from config import settings
 
-# Import routes
-from routes import channel_routes, video_routes, scheduler_routes, health_routes
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
 
-# Import utilities (conditional import based on availability)
-try:
-    from utils.auth import auth_middleware
-except ImportError:
-    logger = logging.getLogger(__name__)
-    logger.warning("Auth middleware not available, continuing without authentication")
-    auth_middleware = None
-
-try:
-    from utils.rate_limiter import RateLimiter, add_rate_limit_headers
-except ImportError:
-    logger = logging.getLogger(__name__)
-    logger.warning("Rate limiter not available")
-    RateLimiter = None
-    add_rate_limit_headers = None
-
-try:
-    from utils.metrics import MetricsCollector, MetricType
-except ImportError:
-    logger = logging.getLogger(__name__)
-    logger.warning("Metrics collector not available")
-    MetricsCollector = None
-    MetricType = None
-
-# Initialize settings
-settings = get_settings()
-
-# Setup logging
-setup_logging(settings)
 logger = logging.getLogger(__name__)
 
-# Log AI/LLM configuration status
-if settings.ANTHROPIC_API_KEY:
-    logger.info("✓ Anthropic Claude AI enabled for content optimization")
-else:
-    logger.warning("⚠ Anthropic API key not configured - LLM optimization features will be limited")
+# Password hashing
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-if settings.SERPAPI_API_KEY:
-    logger.info("✓ SerpAPI enabled for Google Trends integration")
-else:
-    logger.warning("⚠ SerpAPI key not configured - Trending keywords features will be limited")
+# JWT configuration
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60  # 1 hour
+REFRESH_TOKEN_EXPIRE_DAYS = 30  # 30 days
 
-# Initialize utilities
-if MetricsCollector:
-    metrics = MetricsCollector(
-        backend=settings.METRICS_BACKEND if settings.METRICS_ENABLED else "console",
-        namespace=settings.METRICS_NAMESPACE,
-        enabled=settings.METRICS_ENABLED
-    )
-else:
-    metrics = None
-
-if RateLimiter:
-    rate_limiter = RateLimiter(
-        redis_url=settings.REDIS_URL if settings.RATE_LIMITING_ENABLED else None,
-        enabled=settings.RATE_LIMITING_ENABLED
-    )
-else:
-    rate_limiter = None
+# OAuth2 schemes
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+bearer_scheme = HTTPBearer()
 
 
 # ============================================================================
-# APPLICATION LIFESPAN MANAGEMENT
+# MODELS
 # ============================================================================
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
+class Token(BaseModel):
+    """Token response model"""
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+    expires_in: int
+
+
+class TokenData(BaseModel):
+    """Token payload data"""
+    user_id: Optional[int] = None
+    email: Optional[str] = None
+    scopes: List[str] = []
+
+
+class User(BaseModel):
+    """User model"""
+    id: int
+    email: EmailStr
+    full_name: Optional[str] = None
+    is_active: bool = True
+    is_admin: bool = False
+    created_at: datetime
+    
+    @validator('email')
+    def email_must_be_lowercase(cls, v):
+        return v.lower()
+
+
+class UserCreate(BaseModel):
+    """User creation model"""
+    email: EmailStr
+    password: str
+    full_name: Optional[str] = None
+    
+    @validator('password')
+    def password_strength(cls, v):
+        if len(v) < 8:
+            raise ValueError('Password must be at least 8 characters')
+        if not any(c.isupper() for c in v):
+            raise ValueError('Password must contain uppercase letter')
+        if not any(c.islower() for c in v):
+            raise ValueError('Password must contain lowercase letter')
+        if not any(c.isdigit() for c in v):
+            raise ValueError('Password must contain digit')
+        return v
+    
+    @validator('email')
+    def email_must_be_lowercase(cls, v):
+        return v.lower()
+
+
+# ============================================================================
+# PASSWORD UTILITIES
+# ============================================================================
+
+def hash_password(password: str) -> str:
     """
-    Application lifespan context manager.
+    Hash a password using bcrypt
     
-    Handles startup and shutdown events for proper resource management.
+    Args:
+        password: Plain text password
+        
+    Returns:
+        Hashed password
     """
-    # ========================================
-    # STARTUP
-    # ========================================
-    startup_time = time.time()
+    return pwd_context.hash(password)
+
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """
+    Verify a password against a hash
     
-    logger.info("=" * 80)
-    logger.info(f"Starting {settings.APP_NAME} v{settings.APP_VERSION}")
-    logger.info(f"Environment: {settings.ENVIRONMENT}")
-    logger.info(f"Debug Mode: {settings.DEBUG}")
-    logger.info("=" * 80)
-    
-    # Run comprehensive startup validation
+    Args:
+        plain_password: Plain text password
+        hashed_password: Hashed password from database
+        
+    Returns:
+        True if password matches, False otherwise
+    """
     try:
-        from utils.startup_checks import validate_startup
-        
-        validation_passed = await validate_startup(settings)
-        
-        if not validation_passed:
-            logger.critical("Startup validation failed! Application cannot start safely.")
-            if settings.is_production():
-                logger.critical("Exiting due to failed startup checks in production mode.")
-                sys.exit(1)
-            else:
-                logger.warning("Continuing despite failed checks (development mode)")
-        
-    except ImportError:
-        logger.warning("Startup validation module not available, skipping checks")
+        return pwd_context.verify(plain_password, hashed_password)
     except Exception as e:
-        logger.error(f"Error during startup validation: {e}", exc_info=True)
-        if settings.is_production():
-            sys.exit(1)
+        logger.error(f"Error verifying password: {e}")
+        return False
+
+
+def generate_password_reset_token() -> str:
+    """Generate a secure random token for password resets"""
+    return secrets.token_urlsafe(32)
+
+
+# ============================================================================
+# JWT TOKEN UTILITIES
+# ============================================================================
+
+def create_access_token(
+    data: Dict[str, Any],
+    expires_delta: Optional[timedelta] = None
+) -> str:
+    """
+    Create a JWT access token
     
-    # Initialize Sentry for error tracking
-    if settings.SENTRY_DSN:
-        try:
-            import sentry_sdk
-            from sentry_sdk.integrations.fastapi import FastApiIntegration
-            from sentry_sdk.integrations.logging import LoggingIntegration
-            
-            sentry_sdk.init(
-                dsn=settings.SENTRY_DSN,
-                environment=settings.SENTRY_ENVIRONMENT or settings.ENVIRONMENT,
-                traces_sample_rate=settings.SENTRY_TRACES_SAMPLE_RATE,
-                profiles_sample_rate=settings.SENTRY_PROFILES_SAMPLE_RATE,
-                integrations=[
-                    FastApiIntegration(),
-                    LoggingIntegration(
-                        level=logging.INFO,
-                        event_level=logging.ERROR
-                    )
-                ],
-                release=settings.APP_VERSION,
-                send_default_pii=False,
-                attach_stacktrace=True,
-            )
-            logger.info("✓ Sentry error tracking initialized")
-        except Exception as e:
-            logger.warning(f"Failed to initialize Sentry: {e}")
-    
-    # Initialize database connection pool
-    try:
-        from utils.db import init_db_pool, test_db_connection
+    Args:
+        data: Payload data to encode
+        expires_delta: Optional expiration time delta
         
-        init_db_pool(
-            host=settings.DATABASE_HOST,
-            port=settings.DATABASE_PORT,
-            database=settings.DATABASE_NAME,
-            user=settings.DATABASE_USER,
-            password=settings.DATABASE_PASSWORD,
-            pool_size=settings.DATABASE_POOL_SIZE,
-            max_overflow=settings.DATABASE_MAX_OVERFLOW
+    Returns:
+        Encoded JWT token
+    """
+    to_encode = data.copy()
+    
+    if expires_delta:
+        expire = datetime.now(timezone.utc) + expires_delta
+    else:
+        expire = datetime.now(timezone.utc) + timedelta(
+            minutes=ACCESS_TOKEN_EXPIRE_MINUTES
+        )
+    
+    to_encode.update({
+        "exp": expire,
+        "iat": datetime.now(timezone.utc),
+        "type": "access"
+    })
+    
+    encoded_jwt = jwt.encode(
+        to_encode,
+        settings.secret_key.get_secret_value(),
+        algorithm=ALGORITHM
+    )
+    
+    return encoded_jwt
+
+
+def create_refresh_token(user_id: int) -> str:
+    """
+    Create a refresh token
+    
+    Args:
+        user_id: User ID
+        
+    Returns:
+        Encoded refresh token
+    """
+    expire = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+    
+    to_encode = {
+        "sub": str(user_id),
+        "exp": expire,
+        "iat": datetime.now(timezone.utc),
+        "type": "refresh"
+    }
+    
+    encoded_jwt = jwt.encode(
+        to_encode,
+        settings.secret_key.get_secret_value(),
+        algorithm=ALGORITHM
+    )
+    
+    return encoded_jwt
+
+
+def decode_token(token: str) -> Dict[str, Any]:
+    """
+    Decode and validate a JWT token
+    
+    Args:
+        token: JWT token string
+        
+    Returns:
+        Decoded token payload
+        
+    Raises:
+        HTTPException: If token is invalid or expired
+    """
+    try:
+        payload = jwt.decode(
+            token,
+            settings.secret_key.get_secret_value(),
+            algorithms=[ALGORITHM]
+        )
+        return payload
+    except JWTError as e:
+        logger.warning(f"JWT decode error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+# ============================================================================
+# USER OPERATIONS
+# ============================================================================
+
+def get_user_by_email(email: str) -> Optional[User]:
+    """
+    Get user by email address
+    
+    Args:
+        email: User email address
+        
+    Returns:
+        User object or None if not found
+    """
+    try:
+        result = execute_query(
+            """
+            SELECT id, email, full_name, is_active, is_admin, created_at
+            FROM users
+            WHERE email = %s
+            """,
+            (email.lower(),),
+            fetch='one'
         )
         
-        # Test connection
-        if test_db_connection():
-            logger.info("✓ Database connection pool initialized and tested")
-            if metrics:
-                metrics.increment("app.startup.database_connected")
-        else:
-            logger.error("✗ Database connection test failed")
-            if metrics:
-                metrics.increment("app.startup.database_failed")
-            
+        if result:
+            return User(**result)
+        return None
+        
     except Exception as e:
-        logger.error(f"✗ Failed to initialize database: {e}")
-        if metrics:
-            metrics.increment("app.startup.database_error")
-        if settings.is_production():
-            raise  # Fail fast in production
+        logger.error(f"Error getting user by email: {e}", exc_info=True)
+        return None
+
+
+def get_user_by_id(user_id: int) -> Optional[User]:
+    """
+    Get user by ID
     
-    # Initialize Redis connection
-    if settings.REDIS_URL:
-        try:
-            import redis
-            redis_client = redis.from_url(
-                settings.REDIS_URL,
-                decode_responses=True,
-                socket_connect_timeout=5,
-                socket_timeout=5
-            )
-            redis_client.ping()
-            logger.info("✓ Redis connection initialized")
-            if metrics:
-                metrics.increment("app.startup.redis_connected")
-        except Exception as e:
-            logger.warning(f"⚠ Redis connection failed (non-critical): {e}")
-            if metrics:
-                metrics.increment("app.startup.redis_failed")
-    
-    # Validate AI/LLM configuration
-    if settings.ENABLE_LLM_OPTIMIZATION:
-        if not settings.ANTHROPIC_API_KEY:
-            logger.warning("⚠ LLM optimization enabled but ANTHROPIC_API_KEY not set")
-            logger.warning("⚠ AI-powered optimization features will not be available")
-        else:
-            try:
-                import anthropic
-                # Test Anthropic connection
-                client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
-                logger.info("✓ Anthropic Claude client initialized successfully")
-                logger.info(f"✓ Default model: {settings.ANTHROPIC_DEFAULT_MODEL}")
-                logger.info(f"✓ Fallback models: {', '.join(settings.ANTHROPIC_FALLBACK_MODELS)}")
-            except Exception as e:
-                logger.error(f"✗ Failed to initialize Anthropic client: {e}")
-    
-    # Validate Google Trends configuration
-    if not settings.SERPAPI_API_KEY:
-        logger.warning("⚠ SERPAPI_API_KEY not set - trending keywords features limited")
-    else:
-        logger.info("✓ SerpAPI configured for Google Trends integration")
-    
-    # Initialize background task scheduler (if enabled)
-    if settings.SCHEDULER_ENABLED:
-        try:
-            logger.info("✓ Task scheduler initialized")
-            if metrics:
-                metrics.increment("app.startup.scheduler_initialized")
-        except Exception as e:
-            logger.warning(f"⚠ Task scheduler initialization failed: {e}")
-    
-    # Record startup metrics
-    startup_duration = time.time() - startup_time
-    if metrics:
-        metrics.histogram("app.startup.duration", startup_duration)
-        metrics.gauge("app.info", 1, tags={
-            "version": settings.APP_VERSION,
-            "environment": settings.ENVIRONMENT
-        })
-    
-    logger.info(f"✓ Application started successfully in {startup_duration:.2f}s")
-    logger.info("=" * 80)
-    
-    yield
-    
-    # ========================================
-    # SHUTDOWN
-    # ========================================
-    logger.info("=" * 80)
-    logger.info("Shutting down application...")
-    
-    # Close database connections
+    Args:
+        user_id: User ID
+        
+    Returns:
+        User object or None if not found
+    """
     try:
-        from utils.db import close_db_pool
-        close_db_pool()
-        logger.info("✓ Database connections closed")
+        result = execute_query(
+            """
+            SELECT id, email, full_name, is_active, is_admin, created_at
+            FROM users
+            WHERE id = %s
+            """,
+            (user_id,),
+            fetch='one'
+        )
+        
+        if result:
+            return User(**result)
+        return None
+        
     except Exception as e:
-        logger.error(f"✗ Error closing database: {e}")
-    
-    # Close Redis connections
-    if settings.REDIS_URL:
-        try:
-            logger.info("✓ Redis connections closed")
-        except Exception as e:
-            logger.error(f"✗ Error closing Redis: {e}")
-    
-    if metrics:
-        metrics.increment("app.shutdown")
-    logger.info("✓ Application shutdown complete")
-    logger.info("=" * 80)
+        logger.error(f"Error getting user by ID: {e}", exc_info=True)
+        return None
 
 
-# ============================================================================
-# FASTAPI APPLICATION INITIALIZATION
-# ============================================================================
-
-app = FastAPI(
-    title=settings.APP_NAME,
-    version=settings.APP_VERSION,
-    description="""
-    ## YouTube Channel Optimizer API
+def authenticate_user(email: str, password: str) -> Optional[User]:
+    """
+    Authenticate user with email and password
     
-    AI-powered YouTube channel and video optimization platform using Anthropic's Claude AI.
-    
-    ### Features
-    * 🤖 **AI-Powered Optimization** - Uses Claude AI for intelligent content optimization
-    * 📊 **Channel Metadata Optimization** - Enhance channel descriptions and keywords
-    * 🎬 **Video Optimization** - Optimize titles, descriptions, tags with AI
-    * 📈 **Trending Keywords** - Integration with Google Trends via SerpAPI
-    * 🌍 **Multilingual Support** - Optimize content in multiple languages
-    * 📅 **Automated Scheduling** - Schedule regular optimizations
-    * 🔄 **Batch Processing** - Optimize multiple videos at once
-    * 📊 **Statistical Analysis** - Data-driven optimization decisions
-    * 🔐 **Secure Authentication** - JWT-based security
-    
-    ### AI Capabilities
-    * Title optimization using Claude AI
-    * Description enhancement with SEO keywords
-    * Hashtag generation and trending analysis
-    * Competitor keyword extraction
-    * Multi-language content translation
-    * Automatic chapter generation from transcripts
-    
-    ### Rate Limits
-    * Channel Optimization: 10 requests/minute
-    * Video Operations: 30 requests/minute
-    * Batch Operations: 5 requests/hour
-    * AI Optimization: 5 requests/minute
-    
-    ### Authentication
-    All endpoints (except health checks) require JWT authentication.
-    Include the token in the `Authorization` header:
-    ```
-    Authorization: Bearer <your-token>
-    ```
-    
-    ### AI Models Available
-    * Primary: {model}
-    * Fallbacks: {fallbacks}
-    """.format(
-        model=settings.ANTHROPIC_DEFAULT_MODEL,
-        fallbacks=", ".join(settings.ANTHROPIC_FALLBACK_MODELS[:2])
-    ),
-    docs_url="/docs" if settings.ENABLE_SWAGGER_UI else None,
-    redoc_url="/redoc" if settings.ENABLE_REDOC else None,
-    openapi_url=f"{settings.API_V1_PREFIX}/openapi.json",
-    lifespan=lifespan,
-    debug=settings.DEBUG,
-    # OpenAPI customization
-    openapi_tags=[
-        {
-            "name": "Health",
-            "description": "Health check and system status endpoints"
-        },
-        {
-            "name": "Channel Optimization",
-            "description": "AI-powered YouTube channel metadata optimization"
-        },
-        {
-            "name": "Video Operations",
-            "description": "Video management and AI optimization endpoints"
-        },
-        {
-            "name": "Optimization Scheduler",
-            "description": "Scheduled and automated optimization tasks"
-        },
-        {
-            "name": "Authentication",
-            "description": "User authentication and authorization"
-        }
-    ],
-    responses={
-        401: {
-            "description": "Unauthorized - Invalid or missing authentication",
-            "content": {
-                "application/json": {
-                    "example": {
-                        "error": "unauthorized",
-                        "message": "Invalid or missing authentication token"
-                    }
-                }
-            }
-        },
-        403: {
-            "description": "Forbidden - Insufficient permissions",
-            "content": {
-                "application/json": {
-                    "example": {
-                        "error": "forbidden",
-                        "message": "Insufficient permissions for this operation"
-                    }
-                }
-            }
-        },
-        429: {
-            "description": "Too Many Requests - Rate limit exceeded",
-            "content": {
-                "application/json": {
-                    "example": {
-                        "error": "rate_limit_exceeded",
-                        "message": "Rate limit exceeded. Try again later.",
-                        "retry_after": 60
-                    }
-                }
-            }
-        },
-        500: {
-            "description": "Internal Server Error",
-            "content": {
-                "application/json": {
-                    "example": {
-                        "error": "internal_server_error",
-                        "message": "An unexpected error occurred"
-                    }
-                }
-            }
-        }
-    }
-)
-
-
-# ============================================================================
-# EXCEPTION HANDLERS
-# ============================================================================
-
-@app.exception_handler(BaseAPIException)
-async def api_exception_handler(request: Request, exc: BaseAPIException):
-    """Handle custom API exceptions with proper formatting."""
-    logger.warning(
-        f"API Exception: {exc.error_code}",
-        extra={
-            "error_code": exc.error_code,
-            "message": exc.message,
-            "path": request.url.path,
-            "method": request.method
-        }
-    )
-    
-    if metrics:
-        metrics.increment("app.exceptions.api", tags={
-            "error_code": exc.error_code,
-            "endpoint": request.url.path
-        })
-    
-    return JSONResponse(
-        status_code=status.HTTP_400_BAD_REQUEST,
-        content={
-            "error": exc.error_code,
-            "message": exc.message,
-            "details": exc.details,
-            "timestamp": datetime.utcnow().isoformat(),
-            "path": request.url.path
-        }
-    )
-
-
-@app.exception_handler(RequestValidationError)
-async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    """Handle Pydantic validation errors."""
-    logger.warning(
-        f"Validation Error: {exc.errors()}",
-        extra={
-            "path": request.url.path,
-            "method": request.method,
-            "errors": exc.errors()
-        }
-    )
-    
-    if metrics:
-        metrics.increment("app.exceptions.validation", tags={
-            "endpoint": request.url.path
-        })
-    
-    return JSONResponse(
-        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-        content={
-            "error": "validation_error",
-            "message": "Request validation failed",
-            "details": exc.errors(),
-            "timestamp": datetime.utcnow().isoformat(),
-            "path": request.url.path
-        }
-    )
-
-
-@app.exception_handler(Exception)
-async def general_exception_handler(request: Request, exc: Exception):
-    """Handle all unhandled exceptions."""
-    request_id = getattr(request.state, "request_id", "unknown")
-    
-    logger.error(
-        f"Unhandled Exception: {str(exc)}",
-        extra={
-            "request_id": request_id,
-            "path": request.url.path,
-            "method": request.method,
-            "traceback": traceback.format_exc()
-        },
-        exc_info=True
-    )
-    
-    if metrics:
-        metrics.increment("app.exceptions.unhandled", tags={
-            "endpoint": request.url.path,
-            "exception_type": type(exc).__name__
-        })
-    
-    # Don't expose internal errors in production
-    if settings.is_production():
-        error_message = "An unexpected error occurred. Please try again later."
-        details = {"request_id": request_id}
-    else:
-        error_message = str(exc)
-        details = {
-            "request_id": request_id,
-            "type": type(exc).__name__,
-            "traceback": traceback.format_exc().split('\n')
-        }
-    
-    return JSONResponse(
-        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        content={
-            "error": "internal_server_error",
-            "message": error_message,
-            "details": details,
-            "timestamp": datetime.utcnow().isoformat()
-        }
-    )
-
-
-# ============================================================================
-# MIDDLEWARE
-# ============================================================================
-
-@app.middleware("http")
-async def request_id_middleware(request: Request, call_next: Callable):
-    """Add unique request ID to all requests."""
-    request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
-    request.state.request_id = request_id
-    
-    response = await call_next(request)
-    response.headers["X-Request-ID"] = request_id
-    
-    return response
-
-
-@app.middleware("http")
-async def request_timing_middleware(request: Request, call_next: Callable):
-    """Track request timing and record metrics."""
-    start_time = time.time()
-    
+    Args:
+        email: User email
+        password: Plain text password
+        
+    Returns:
+        User object if authenticated, None otherwise
+    """
     try:
-        response = await call_next(request)
+        result = execute_query(
+            """
+            SELECT id, email, password_hash, full_name, is_active, is_admin, created_at
+            FROM users
+            WHERE email = %s
+            """,
+            (email.lower(),),
+            fetch='one'
+        )
         
-        # Calculate duration
-        duration = time.time() - start_time
+        if not result:
+            logger.warning(f"User not found: {email}")
+            return None
         
-        # Record metrics
-        if metrics:
-            metrics.record_request(
-                endpoint=request.url.path,
-                method=request.method,
-                status_code=response.status_code,
-                duration=duration,
-                user_id=getattr(request.state, "user", {}).get("id")
-            )
+        if not result['is_active']:
+            logger.warning(f"Inactive user attempted login: {email}")
+            return None
         
-        # Add timing header
-        response.headers["X-Response-Time"] = f"{duration:.3f}s"
+        if not verify_password(password, result['password_hash']):
+            logger.warning(f"Invalid password for user: {email}")
+            return None
         
-        # Log slow requests
-        if duration > 1.0:  # Log requests slower than 1 second
-            logger.warning(
-                f"Slow request: {request.method} {request.url.path}",
-                extra={
-                    "duration": duration,
-                    "status_code": response.status_code,
-                    "request_id": getattr(request.state, "request_id", "unknown")
-                }
-            )
-        
-        return response
+        # Remove password_hash from result
+        user_data = {k: v for k, v in result.items() if k != 'password_hash'}
+        return User(**user_data)
         
     except Exception as e:
-        duration = time.time() - start_time
-        if metrics:
-            metrics.record_request(
-                endpoint=request.url.path,
-                method=request.method,
-                status_code=500,
-                duration=duration
+        logger.error(f"Error authenticating user: {e}", exc_info=True)
+        return None
+
+
+def create_user(user_data: UserCreate) -> Optional[User]:
+    """
+    Create a new user
+    
+    Args:
+        user_data: User creation data
+        
+    Returns:
+        Created User object or None on error
+    """
+    try:
+        # Check if user already exists
+        existing_user = get_user_by_email(user_data.email)
+        if existing_user:
+            logger.warning(f"User already exists: {user_data.email}")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Email already registered"
             )
+        
+        # Hash password
+        password_hash = hash_password(user_data.password)
+        
+        # Insert user
+        result = execute_query(
+            """
+            INSERT INTO users (email, password_hash, full_name, is_active, is_admin)
+            VALUES (%s, %s, %s, TRUE, FALSE)
+            RETURNING id, email, full_name, is_active, is_admin, created_at
+            """,
+            (user_data.email.lower(), password_hash, user_data.full_name),
+            fetch='one'
+        )
+        
+        if result:
+            logger.info(f"Created new user: {user_data.email}")
+            return User(**result)
+        return None
+        
+    except HTTPException:
         raise
+    except Exception as e:
+        logger.error(f"Error creating user: {e}", exc_info=True)
+        return None
 
 
-@app.middleware("http")
-async def security_headers_middleware(request: Request, call_next: Callable):
-    """Add security headers to all responses."""
-    response = await call_next(request)
+# ============================================================================
+# DEPENDENCY FUNCTIONS
+# ============================================================================
+
+async def get_current_user(
+    token: str = Depends(oauth2_scheme)
+) -> User:
+    """
+    FastAPI dependency to get current authenticated user from JWT token
     
-    # Security headers
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "DENY"
-    response.headers["X-XSS-Protection"] = "1; mode=block"
-    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
-    
-    if settings.is_production():
-        response.headers["Content-Security-Policy"] = "default-src 'self'"
-    
-    return response
-
-
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.CORS_ORIGINS,
-    allow_credentials=settings.CORS_CREDENTIALS,
-    allow_methods=settings.CORS_METHODS,
-    allow_headers=settings.CORS_HEADERS,
-    expose_headers=[
-        "X-Request-ID",
-        "X-Response-Time",
-        "X-RateLimit-Limit",
-        "X-RateLimit-Remaining",
-        "X-RateLimit-Reset"
-    ]
-)
-
-# Add GZip compression
-if settings.ENABLE_COMPRESSION:
-    app.add_middleware(
-        GZipMiddleware,
-        minimum_size=1000,
-        compresslevel=6
+    Args:
+        token: JWT token from Authorization header
+        
+    Returns:
+        Current User object
+        
+    Raises:
+        HTTPException: If authentication fails
+    """
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
     )
-
-# Add trusted host middleware (production only)
-if settings.is_production() and settings.ALLOWED_HOSTS != ["*"]:
-    app.add_middleware(
-        TrustedHostMiddleware,
-        allowed_hosts=settings.ALLOWED_HOSTS
-    )
-
-# Add custom middleware
-if auth_middleware:
-    app.middleware("http")(auth_middleware)
-
-if settings.ENABLE_RATE_LIMITING and add_rate_limit_headers:
-    app.middleware("http")(add_rate_limit_headers)
-
-
-# ============================================================================
-# INCLUDE ROUTERS
-# ============================================================================
-
-# Health check routes (no prefix, public)
-app.include_router(
-    health_routes.router,
-    tags=["Health"]
-)
-
-# API v1 routes
-app.include_router(
-    channel_routes.router,
-    prefix=settings.API_V1_PREFIX,
-    tags=["Channel Optimization"]
-)
-
-app.include_router(
-    video_routes.router,
-    prefix=f"{settings.API_V1_PREFIX}/videos",
-    tags=["Video Operations"]
-)
-
-app.include_router(
-    scheduler_routes.router,
-    prefix=settings.API_V1_PREFIX,
-    tags=["Optimization Scheduler"]
-)
-
-
-# ============================================================================
-# ROOT ENDPOINTS
-# ============================================================================
-
-@app.get("/", include_in_schema=False)
-async def root():
-    """Redirect root to API documentation."""
-    if settings.ENABLE_SWAGGER_UI:
-        return RedirectResponse(url="/docs")
-    else:
-        return {
-            "name": settings.APP_NAME,
-            "version": settings.APP_VERSION,
-            "environment": settings.ENVIRONMENT,
-            "status": "operational",
-            "documentation": "/redoc" if settings.ENABLE_REDOC else None,
-            "ai_features": {
-                "llm_optimization": settings.ENABLE_LLM_OPTIMIZATION,
-                "multilingual_support": settings.ENABLE_MULTILINGUAL_SUPPORT,
-                "anthropic_configured": bool(settings.ANTHROPIC_API_KEY),
-                "serpapi_configured": bool(settings.SERPAPI_API_KEY)
-            }
-        }
-
-
-@app.get("/info", tags=["Root"])
-async def app_info():
-    """Get application information."""
-    return {
-        "name": settings.APP_NAME,
-        "version": settings.APP_VERSION,
-        "environment": settings.ENVIRONMENT,
-        "debug": settings.DEBUG,
-        "features": {
-            "swagger_ui": settings.ENABLE_SWAGGER_UI,
-            "redoc": settings.ENABLE_REDOC,
-            "rate_limiting": settings.ENABLE_RATE_LIMITING,
-            "metrics": settings.ENABLE_METRICS,
-            "caching": settings.ENABLE_CACHING,
-            "llm_optimization": settings.ENABLE_LLM_OPTIMIZATION,
-            "multilingual": settings.ENABLE_MULTILINGUAL_SUPPORT
-        },
-        "ai_configuration": {
-            "anthropic_enabled": bool(settings.ANTHROPIC_API_KEY),
-            "default_model": settings.ANTHROPIC_DEFAULT_MODEL if settings.ANTHROPIC_API_KEY else None,
-            "serpapi_enabled": bool(settings.SERPAPI_API_KEY),
-            "statistical_analysis": settings.USE_STATISTICAL_ANALYSIS
-        },
-        "api": {
-            "version": "v1",
-            "prefix": settings.API_V1_PREFIX,
-            "documentation": "/docs" if settings.ENABLE_SWAGGER_UI else None
-        }
-    }
-
-
-# ============================================================================
-# PROMETHEUS METRICS ENDPOINT
-# ============================================================================
-
-if settings.METRICS_BACKEND == "prometheus" and settings.METRICS_ENABLED:
+    
     try:
-        from prometheus_client import make_asgi_app
+        payload = decode_token(token)
+        user_id: str = payload.get("sub")
         
-        # Mount Prometheus metrics app
-        metrics_app = make_asgi_app()
-        app.mount("/metrics", metrics_app)
+        if user_id is None:
+            raise credentials_exception
         
-        logger.info(f"✓ Prometheus metrics endpoint available at /metrics")
-    except ImportError:
-        logger.warning("⚠ Prometheus client not installed, metrics endpoint disabled")
+        token_type = payload.get("type")
+        if token_type != "access":
+            raise credentials_exception
+            
+    except JWTError:
+        raise credentials_exception
+    
+    user = get_user_by_id(int(user_id))
+    if user is None:
+        raise credentials_exception
+    
+    if not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Inactive user"
+        )
+    
+    return user
+
+
+async def get_current_active_user(
+    current_user: User = Depends(get_current_user)
+) -> User:
+    """
+    Get current active user
+    
+    Args:
+        current_user: Current user from get_current_user dependency
+        
+    Returns:
+        Active User object
+        
+    Raises:
+        HTTPException: If user is inactive
+    """
+    if not current_user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Inactive user"
+        )
+    return current_user
+
+
+async def get_current_admin_user(
+    current_user: User = Depends(get_current_user)
+) -> User:
+    """
+    Get current admin user
+    
+    Args:
+        current_user: Current user from get_current_user dependency
+        
+    Returns:
+        Admin User object
+        
+    Raises:
+        HTTPException: If user is not admin
+    """
+    if not current_user.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin access required"
+        )
+    return current_user
+
+
+def require_permissions(required_scopes: List[str]):
+    """
+    Dependency factory for permission checking
+    
+    Args:
+        required_scopes: List of required permission scopes
+        
+    Returns:
+        Dependency function that checks permissions
+    """
+    async def permission_checker(
+        current_user: User = Depends(get_current_user)
+    ) -> User:
+        # For now, just check if user is active
+        # In future, implement granular permissions
+        if not current_user.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Insufficient permissions"
+            )
+        return current_user
+    
+    return permission_checker
 
 
 # ============================================================================
-# STARTUP EVENT LOGGING
+# TOKEN OPERATIONS
 # ============================================================================
 
-@app.on_event("startup")
-async def log_routes():
-    """Log all registered routes on startup."""
-    if settings.DEBUG:
-        logger.info("Registered routes:")
-        for route in app.routes:
-            if hasattr(route, "methods"):
-                logger.info(f"  {', '.join(route.methods)} {route.path}")
+def login(email: str, password: str) -> Optional[Token]:
+    """
+    Login user and create tokens
+    
+    Args:
+        email: User email
+        password: User password
+        
+    Returns:
+        Token object with access and refresh tokens
+    """
+    user = authenticate_user(email, password)
+    if not user:
+        return None
+    
+    # Create tokens
+    access_token = create_access_token(
+        data={"sub": str(user.id), "email": user.email}
+    )
+    refresh_token = create_refresh_token(user.id)
+    
+    # Log successful login
+    logger.info(f"User logged in: {user.email}")
+    
+    return Token(
+        access_token=access_token,
+        refresh_token=refresh_token,
+        expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60  # seconds
+    )
+
+
+def refresh_access_token(refresh_token: str) -> Optional[str]:
+    """
+    Create new access token from refresh token
+    
+    Args:
+        refresh_token: Refresh token
+        
+    Returns:
+        New access token or None if invalid
+    """
+    try:
+        payload = decode_token(refresh_token)
+        
+        # Verify it's a refresh token
+        if payload.get("type") != "refresh":
+            logger.warning("Invalid token type for refresh")
+            return None
+        
+        user_id = int(payload.get("sub"))
+        user = get_user_by_id(user_id)
+        
+        if not user or not user.is_active:
+            logger.warning(f"Cannot refresh token for inactive user: {user_id}")
+            return None
+        
+        # Create new access token
+        access_token = create_access_token(
+            data={"sub": str(user.id), "email": user.email}
+        )
+        
+        return access_token
+        
+    except Exception as e:
+        logger.error(f"Error refreshing access token: {e}", exc_info=True)
+        return None
 
 
 # ============================================================================
-# APPLICATION ENTRY POINT
+# API KEY MANAGEMENT (for service-to-service auth)
 # ============================================================================
 
-if __name__ == "__main__":
-    import uvicorn
-    
-    # Configure uvicorn
-    uvicorn_config = {
-        "app": "main:app",
-        "host": settings.HOST,
-        "port": settings.PORT,
-        "reload": settings.DEBUG,
-        "log_level": settings.LOG_LEVEL.lower(),
-        "access_log": True,
-        "proxy_headers": True,
-        "forwarded_allow_ips": "*",
-    }
-    
-    # Use workers in production (but not with reload)
-    if settings.is_production() and not settings.DEBUG:
-        uvicorn_config["workers"] = settings.WORKERS
-    
-    logger.info("Starting Uvicorn server...")
-    logger.info(f"Server will be available at http://{settings.HOST}:{settings.PORT}")
-    logger.info(f"Documentation: http://{settings.HOST}:{settings.PORT}/docs")
-    if settings.ANTHROPIC_API_KEY:
-        logger.info(f"AI Features: ✓ ENABLED")
-    else:
-        logger.warning(f"AI Features: ⚠ LIMITED (no Anthropic API key)")
-    
-    uvicorn.run(**uvicorn_config)
+def generate_api_key() -> str:
+    """Generate a secure API key"""
+    return secrets.token_urlsafe(32)
+
+
+def hash_api_key(api_key: str) -> str:
+    """Hash an API key for storage"""
+    return hashlib.sha256(api_key.encode()).hexdigest()
+
+
+# ============================================================================
+# EXPORTS
+# ============================================================================
+
+__all__ = [
+    'User',
+    'UserCreate',
+    'Token',
+    'TokenData',
+    'hash_password',
+    'verify_password',
+    'create_access_token',
+    'create_refresh_token',
+    'decode_token',
+    'get_user_by_email',
+    'get_user_by_id',
+    'authenticate_user',
+    'create_user',
+    'get_current_user',
+    'get_current_active_user',
+    'get_current_admin_user',
+    'require_permissions',
+    'login',
+    'refresh_access_token',
+    'generate_api_key',
+    'hash_api_key',
+]
